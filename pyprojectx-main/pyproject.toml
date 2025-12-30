@@ -1,0 +1,87 @@
+[project]
+name = "pyprojectx"
+version = "3.2.0.dev"
+description = "Execute scripts from pyproject.toml, installing tools on-the-fly"
+license = { text = "MIT" }
+authors = [{ name = "Houbie", email = "ivo@houbrechts-it.be" }]
+readme = "README.md"
+urls = { homepage = "https://github.com/pyprojectx/pyprojectx", documentation = "https://pyprojectx.github.io" }
+
+keywords = ["build", "dependency", "pyprojectx"]
+classifiers = [
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+requires-python = ">=3.9"
+
+dependencies = [
+    "userpath>=1.9",
+    "tomlkit>=0.13",
+    "uv>=0.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-mock>=3.15",
+]
+
+[project.scripts]
+pyprojectx = "pyprojectx.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+[tool.ruff.lint]
+select = ["ALL"]
+fixable = ["ALL"]
+ignore = ["ISC001", "ANN", "FA", "FBT", "D100", "D102", "D103", "D104", "D105", "D213", "D203", "T201", "TRY003", "EM102", "COM812", "S602", "S603", "S604", "S605", "S607", "S324"]
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "I001", "INP001", "YTT204", "PLR2004"]
+"bin/*" = ["INP001"]
+
+[tool.pyprojectx]
+lock-python-version = "3.9"
+[tool.pyprojectx.main]
+requirements = [
+    "uv",
+    "tomlkit",
+    "ruff",
+    "pre-commit",
+    "px-utils",
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings[python]<0.28",
+    "markdown-include"
+]
+post-install = "pre-commit install"
+
+[tool.pyprojectx.aliases]
+install = "uv sync"
+run = "uv run pyprojectx -t pyproject.toml "
+update = ["uv lock --upgrade", "@install"]
+outdated = "uv pip list --outdated"
+clean = "pxrm .venv .pytest_cache dist .uv-build .ruff_cache"
+full-clean = ["@clean", "pxrm .pyprojectx .uv-python"]
+format = ["ruff format", "ruff check --select I --fix"]
+lint = ["ruff check"]
+unit-test = "uv run pytest tests/unit"
+integration-test = "uv run pytest tests/integration"
+test = ["@unit-test", "@integration-test"]
+check = ["@lint", "@test"]
+build = ["@install", "@check", "uv build"]
+
+# used in GitHub actions:
+export-locked-requirements = "uv export -q --frozen --no-dev --no-editable --no-emit-project --no-hashes --no-annotate --no-header -o dist/requirements.txt"
+publish = "uv publish --username __token__"
+
+generate-usage = "uv run python -m pyprojectx.wrapper.pw --help > docs/docs/usage.txt"
+serve-docs = { cmd = "mkdocs serve", cwd = "docs" }
+generate-docs = { cmd = ["@install", "@generate-usage && mkdocs build"], cwd = "docs" }
+deploy-docs = { cmd = "mkdocs gh-deploy", cwd = "docs" }

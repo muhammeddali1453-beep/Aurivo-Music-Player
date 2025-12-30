@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Angolla Reklam Geçiş Sistemi - Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #fff;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .subtitle {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .info-section {
+            background: rgba(255,255,255,0.1);
+            border: 2px solid rgba(255,255,255,0.2);
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .info-section h2 {
+            color: #40C4FF;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+        }
+        
+        .keyboard-shortcuts {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        
+        .shortcut {
+            background: rgba(0,0,0,0.2);
+            padding: 10px;
+            border-left: 3px solid #40C4FF;
+            border-radius: 5px;
+        }
+        
+        .key {
+            background: #40C4FF;
+            color: #000;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-weight: bold;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        
+        .video-simulator {
+            background: #000;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 20px;
+        }
+        
+        .video-container {
+            position: relative;
+            width: 100%;
+            padding-bottom: 56.25%;
+            height: 0;
+        }
+        
+        .video-content {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(45deg, #333 25%, transparent 25%, transparent 75%, #333 75%, #333),
+                        linear-gradient(45deg, #333 25%, transparent 25%, transparent 75%, #333 75%, #333);
+            background-size: 40px 40px;
+            background-position: 0 0, 20px 20px;
+            background-color: #222;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font-size: 1.5em;
+        }
+        
+        .ad-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.8);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            z-index: 10;
+        }
+        
+        .ad-badge {
+            background: #FF6B6B;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 5px;
+            font-weight: bold;
+            font-size: 0.9em;
+        }
+        
+        .skip-button {
+            background: #40C4FF;
+            color: #000;
+            border: none;
+            padding: 10px 30px;
+            border-radius: 5px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 1.1em;
+            transition: all 0.3s;
+        }
+        
+        .skip-button:hover {
+            background: #00B8E6;
+            transform: scale(1.05);
+        }
+        
+        .skip-button:active {
+            transform: scale(0.95);
+        }
+        
+        .countdown {
+            font-size: 3em;
+            font-weight: bold;
+            color: #40C4FF;
+        }
+        
+        .status-log {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(64,196,255,0.3);
+            border-radius: 10px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            height: 250px;
+            overflow-y: auto;
+            font-size: 0.9em;
+            line-height: 1.5;
+        }
+        
+        .log-entry {
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(64,196,255,0.1);
+        }
+        
+        .log-entry.success {
+            color: #66BB6A;
+        }
+        
+        .log-entry.warning {
+            color: #FFA726;
+        }
+        
+        .log-entry.error {
+            color: #EF5350;
+        }
+        
+        .log-entry.info {
+            color: #40C4FF;
+        }
+        
+        button.test-btn {
+            background: #40C4FF;
+            color: #000;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 5px;
+            font-weight: bold;
+            cursor: pointer;
+            margin: 5px;
+            transition: all 0.3s;
+        }
+        
+        button.test-btn:hover {
+            background: #00B8E6;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(64,196,255,0.3);
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 15px;
+        }
+        
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            opacity: 0.7;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⚡ Angolla TURBO Reklam Geçiş Sistemi</h1>
+            <p class="subtitle">Web platformlarında ultra hızlı otomatik reklam geçişi (50ms)</p>
+        </header>
+        
+        <div class="info-section">
+            <h2>🚀 Turbo Özellikler</h2>
+            <p>✓ 50ms interval (10x daha hızlı!)</p>
+            <p>✓ 16x video hızlandırma</p>
+            <p>✓ Anında DOM tespit (MutationObserver)</p>
+            <p>✓ Çoklu tıklama garantisi (3x)</p>
+            <p>✓ Overlay gizleme + ses kapatma</p>
+            
+            <div class="keyboard-shortcuts">
+                <div class="shortcut">
+                    <div><span class="key">Shift+S</span>: Hızlı reklam geçiş</div>
+                </div>
+                <div class="shortcut">
+                    <div><span class="key">Ctrl+Shift+A</span>: Otomatik geçişi aç/kapat</div>
+                </div>
+                <div class="shortcut">
+                    <div><span class="key">Ctrl+Shift+T</span>: Turbo modu aç/kapat</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="info-section">
+            <h2>🎥 Demo Video (Reklam Simülasyonu)</h2>
+            <div class="video-simulator">
+                <div class="video-container">
+                    <div class="video-content">
+                        <div id="ad-overlay" class="ad-overlay" style="display:none;">
+                            <div class="ad-badge">REKLAM</div>
+                            <div class="countdown" id="countdown">5</div>
+                            <button class="skip-button" onclick="skipAd()">Reklamı Atla</button>
+                        </div>
+                        <span id="video-text">Video Oynatıcı</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="button-group">
+                <button class="test-btn" onclick="showAd()">Reklam Göster</button>
+                <button class="test-btn" onclick="skipAd()">Reklamı Atla</button>
+                <button class="test-btn" onclick="testBridge()">Bridge Test</button>
+                <button class="test-btn" onclick="clearLog()">Logları Temizle</button>
+            </div>
+        </div>
+        
+        <div class="info-section">
+            <h2>📋 Sistem Durumu & Loglar</h2>
+            <div class="status-log" id="log">
+                <div class="log-entry info">🔄 Demo sayfası yüklendi</div>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>Angolla Music Player - Reklam Geçiş Sistemi Demo</p>
+            <p>JavaScript konsolu (F12) ile detaylı logları görebilirsiniz</p>
+        </div>
+    </div>
+    
+    <script>
+        let countdownInterval = null;
+        
+        function log(message, type = 'info') {
+            const logElement = document.getElementById('log');
+            const timestamp = new Date().toLocaleTimeString('tr-TR');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${timestamp}] ${message}`;
+            logElement.appendChild(entry);
+            logElement.scrollTop = logElement.scrollHeight;
+            console.log(`[${type.toUpperCase()}] ${message}`);
+        }
+        
+        function showAd() {
+            const adOverlay = document.getElementById('ad-overlay');
+            const videoText = document.getElementById('video-text');
+            adOverlay.style.display = 'flex';
+            videoText.style.display = 'none';
+            
+            let countdown = 5;
+            document.getElementById('countdown').textContent = countdown;
+            
+            log('📺 Reklam gösterildi (5 saniye)', 'warning');
+            
+            if (countdownInterval) clearInterval(countdownInterval);
+            
+            countdownInterval = setInterval(() => {
+                countdown--;
+                document.getElementById('countdown').textContent = countdown;
+                
+                if (countdown <= 0) {
+                    clearInterval(countdownInterval);
+                    hideAd();
+                    log('✓ Reklam otomatik sonlandı', 'success');
+                }
+            }, 1000);
+        }
+        
+        function skipAd() {
+            clearInterval(countdownInterval);
+            hideAd();
+            log('✓ Reklam geçildi!', 'success');
+            
+            // Bridge'i çağır
+            if (window.AngollaBridge) {
+                try {
+                    window.AngollaBridge.skip_ad_safe('youtube');
+                    log('✓ Bridge skip_ad_safe() çağrıldı', 'success');
+                } catch(e) {
+                    log(`⚠ Bridge hatası: ${e.message}`, 'error');
+                }
+            } else {
+                log('⚠ AngollaBridge kullanılamadı (local test)', 'warning');
+            }
+        }
+        
+        function hideAd() {
+            const adOverlay = document.getElementById('ad-overlay');
+            const videoText = document.getElementById('video-text');
+            adOverlay.style.display = 'none';
+            videoText.style.display = 'block';
+        }
+        
+        function testBridge() {
+            log('🔧 Bridge test başlatıldı...', 'info');
+            
+            if (window.AngollaBridge) {
+                log('✓ AngollaBridge nesne bulundu', 'success');
+                log('✓ Metod: skip_ad_safe (string)', 'info');
+                log('✓ Metod: seek_safe (string, int)', 'info');
+                log('✓ Metod: toggle_play_safe (string, bool)', 'info');
+                log('✓ Metod: volume_safe (string, int)', 'info');
+                
+                try {
+                    window.AngollaBridge.skip_ad_safe('youtube');
+                    log('✓ skip_ad_safe("youtube") başarılı', 'success');
+                } catch(e) {
+                    log(`❌ Hata: ${e.message}`, 'error');
+                }
+            } else {
+                log('❌ AngollaBridge bulunamadı', 'error');
+                log('ℹ Local test ortamı - Angolla uygulamasında çalışacaktır', 'warning');
+            }
+        }
+        
+        function clearLog() {
+            document.getElementById('log').innerHTML = '<div class="log-entry info">📋 Loglar temizlendi</div>';
+            log('Sistem logları temizlendi', 'info');
+        }
+        
+        // Sayfa yüklendiğinde
+        window.addEventListener('load', () => {
+            log('✓ Demo sayfası tam yüklendi', 'success');
+            
+            if (window.AngollaBridge) {
+                log('✓ QWebChannel Bridge bağlantısı aktif', 'success');
+            } else {
+                log('ℹ Local test modunda - Bridge bağlantısı yok', 'warning');
+            }
+            
+            if (window.angollaAdSkip) {
+                log('✓ Angolla Ad Skip sistemi aktif', 'success');
+            }
+        });
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.shiftKey && e.code === 'KeyS') {
+                e.preventDefault();
+                log('⌨️ Shift+S tuşu basıldı', 'info');
+                skipAd();
+            }
+            if (e.ctrlKey && e.shiftKey && e.code === 'KeyA') {
+                e.preventDefault();
+                const status = window.angollaAdSkip ? window.angollaAdSkip.autoSkip : false;
+                log(`🔧 Otomatik geçiş: ${status ? 'ON' : 'OFF'}`, 'info');
+            }
+        });
+    </script>
+</body>
+</html>

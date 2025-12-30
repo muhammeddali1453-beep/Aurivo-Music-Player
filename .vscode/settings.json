@@ -1,0 +1,10 @@
+{
+  "files.exclude": {
+    "pyprojectx-main/.github/workflows": true
+  },
+  "search.exclude": {
+    "pyprojectx-main/.github/workflows": true
+  },
+  "github-actions.workflows.pinned.workflows": [],
+  "problems.decorations.enabled": true
+}
