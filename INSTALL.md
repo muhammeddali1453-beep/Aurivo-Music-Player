@@ -1,0 +1,157 @@
+# Angolla Music Player - Kurulum Rehberi
+
+## 📦 İndirme
+
+### GitHub Releases'tan İndirme
+1. [Releases sayfasına](../../releases) gidin
+2. En son sürümü bulun (örn: v1.0)
+3. **Assets** bölümünden `Angolla-Linux-v1.0.tar.gz` dosyasını indirin (203 MB)
+
+### Komut satırından indirme (opsiyonel)
+```bash
+wget https://github.com/KULLANICI_ADI/Angolla-Music-Player/releases/latest/download/Angolla-Linux-v1.0.tar.gz
+```
+
+## 🚀 Kurulum (Linux)
+
+### 1. Sistem Gereksinimleri
+Angolla çalışmak için şu sistem paketlerine ihtiyaç duyar:
+
+```bash
+# Arch Linux / Manjaro
+sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
+
+# Ubuntu / Debian
+sudo apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+                 gstreamer1.0-plugins-bad gstreamer1.0-libav
+
+# Fedora
+sudo dnf install gstreamer1-plugins-base gstreamer1-plugins-good \
+                 gstreamer1-plugins-bad-free gstreamer1-libav
+```
+
+### 2. Paketi Çıkartma
+```bash
+tar -xzf Angolla-Linux-v1.0.tar.gz
+cd angolla
+```
+
+### 3. Çalıştırma
+```bash
+./angolla
+```
+
+### 4. Masaüstü Kısayolu Oluşturma (Opsiyonel)
+Uygulama menüsünden başlatmak için:
+
+```bash
+# Desktop dosyasını kopyalayın
+cp angolla.desktop ~/.local/share/applications/
+
+# Icon'u kopyalayın
+mkdir -p ~/.local/share/icons/hicolor/48x48/apps/
+cp angolla.png ~/.local/share/icons/hicolor/48x48/apps/
+
+# Desktop veritabanını güncelleyin
+update-desktop-database ~/.local/share/applications/
+```
+
+Artık uygulama menünüzde "Angolla Music Player" görünecektir.
+
+## 🎵 İlk Kullanım
+
+1. **Müzik Ekleme**: Sürükle-bırak ile dosya ekleyin veya sağ tıklayarak "Dosya Ekle" seçin
+2. **Kütüphane Tarama**: Ayarlar → Kütüphane → Klasör Ekle
+3. **Görselleştirme**: 11 farklı görselleştirme modu (Alt panel veya tam ekran)
+4. **Ekolayzır**: Ses → Ekolayzır (10 bant ayarlanabilir)
+5. **Video Oynatma**: Video dosyalarını sürükleyip bırakın
+6. **Altyazı**: Video oynatırken sağ tıklayın → Altyazı Seç (otomatik transkripsiyon için Whisper kurulumu gerekir)
+
+## 🛠️ Gelişmiş Özellikler
+
+### Whisper Altyazı Desteği (Opsiyonel)
+Otomatik video transkripsiyon için:
+
+```bash
+# Whisper kurulumu
+pip install openai-whisper
+
+# Kullanım: Video oynatırken sağ tıklayın → "Whisper ile Transkripsiyonu Oluştur"
+```
+
+### DSP Efektleri
+Dahili C++ DSP motoru ile:
+- Compressor
+- Limiter
+- Exciter
+- Stereo Widener
+- Bass Boost
+
+Efektler otomatik olarak yüklenir (angolla_dsp.so).
+
+## ⚙️ Ayarlar ve Yapılandırma
+
+Ayarlar otomatik olarak şurada saklanır:
+- Yapılandırma: `~/.config/Angolla/angolla_config.json`
+- Çalma listeleri: `~/.config/Angolla/angolla_playlist.json`
+- Altyazılar: `~/.local/share/angolla/subtitles/`
+
+## 🐛 Sorun Giderme
+
+### Video oynatılmıyor
+```bash
+# Codec desteğini kontrol edin
+gst-inspect-1.0 | grep -i libav
+
+# Eksik codec paketini kurun
+sudo pacman -S gst-libav  # Arch
+sudo apt install gstreamer1.0-libav  # Ubuntu
+```
+
+### Ses çıkmıyor
+- Sistem ses ayarlarını kontrol edin
+- Angolla içindeki ses seviyesini kontrol edin
+- Terminal'den `./angolla` çalıştırıp hata mesajlarını kontrol edin
+
+### Görselleştirme çalışmıyor
+- NumPy kurulu olduğundan emin olun: `pip install numpy`
+- OpenGL sürücülerini kontrol edin
+
+### Desktop kısayolu görünmüyor
+```bash
+# XDG veritabanını manuel güncelleme
+update-desktop-database ~/.local/share/applications/
+gtk-update-icon-cache ~/.local/share/icons/hicolor/
+```
+
+## 📊 Sistem Gereksinimleri
+
+| Bileşen | Minimum | Önerilen |
+|---------|---------|----------|
+| İşletim Sistemi | Linux (kernel 5.0+) | Linux (kernel 6.0+) |
+| RAM | 512 MB | 1 GB |
+| Disk Alanı | 250 MB | 300 MB |
+| İşlemci | Dual-core 1.5 GHz | Quad-core 2.0 GHz |
+| GPU | OpenGL 2.0 | OpenGL 3.0+ |
+
+## 🔄 Güncelleme
+
+Yeni sürüm için:
+1. [Releases sayfasından](../../releases) yeni sürümü indirin
+2. Eski klasörü silin veya yeniden adlandırın
+3. Yeni paketi çıkartın
+4. Ayarlarınız otomatik olarak korunur (~/.config/Angolla/)
+
+## 📝 Lisans
+
+Bu yazılım [LICENSE](LICENSE) dosyasında belirtilen lisans altında dağıtılmaktadır.
+
+## 🤝 Destek
+
+- **Hata Bildirimi**: [GitHub Issues](../../issues)
+- **Özellik İsteği**: [GitHub Discussions](../../discussions)
+- **Dokümantasyon**: [Wiki](../../wiki)
+
+## 🌟 Katkıda Bulunma
+
+Kaynak koddan derlemek veya geliştirmeye katkıda bulunmak için [CONTRIBUTING.md](CONTRIBUTING.md) dosyasına bakın.

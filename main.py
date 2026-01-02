@@ -646,6 +646,12 @@ class GlobalAudioEngine(QThread):
         self._stream_mode = "local"
         self._web_lpf_freq = 8000.0
         
+        # Crossfade Variables
+        self.crossfade_duration_ms = 0
+        self.crossfade_buffer = None
+        self.crossfade_pos = 0
+        self.crossfade_active = False
+        
         # Connect manager updates (thread-safe)
         self.mgr.state_changed.connect(self.sync_dsp_params)
 
@@ -689,6 +695,9 @@ class GlobalAudioEngine(QThread):
             self._web_lpf_freq = freq
             if self.dsp and hasattr(self.dsp, "set_web_lpf"):
                 self.dsp.set_web_lpf(freq)
+
+    def set_crossfade_duration(self, ms):
+        self.crossfade_duration_ms = max(0, int(ms))
 
     def set_force_mute(self, mute: bool):
         """Phase 3: Hard mute for absolute silence."""
@@ -916,7 +925,26 @@ class GlobalAudioEngine(QThread):
         if not sf:
             print("❌ soundfile not found. Cannot load local files.")
             return
+        
+        # Crossfade Capture
         with self._lock:
+            if self.crossfade_duration_ms > 0 and self.audio_data is not None and not self.paused:
+                try:
+                    cf_samples = int((self.crossfade_duration_ms / 1000.0) * self.samplerate)
+                    if cf_samples > 0:
+                        remaining = len(self.audio_data) - self.current_frame
+                        take = min(remaining, cf_samples)
+                        if take > 0:
+                            self.crossfade_buffer = self.audio_data[self.current_frame : self.current_frame + take].copy()
+                            self.crossfade_pos = 0
+                            self.crossfade_active = True
+                        else:
+                            self.crossfade_active = False
+                except Exception:
+                    self.crossfade_active = False
+            else:
+                self.crossfade_active = False
+
             self.audio_data = None
             self.current_frame = 0
             self.paused = True
@@ -1043,6 +1071,10 @@ class GlobalAudioEngine(QThread):
             if self.dsp:
                 self.dsp.process_buffer(proc_buf)
             
+            # --- CROSSFADE (Modular) ---
+            self._apply_crossfade(proc_buf, actual_frames)
+            # ---------------------------
+
             # Apply Volume and copy to output
             out_view = outdata
             if out_view.ndim == 1:
@@ -1075,6 +1107,49 @@ class GlobalAudioEngine(QThread):
             # Emit viz data (PCM for FFT) using pre-DSP audio
             viz_buf = raw_buf
             self.viz_data_ready.emit(viz_buf.tobytes(), 32, 2, self.samplerate)
+
+    def _apply_crossfade(self, proc_buf, actual_frames):
+        """Applies crossfade logic to the processed buffer."""
+        if self.crossfade_duration_ms <= 0:
+            return
+
+        try:
+            cf_len = int((self.crossfade_duration_ms / 1000.0) * self.samplerate)
+            if cf_len <= 0:
+                return
+
+            # 1. Fade In (New Track)
+            if self.current_frame < cf_len:
+                start_pos = self.current_frame
+                end_pos = self.current_frame + actual_frames
+                ramp_in = np.linspace(start_pos / cf_len, end_pos / cf_len, actual_frames, dtype=np.float32)
+                ramp_in = np.clip(ramp_in, 0.0, 1.0)
+                
+                proc_view = proc_buf.reshape(-1, 2)
+                proc_view *= ramp_in[:, np.newaxis]
+
+            # 2. Fade Out (Old Track)
+            if self.crossfade_active and self.crossfade_buffer is not None:
+                cf_avail = len(self.crossfade_buffer) - self.crossfade_pos
+                if cf_avail > 0:
+                    mix_len = min(actual_frames, cf_avail)
+                    cf_chunk = self.crossfade_buffer[self.crossfade_pos : self.crossfade_pos + mix_len]
+                    
+                    start_pos = self.crossfade_pos
+                    end_pos = self.crossfade_pos + mix_len
+                    ramp_out = 1.0 - np.linspace(start_pos / cf_len, end_pos / cf_len, mix_len, dtype=np.float32)
+                    ramp_out = np.clip(ramp_out, 0.0, 1.0)
+                    
+                    cf_chunk_faded = cf_chunk * ramp_out[:, np.newaxis]
+                    
+                    proc_view = proc_buf.reshape(-1, 2)
+                    proc_view[:mix_len] += cf_chunk_faded
+                    
+                    self.crossfade_pos += mix_len
+                else:
+                    self.crossfade_active = False
+        except Exception:
+            pass
 
     def get_position_ms(self):
         return int((self.current_frame / self.samplerate) * 1000)
@@ -3425,7 +3500,7 @@ class InfoDisplayWidget(QWidget):
 class GradientSlider(QSlider):
     def __init__(self, orientation=Qt.Horizontal, parent=None):
         super().__init__(orientation, parent)
-        self.setFixedHeight(12) # Biraz daha ince, şık olsun
+        self.setFixedHeight(20)  # Daha geniş ve net
         self.shift = 0.0
         self._aura_speed = 1.0
         self._aura_base_hue_f = None  # 0..1 (HSV hue fraction)
@@ -3433,9 +3508,13 @@ class GradientSlider(QSlider):
         self._aura_value_f = 1.0
         self._aura_span_f = 0.20
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(100)
+        self._anim_timer.setInterval(50)  # Daha akıcı animasyon (100ms -> 50ms)
         self._anim_timer.timeout.connect(self._animate_gradient)
         self._anim_timer.start()
+        self._is_seeking = False  # Drag state tracking
+        
+        # Mouse tracking aktif
+        self.setMouseTracking(True)
 
     def set_aura_speed(self, speed: float):
         """Aura akış hızını ayarla (1.0 = normal)."""
@@ -3463,24 +3542,52 @@ class GradientSlider(QSlider):
             self._aura_base_hue_f = None
 
     def _animate_gradient(self):
-        self.shift += 0.02 * float(self._aura_speed)  # video oynarken hızlanır, durunca yavaşlar
+        self.shift += 0.03 * float(self._aura_speed)  # Daha hızlı animasyon
         if self.shift > 1.0:
             self.shift -= 1.0
         self.update()
 
     def mousePressEvent(self, event):
-        """Etkileşimli Süre Çubuğu: Tıklanan yere atla"""
+        """Etkileşimli Süre Çubuğu: Tıklanan yere anında atla"""
         if event.button() == Qt.LeftButton:
+            self._is_seeking = True
             val = QStyle.sliderValueFromPosition(
                 self.minimum(), self.maximum(), 
                 event.x(), self.width()
             )
             self.setValue(val)
-            self.sliderMoved.emit(val) 
-            self.sliderReleased.emit()
+            self.sliderMoved.emit(val)
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Mouse drag: Sürekli güncelleme"""
+        if self._is_seeking and event.buttons() & Qt.LeftButton:
+            val = QStyle.sliderValueFromPosition(
+                self.minimum(), self.maximum(), 
+                event.x(), self.width()
+            )
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """Mouse release: Seeking tamamlandı"""
+        if event.button() == Qt.LeftButton and self._is_seeking:
+            self._is_seeking = False
+            val = QStyle.sliderValueFromPosition(
+                self.minimum(), self.maximum(), 
+                event.x(), self.width()
+            )
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            self.sliderReleased.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
         if self.maximum() <= self.minimum():
@@ -3510,13 +3617,18 @@ class GradientSlider(QSlider):
         
         rect = self.rect()
         
-        # 1. Groove (Kanal)
-        groove_rect = rect.adjusted(0, 4, 0, -4)
-        painter.setBrush(QColor("#263238"))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(groove_rect, 2, 2)
+        # 1. Groove (Kanal) - Daha geniş ve estetik
+        groove_rect = rect.adjusted(0, 5, 0, -5)
         
-        # 2. Progress Aura Gradient
+        # Groove gradient (koyu -> daha koyu)
+        groove_grad = QLinearGradient(groove_rect.topLeft(), groove_rect.bottomLeft())
+        groove_grad.setColorAt(0.0, QColor(38, 50, 56, 240))
+        groove_grad.setColorAt(1.0, QColor(26, 35, 39, 250))
+        painter.setBrush(QBrush(groove_grad))
+        painter.setPen(QPen(QColor(85, 85, 85, 120), 1))
+        painter.drawRoundedRect(groove_rect, 4, 4)  # Daha yuvarlatılmış
+        
+        # 2. Progress Aura Gradient - Çok daha parlak ve akıcı
         if self.maximum() > 0:
             ratio = self.value() / self.maximum()
         else:
@@ -3525,40 +3637,65 @@ class GradientSlider(QSlider):
         width = max(0, min(rect.width(), int(rect.width() * ratio)))
         progress_rect = groove_rect.adjusted(0, 0, width - rect.width(), 0)
         
-        # Akıcı Renkler (Aura)
-        grad = QLinearGradient(progress_rect.topLeft(), progress_rect.topRight())
-        # Varsayılan: rainbow neon. (Video sekmesinde tema tabanlı moda geçer)
-        if self._aura_base_hue_f is not None:
-            base = self._aura_base_hue_f
-            c1 = QColor.fromHsvF((base + self.shift) % 1.0, self._aura_saturation_f, self._aura_value_f)
-            c2 = QColor.fromHsvF((base + self.shift + self._aura_span_f) % 1.0, self._aura_saturation_f, self._aura_value_f)
-        else:
-            # Neon tonları: Cyan, Magenta, Purple
-            c1 = QColor.fromHsvF((0.5 + self.shift) % 1.0, 0.8, 1.0)
-            c2 = QColor.fromHsvF((0.7 + self.shift) % 1.0, 0.8, 1.0)
+        if width > 0:
+            # Çok renkli gradient aura (tema bazlı veya rainbow)
+            grad = QLinearGradient(progress_rect.topLeft(), progress_rect.topRight())
+            
+            if self._aura_base_hue_f is not None:
+                # Tema bazlı renkler
+                base = self._aura_base_hue_f
+                # Çoklu renk durağı (daha zengin gradient)
+                grad.setColorAt(0.0, QColor.fromHsvF((base + self.shift) % 1.0, self._aura_saturation_f, self._aura_value_f))
+                grad.setColorAt(0.5, QColor.fromHsvF((base + self.shift + self._aura_span_f * 0.5) % 1.0, self._aura_saturation_f * 0.9, self._aura_value_f))
+                grad.setColorAt(1.0, QColor.fromHsvF((base + self.shift + self._aura_span_f) % 1.0, self._aura_saturation_f, self._aura_value_f * 0.95))
+            else:
+                # Neon rainbow (varsayılan)
+                grad.setColorAt(0.0, QColor.fromHsvF((0.50 + self.shift) % 1.0, 0.85, 1.0))  # Cyan
+                grad.setColorAt(0.33, QColor.fromHsvF((0.60 + self.shift) % 1.0, 0.80, 1.0))  # Mavi
+                grad.setColorAt(0.67, QColor.fromHsvF((0.75 + self.shift) % 1.0, 0.85, 0.95))  # Mor
+                grad.setColorAt(1.0, QColor.fromHsvF((0.85 + self.shift) % 1.0, 0.80, 1.0))  # Pembe
+            
+            painter.setBrush(QBrush(grad))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(progress_rect, 4, 4)
+            
+            # Işıltı efekti (üst kısımda parlak çizgi)
+            shimmer_rect = progress_rect.adjusted(2, 1, -2, -progress_rect.height()//2 - 1)
+            if shimmer_rect.width() > 0 and shimmer_rect.height() > 0:
+                shimmer_grad = QLinearGradient(shimmer_rect.topLeft(), shimmer_rect.bottomLeft())
+                shimmer_grad.setColorAt(0.0, QColor(255, 255, 255, 60))
+                shimmer_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+                painter.setBrush(QBrush(shimmer_grad))
+                painter.drawRoundedRect(shimmer_rect, 2, 2)
         
-        grad.setColorAt(0.0, c1)
-        grad.setColorAt(1.0, c2)
-        
-        painter.setBrush(QBrush(grad))
-        painter.drawRoundedRect(progress_rect, 2, 2)
-        
+        # 3. Animasyonlu Nokta (Handle) - Daha büyük ve parlak
         def _draw_dot(x_pos):
             dot_pos = QPointF(x_pos, groove_rect.center().y())
-            dot_color = QColor(76, 255, 90)
-            glow = QRadialGradient(dot_pos, 6)
-            glow.setColorAt(0, QColor(dot_color.red(), dot_color.green(), dot_color.blue(), 190))
-            glow.setColorAt(1, QColor(dot_color.red(), dot_color.green(), dot_color.blue(), 0))
+            
+            # Glow efekti
+            glow = QRadialGradient(dot_pos, 9)
+            if self._aura_base_hue_f is not None:
+                base_col = QColor.fromHsvF(self._aura_base_hue_f, self._aura_saturation_f, self._aura_value_f)
+                glow.setColorAt(0, QColor(base_col.red(), base_col.green(), base_col.blue(), 220))
+                glow.setColorAt(1, QColor(base_col.red(), base_col.green(), base_col.blue(), 0))
+            else:
+                glow.setColorAt(0, QColor(76, 255, 220, 220))
+                glow.setColorAt(1, QColor(76, 255, 220, 0))
+            
             painter.setBrush(QBrush(glow))
             painter.setPen(Qt.NoPen)
-            painter.drawEllipse(dot_pos, 6, 6)
-            painter.setBrush(dot_color)
-            painter.drawEllipse(dot_pos, 3.2, 3.2)
+            painter.drawEllipse(dot_pos, 9, 9)
+            
+            # İç nokta (beyaz parlak)
+            painter.setBrush(QColor(255, 255, 255, 240))
+            painter.drawEllipse(dot_pos, 4, 4)
+            
+            # Çok küçük merkez parlama
+            painter.setBrush(QColor(255, 255, 255))
+            painter.drawEllipse(dot_pos, 2, 2)
 
-        # 3. Start + Current Dots
-        start_x = groove_rect.left()
+        # 4. Handle (Sadece progress pozisyonunda)
         progress_x = groove_rect.left() + groove_rect.width() * ratio
-        _draw_dot(start_x)
         _draw_dot(progress_x)
 
 # ---------------------------------------------------------------------------
@@ -8322,18 +8459,30 @@ class AngollaPlayer(QMainWindow):
         self.prevButton = QPushButton()
         self.playButton = QPushButton()
         self.nextButton = QPushButton()
+        
+        # Hızlı İleri/Geri butonları (10 saniye)
+        self.seekBackwardButton = QPushButton()
+        self.seekForwardButton = QPushButton()
+        
         icon_size = QSize(30, 30)
         self.icon_play = QIcon(os.path.join("icons", "media-playback-start.png"))
         self.icon_pause = QIcon(os.path.join("icons", "media-playback-pause.png"))
         icon_map = {
-            self.prevButton: "media-skip-backward.png",   # geri
+            self.prevButton: "media-skip-backward.png",   # önceki parça
             self.playButton: "media-playback-start.png",  # play
-            self.nextButton: "media-skip-forward.png",    # ileri
+            self.nextButton: "media-skip-forward.png",    # sonraki parça
+            self.seekBackwardButton: "media-seek-backward.png",  # 10sn geri
+            self.seekForwardButton: "media-seek-forward.png",    # 10sn ileri
         }
         for btn, icon_name in icon_map.items():
             btn.setIcon(QIcon(os.path.join("icons", icon_name)))
             btn.setIconSize(icon_size)
-            btn.setFixedSize(38, 38)
+            # Seek butonları biraz daha küçük
+            if btn in (self.seekBackwardButton, self.seekForwardButton):
+                btn.setFixedSize(34, 34)
+                btn.setIconSize(QSize(24, 24))
+            else:
+                btn.setFixedSize(38, 38)
             # Not: overlay butonlarının burada gizlenmesine izin verme —
             # overlay görünürlüğü web açma/URL change sırasında kontrol edilir.
 
@@ -8341,8 +8490,8 @@ class AngollaPlayer(QMainWindow):
         self.repeatButton = QPushButton()
         for btn in (self.shuffleButton, self.repeatButton):
             btn.setCheckable(True)
-            btn.setFixedSize(34, 32)
-            btn.setIconSize(QSize(20, 20))
+            btn.setFixedSize(34, 34)
+            btn.setIconSize(QSize(22, 22))
             btn.setCursor(Qt.PointingHandCursor)
 
         self._shuffle_icon_off = QIcon(os.path.join("icons", "shuffle.svg"))
@@ -8359,6 +8508,8 @@ class AngollaPlayer(QMainWindow):
             self.prevButton,
             self.playButton,
             self.nextButton,
+            self.seekBackwardButton,
+            self.seekForwardButton,
             self.shuffleButton,
             self.repeatButton,
         ]
@@ -8366,12 +8517,33 @@ class AngollaPlayer(QMainWindow):
             btn.setFlat(True)
             btn.setStyleSheet("""
                 QPushButton {
-                    background: transparent;
-                    border: none;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(70, 70, 70, 180),
+                        stop:1 rgba(50, 50, 50, 200));
+                    border: 1px solid rgba(100, 100, 100, 150);
+                    border-radius: 19px;
                     padding: 2px;
                 }
-                QPushButton:hover { background: transparent; }
-                QPushButton:checked { background: transparent; }
+                QPushButton:hover {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 rgba(64, 196, 255, 220),
+                        stop:0.5 rgba(50, 180, 240, 230),
+                        stop:1 rgba(40, 160, 220, 240));
+                    border: 2px solid rgba(100, 220, 255, 255);
+                    transform: scale(1.05);
+                }
+                QPushButton:pressed {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(40, 160, 220, 240),
+                        stop:1 rgba(20, 120, 180, 255));
+                    border: 2px solid rgba(64, 196, 255, 255);
+                }
+                QPushButton:checked { 
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(64, 196, 255, 220),
+                        stop:1 rgba(40, 160, 220, 240));
+                    border: 2px solid rgba(100, 220, 255, 255);
+                }
                 QPushButton:focus { outline: none; }
             """)
 
@@ -8386,54 +8558,131 @@ class AngollaPlayer(QMainWindow):
         self.eqButton.setToolTip("DSP Equalizer")
         self.eqButton.setStyleSheet("""
             QPushButton {
-                background-color: #263238;
-                border: 1px solid #555;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(60, 70, 80, 200),
+                    stop:1 rgba(38, 50, 56, 230));
+                border: 1px solid rgba(85, 85, 85, 180);
                 font-size: 16px;
-                border-radius: 4px;
+                border-radius: 8px;
             }
-            QPushButton:hover { background-color: #37474F; }
-            QPushButton:pressed { background-color: #40C4FF; color: #000; }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(80, 100, 120, 220),
+                    stop:1 rgba(55, 71, 79, 250));
+                border: 1px solid rgba(64, 196, 255, 200);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(64, 196, 255, 240),
+                    stop:1 rgba(40, 160, 220, 255));
+                color: #000;
+                border: 1px solid rgba(100, 220, 255, 255);
+            }
         """)
         self.eqButton.clicked.connect(self._toggle_popup_eq)
         
         self.popup_eq = PopupEqualizerWidget(parent=self, manager=self.audio_manager)
         # Popup'i gizli baslat
-        self.popup_eq.hide()
-
-        self.volumeSlider = QSlider(Qt.Horizontal)
-        self.volumeSlider.setMinimumWidth(80)
-        self.volumeSlider.setRange(0, 100)
-        self.volumeSlider.setValue(70)
-        # Rainbow efekt için başlangıç stili (timer tarafından güncellenecek)
-        self.volumeSlider.setStyleSheet("""
-            QSlider::groove:horizontal {
-                background: #333; height: 6px; border-radius: 3px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #40C4FF; height: 6px; border-radius: 3px;
-            }
-            QSlider::add-page:horizontal {
-                background: #2E2E2E; border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #40C4FF; border: 2px solid #000;
-                width: 12px; margin: -4px 0; border-radius: 6px;
+        
+        # Playback Rate Controls (Video Hızlandırma/Yavaşlatma)
+        self.playbackRateLabel = QLabel("1.0x")
+        self.playbackRateLabel.setFixedWidth(45)
+        self.playbackRateLabel.setAlignment(Qt.AlignCenter)
+        self.playbackRateLabel.setStyleSheet("""
+            QLabel {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(50, 50, 50, 200),
+                    stop:1 rgba(30, 30, 30, 220));
+                border: 1px solid rgba(80, 80, 80, 150);
+                border-radius: 6px;
+                color: #40C4FF;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 2px 4px;
             }
         """)
+        self.playbackRateLabel.setToolTip("Video Oynatma Hızı")
+        
+        self.playbackRateNormalBtn = QPushButton("Norm.")
+        self.playbackRateDecreaseBtn = QPushButton("−")
+        self.playbackRateIncreaseBtn = QPushButton("+")
+        
+        for btn in [self.playbackRateNormalBtn, self.playbackRateDecreaseBtn, self.playbackRateIncreaseBtn]:
+            btn.setFixedSize(40, 28)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(60, 70, 80, 200),
+                        stop:1 rgba(38, 50, 56, 230));
+                    border: 1px solid rgba(85, 85, 85, 180);
+                    font-size: 12px;
+                    font-weight: bold;
+                    border-radius: 6px;
+                    color: #E0E0E0;
+                }
+                QPushButton:hover {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(80, 100, 120, 220),
+                        stop:1 rgba(55, 71, 79, 250));
+                    border: 1px solid rgba(64, 196, 255, 200);
+                    color: #40C4FF;
+                }
+                QPushButton:pressed {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(64, 196, 255, 240),
+                        stop:1 rgba(40, 160, 220, 255));
+                    border: 1px solid rgba(100, 220, 255, 255);
+                    color: #000;
+                }
+            """)
+        
+        self.playbackRateNormalBtn.setToolTip("Normal Hız (1.0x) - Klavye: \\ veya =")
+        self.playbackRateDecreaseBtn.setToolTip("Hızı Azalt - Klavye: [")
+        self.playbackRateIncreaseBtn.setToolTip("Hızı Artır - Klavye: ]")
+        
+        self.playbackRateNormalBtn.clicked.connect(self._set_playback_rate_normal)
+        self.playbackRateDecreaseBtn.clicked.connect(self._decrease_playback_rate)
+        self.playbackRateIncreaseBtn.clicked.connect(self._increase_playback_rate)
+        
+        # Playback rate değişkeni
+        self._current_playback_rate = 1.0
+        self._playback_rate_steps = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+        self.popup_eq.hide()
+
+        # Volume Slider - Modern gradient efektli
+        self.volumeSlider = GradientSlider(Qt.Horizontal)
+        self.volumeSlider.setMinimumWidth(100)
+        self.volumeSlider.setFixedHeight(16)  # Biraz daha ince
+        self.volumeSlider.setRange(0, 100)
+        self.volumeSlider.setValue(70)
 
         self.positionSlider = GradientSlider(Qt.Horizontal)
         self.lblCurrentTime = QLabel("00:00")
-        self.lblCurrentTime.setStyleSheet("color: #40C4FF; font-weight: bold; font-family: 'Segoe UI', sans-serif;")
-        self.lblCurrentTime.setFixedWidth(45)
+        self.lblCurrentTime.setStyleSheet("color: #40C4FF; font-weight: bold; font-family: 'Segoe UI', sans-serif; font-size: 13px;")
+        self.lblCurrentTime.setFixedWidth(50)
         self.lblCurrentTime.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         
         self.lblTotalTime = QLabel("00:00")
-        self.lblTotalTime.setStyleSheet("color: #888; font-weight: bold; font-family: 'Segoe UI', sans-serif;")
-        self.lblTotalTime.setFixedWidth(45)
+        self.lblTotalTime.setStyleSheet("color: #888; font-weight: bold; font-family: 'Segoe UI', sans-serif; font-size: 13px;")
+        self.lblTotalTime.setFixedWidth(50)
         self.fileLabel = QLabel("Şu An Çalınan: -")
         self.fileLabel.setAlignment(Qt.AlignLeft)
         self.volumeLabel = QLabel("70%")
-        self.volumeLabel.setFixedWidth(40)
+        self.volumeLabel.setFixedWidth(45)
+        self.volumeLabel.setAlignment(Qt.AlignCenter)
+        self.volumeLabel.setStyleSheet("""
+            QLabel {
+                color: #40C4FF;
+                font-weight: bold;
+                font-size: 12px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(50, 50, 50, 180),
+                    stop:1 rgba(30, 30, 30, 200));
+                border: 1px solid rgba(80, 80, 80, 150);
+                border-radius: 6px;
+                padding: 2px 4px;
+            }
+        """)
         self.searchBar = None
         self.search_mode = "local"
         self.search_provider = None
@@ -8619,6 +8868,14 @@ class AngollaPlayer(QMainWindow):
                 self.videoPlayer.setMedia(QMediaContent(url))
                 self.videoPlayer.play()
                 self.statusBar().showMessage(f"Oynatılıyor: {os.path.basename(path)}", 5000)
+                
+                # Playback rate'i uygula (kaydedilmiş veya mevcut değeri koru)
+                try:
+                    if hasattr(self, '_current_playback_rate'):
+                        self.videoPlayer.setPlaybackRate(self._current_playback_rate)
+                except Exception:
+                    pass
+                
                 try:
                     # Kontrollerin videoPlayer'a göre aktifleşmesini tetikle
                     self._on_video_media_status_changed(QMediaPlayer.LoadedMedia)
@@ -9020,6 +9277,67 @@ class AngollaPlayer(QMainWindow):
                 self.video_hud_mute.setIcon(self.style().standardIcon(ico))
         except Exception:
             pass
+
+    def _set_playback_rate(self, rate: float):
+        """Video oynatma hızını ayarla."""
+        if not hasattr(self, 'videoPlayer'):
+            return
+        try:
+            # Rate'i geçerli aralıkta tut
+            rate = max(0.25, min(2.0, rate))
+            self._current_playback_rate = rate
+            self.videoPlayer.setPlaybackRate(rate)
+            
+            # Label'ı güncelle
+            if hasattr(self, 'playbackRateLabel'):
+                self.playbackRateLabel.setText(f"{rate:.2f}x")
+            
+            # Durum çubuğunda bildir
+            self.statusBar().showMessage(f"Oynatma hızı: {rate:.2f}x", 2000)
+        except Exception as e:
+            print(f"Playback rate ayarlama hatası: {e}")
+
+    def _set_playback_rate_normal(self):
+        """Normal hıza (1.0x) dön."""
+        self._set_playback_rate(1.0)
+
+    def _increase_playback_rate(self):
+        """Playback rate'i bir kademe artır."""
+        try:
+            current = self._current_playback_rate
+            # Mevcut rate'den büyük en küçük adımı bul
+            next_rate = None
+            for step in self._playback_rate_steps:
+                if step > current + 0.01:  # Küçük tolerans
+                    next_rate = step
+                    break
+            
+            if next_rate is None:
+                # Son adımdaysak, maksimum değerde kal
+                next_rate = self._playback_rate_steps[-1]
+            
+            self._set_playback_rate(next_rate)
+        except Exception as e:
+            print(f"Hız artırma hatası: {e}")
+
+    def _decrease_playback_rate(self):
+        """Playback rate'i bir kademe azalt."""
+        try:
+            current = self._current_playback_rate
+            # Mevcut rate'den küçük en büyük adımı bul
+            prev_rate = None
+            for step in reversed(self._playback_rate_steps):
+                if step < current - 0.01:  # Küçük tolerans
+                    prev_rate = step
+                    break
+            
+            if prev_rate is None:
+                # İlk adımdaysak, minimum değerde kal
+                prev_rate = self._playback_rate_steps[0]
+            
+            self._set_playback_rate(prev_rate)
+        except Exception as e:
+            print(f"Hız azaltma hatası: {e}")
 
     def _on_video_volume_changed(self, v: int):
         """VideoPlayer ses değiştiğinde HUD slider'ı senkronla (izole)."""
@@ -10250,16 +10568,13 @@ class AngollaPlayer(QMainWindow):
         self.video_seek_slider = GradientSlider(Qt.Horizontal)
         self.video_seek_slider.setRange(0, 0)
         self.video_seek_slider.sliderMoved.connect(self._set_video_position)
-        try:
-            self.video_seek_slider.setFixedHeight(18)
-        except Exception:
-            pass
+        # GradientSlider zaten fixedHeight=20 olarak ayarlı
 
         # Normal mod zaman göstergeleri
         self.video_time_current = QLabel("00:00")
         self.video_time_total = QLabel("00:00")
         for _lbl in (self.video_time_current, self.video_time_total):
-            _lbl.setStyleSheet("color: #e0e0e0; padding: 0 8px;")
+            _lbl.setStyleSheet("color: #e0e0e0; padding: 0 8px; font-size: 13px; font-weight: bold;")
 
         # Video overlay host (video + HUD)
         self.video_overlay_host = QWidget()
@@ -10290,16 +10605,36 @@ class AngollaPlayer(QMainWindow):
         eo_layout.addWidget(self.video_error_open_btn, alignment=Qt.AlignCenter)
         vgrid.addWidget(self.video_error_overlay, 0, 0, alignment=Qt.AlignCenter)
 
-        # Normal mod: Tam ekran butonu (video sekmesiyle izole)
+        # Normal mod: Tam ekran butonu (video sekmesiyle izole) - Modern tasarım
         self.video_fs_button = QToolButton(self.video_overlay_host)
         self.video_fs_button.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
         self.video_fs_button.setAutoRaise(True)
         self.video_fs_button.setToolTip("Tam Ekran (F11)")
         self.video_fs_button.clicked.connect(self._toggle_video_fullscreen)
-        self.video_fs_button.setStyleSheet(
-            "QToolButton { background: rgba(42,42,42,160); border: 1px solid rgba(85,85,85,180); border-radius: 8px; padding: 6px; }"
-            "QToolButton:pressed { background: rgba(64,196,255,90); }"
-        )
+        self.video_fs_button.setFixedSize(40, 40)
+        self.video_fs_button.setIconSize(QSize(22, 22))
+        self.video_fs_button.setStyleSheet("""
+            QToolButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(50, 50, 50, 200),
+                    stop:1 rgba(30, 30, 30, 230));
+                border: 1px solid rgba(85, 85, 85, 150);
+                border-radius: 10px;
+                padding: 4px;
+            }
+            QToolButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(64, 196, 255, 200),
+                    stop:1 rgba(40, 160, 220, 230));
+                border: 2px solid rgba(100, 220, 255, 255);
+            }
+            QToolButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(40, 160, 220, 240),
+                    stop:1 rgba(20, 120, 180, 255));
+                border: 2px solid rgba(64, 196, 255, 255);
+            }
+        """)
         vgrid.addWidget(self.video_fs_button, 0, 0, alignment=Qt.AlignTop | Qt.AlignRight)
 
         # HUD (sadece tam ekranda görünür)
@@ -10318,17 +10653,14 @@ class AngollaPlayer(QMainWindow):
         self.video_hud_progress = GradientSlider(Qt.Horizontal)
         self.video_hud_progress.setRange(0, 0)
         self.video_hud_progress.sliderMoved.connect(self._set_video_position)
-        try:
-            self.video_hud_progress.setFixedHeight(18)
-        except Exception:
-            pass
+        # GradientSlider zaten fixedHeight=20 olarak ayarlı
 
         # HUD progress + zaman
         hud_layout.addWidget(self.video_hud_progress)
         self.video_hud_time_current = QLabel("00:00")
         self.video_hud_time_total = QLabel("00:00")
         for _lbl in (self.video_hud_time_current, self.video_hud_time_total):
-            _lbl.setStyleSheet("color: #e0e0e0; padding: 0 6px;")
+            _lbl.setStyleSheet("color: #e0e0e0; padding: 0 6px; font-size: 14px; font-weight: bold;")
         time_row = QHBoxLayout()
         time_row.setContentsMargins(0, 0, 0, 0)
         time_row.addWidget(self.video_hud_time_current)
@@ -10347,10 +10679,30 @@ class AngollaPlayer(QMainWindow):
             b.setAutoRaise(True)
             b.setToolTip(tip)
             b.clicked.connect(cb)
-            b.setStyleSheet(
-                "QToolButton { background: transparent; border: 1px solid rgba(85,85,85,180); border-radius: 6px; padding: 6px; }"
-                "QToolButton:pressed { background: rgba(64,196,255,90); }"
-            )
+            b.setFixedSize(36, 36)
+            b.setIconSize(QSize(20, 20))
+            b.setStyleSheet("""
+                QToolButton {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(60, 60, 60, 200),
+                        stop:1 rgba(40, 40, 40, 230));
+                    border: 1px solid rgba(100, 100, 100, 150);
+                    border-radius: 8px;
+                    padding: 2px;
+                }
+                QToolButton:hover {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(64, 196, 255, 220),
+                        stop:1 rgba(40, 160, 220, 240));
+                    border: 2px solid rgba(100, 220, 255, 255);
+                }
+                QToolButton:pressed {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(40, 160, 220, 240),
+                        stop:1 rgba(20, 120, 180, 255));
+                    border: 2px solid rgba(64, 196, 255, 255);
+                }
+            """)
             return b
 
         self.video_hud_prev = _mk_btn(QStyle.SP_MediaSeekBackward, "Geri (10 sn)", lambda: self._video_seek_relative(-10_000))
@@ -10363,23 +10715,88 @@ class AngollaPlayer(QMainWindow):
 
         row.addStretch(1)
 
-        # FPS göstergesi
+        # FPS göstergesi - Modern tasarım
         self.video_hud_fps = QLabel("FPS: --")
+        self.video_hud_fps.setAlignment(Qt.AlignCenter)
+        self.video_hud_fps.setFixedWidth(70)
+        self.video_hud_fps.setStyleSheet("""
+            QLabel {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(50, 50, 50, 220),
+                    stop:1 rgba(30, 30, 30, 240));
+                border: 1px solid rgba(80, 80, 80, 180);
+                border-radius: 8px;
+                color: #4CAF50;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 4px 6px;
+            }
+        """)
         row.addWidget(self.video_hud_fps)
 
-        # Tam ekran düğmesi (HUD içinde)
+        # Tam ekran düğmesi (HUD içinde) - Modern tasarım
         self.video_hud_fullscreen = QToolButton()
         self.video_hud_fullscreen.setAutoRaise(True)
         self.video_hud_fullscreen.setToolTip("Tam Ekran (F11)")
         self.video_hud_fullscreen.clicked.connect(self._toggle_video_fullscreen)
         self.video_hud_fullscreen.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
+        self.video_hud_fullscreen.setFixedSize(36, 36)
+        self.video_hud_fullscreen.setIconSize(QSize(20, 20))
+        self.video_hud_fullscreen.setStyleSheet("""
+            QToolButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(60, 60, 60, 200),
+                    stop:1 rgba(40, 40, 40, 230));
+                border: 1px solid rgba(100, 100, 100, 150);
+                border-radius: 8px;
+                padding: 2px;
+            }
+            QToolButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(64, 196, 255, 220),
+                    stop:1 rgba(40, 160, 220, 240));
+                border: 2px solid rgba(100, 220, 255, 255);
+            }
+            QToolButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(40, 160, 220, 240),
+                    stop:1 rgba(20, 120, 180, 255));
+                border: 2px solid rgba(64, 196, 255, 255);
+            }
+        """)
         row.addWidget(self.video_hud_fullscreen)
 
-        # Ayar menüsü
+        # Ayar menüsü - Modern tasarım
         self.video_hud_settings = QToolButton()
         self.video_hud_settings.setAutoRaise(True)
         self.video_hud_settings.setPopupMode(QToolButton.InstantPopup)
-        self.video_hud_settings.setToolTip("Ayarlar")
+        self.video_hud_settings.setToolTip("Video Ayarları")
+        self.video_hud_settings.setFixedSize(36, 36)
+        self.video_hud_settings.setIconSize(QSize(20, 20))
+        self.video_hud_settings.setStyleSheet("""
+            QToolButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(60, 60, 60, 200),
+                    stop:1 rgba(40, 40, 40, 230));
+                border: 1px solid rgba(100, 100, 100, 150);
+                border-radius: 8px;
+                padding: 2px;
+                color: #E0E0E0;
+                font-size: 18px;
+            }
+            QToolButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(80, 100, 120, 220),
+                    stop:1 rgba(55, 71, 79, 250));
+                border: 2px solid rgba(100, 220, 255, 200);
+            }
+            QToolButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(64, 196, 255, 240),
+                    stop:1 rgba(40, 160, 220, 255));
+                border: 2px solid rgba(100, 220, 255, 255);
+            }
+        """)
         try:
             _pref_ico = QIcon.fromTheme("preferences-system")
             if _pref_ico is not None and not _pref_ico.isNull():
@@ -10388,7 +10805,36 @@ class AngollaPlayer(QMainWindow):
                 self.video_hud_settings.setText("⚙")
         except Exception:
             self.video_hud_settings.setText("⚙")
+        
+        # Modern menü stili
         m = QMenu(self)
+        m.setStyleSheet("""
+            QMenu {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(45, 45, 45, 250),
+                    stop:1 rgba(30, 30, 30, 255));
+                color: #E0E0E0;
+                border: 2px solid rgba(64, 196, 255, 180);
+                border-radius: 8px;
+                padding: 8px 4px;
+            }
+            QMenu::item {
+                padding: 8px 24px 8px 16px;
+                border-radius: 4px;
+                margin: 2px 4px;
+            }
+            QMenu::item:selected {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(64, 196, 255, 200),
+                    stop:1 rgba(40, 160, 220, 220));
+                color: #FFFFFF;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: rgba(100, 100, 100, 150);
+                margin: 6px 8px;
+            }
+        """)
         act_rot_l = QAction("↩️ Sola Çevir (90°)", self)
         act_rot_r = QAction("↪️ Sağa Çevir (90°)", self)
         act_rot_0 = QAction("⏹️ Sıfırla (Normal)", self)
@@ -10499,16 +10945,54 @@ class AngollaPlayer(QMainWindow):
             b.setAutoRaise(True)
             b.setToolTip(tip)
             b.clicked.connect(cb)
-            try:
-                b.setIconSize(QSize(18, 18))
-            except Exception:
-                pass
+            b.setFixedSize(36, 36)
+            b.setIconSize(QSize(20, 20))
+            b.setStyleSheet("""
+                QToolButton {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(60, 60, 60, 180),
+                        stop:1 rgba(40, 40, 40, 200));
+                    border: 1px solid rgba(100, 100, 100, 150);
+                    border-radius: 8px;
+                    padding: 2px;
+                }
+                QToolButton:hover {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(64, 196, 255, 200),
+                        stop:1 rgba(40, 160, 220, 230));
+                    border: 2px solid rgba(100, 220, 255, 255);
+                }
+                QToolButton:pressed {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(40, 160, 220, 240),
+                        stop:1 rgba(20, 120, 180, 255));
+                    border: 2px solid rgba(64, 196, 255, 255);
+                }
+            """)
             return b
 
         self.video_ctl_prev = _mk_ctl_btn(QStyle.SP_MediaSeekBackward, "Geri (10 sn)", lambda: self._video_seek_relative(-10_000))
         self.video_ctl_play = _mk_ctl_btn(QStyle.SP_MediaPlay, "Oynat/Duraklat", self._video_toggle_play)
         self.video_ctl_next = _mk_ctl_btn(QStyle.SP_MediaSeekForward, "İleri (10 sn)", lambda: self._video_seek_relative(10_000))
+        
+        # FPS göstergesi - Modern tasarım
         self.video_ctl_fps = QLabel("FPS: --")
+        self.video_ctl_fps.setAlignment(Qt.AlignCenter)
+        self.video_ctl_fps.setFixedWidth(70)
+        self.video_ctl_fps.setStyleSheet("""
+            QLabel {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(50, 50, 50, 200),
+                    stop:1 rgba(30, 30, 30, 220));
+                border: 1px solid rgba(80, 80, 80, 150);
+                border-radius: 8px;
+                color: #4CAF50;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 4px 6px;
+            }
+        """)
+        
         self.video_ctl_fullscreen = _mk_ctl_btn(QStyle.SP_TitleBarMaxButton, "Tam Ekran (F11)", self._toggle_video_fullscreen)
 
         ctrl_layout.addWidget(self.video_ctl_prev)
@@ -10679,12 +11163,22 @@ class AngollaPlayer(QMainWindow):
         self.eqButton.setToolTip("Ses Efektleri (DSP)")
         
         controlBar.addWidget(self.shuffleButton)
+        controlBar.addWidget(self.seekBackwardButton)  # 10sn geri
         controlBar.addWidget(self.prevButton)
         controlBar.addWidget(self.playButton)
         controlBar.addWidget(self.nextButton)
+        controlBar.addWidget(self.seekForwardButton)  # 10sn ileri
         controlBar.addWidget(self.repeatButton)
         
         controlBar.addStretch(1)  # Sağ boşluk (1 kat)
+        
+        # Playback Rate Controls (Video Hızlandırma)
+        controlBar.addWidget(QLabel("⏩ Hız:"))
+        controlBar.addWidget(self.playbackRateDecreaseBtn)
+        controlBar.addWidget(self.playbackRateLabel)
+        controlBar.addWidget(self.playbackRateIncreaseBtn)
+        controlBar.addWidget(self.playbackRateNormalBtn)
+        controlBar.addSpacing(15)
         
         # Volume controls (aynı satırın sağ ucunda)
         controlBar.addWidget(self.eqButton) # EQ Button (Ses Efektleri) - FIXED VISIBILITY
@@ -10706,10 +11200,14 @@ class AngollaPlayer(QMainWindow):
         bottomWidget = QWidget()
         bottomWidget.setObjectName("bottomWidget")
         bottomWidget.setLayout(bottomContainer)
+        # Modern gradient ve transparan arka plan (tema değişiminde güncellenecek)
         bottomWidget.setStyleSheet("""
             QWidget#bottomWidget {
-                background-color: #2A2A2A;
-                border-top: 1px solid #444444;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(42, 42, 42, 240),
+                    stop:1 rgba(20, 20, 20, 250));
+                border-top: 2px solid rgba(64, 196, 255, 180);
+                border-radius: 0px;
             }
         """)
         self.bottom_widget = bottomWidget
@@ -10844,6 +11342,10 @@ class AngollaPlayer(QMainWindow):
         self.playButton.clicked.connect(self.play_pause)
         self.nextButton.clicked.connect(self._next_track)
         self.prevButton.clicked.connect(self._prev_track)
+        
+        # Hızlı ileri/geri butonları (10 saniye)
+        self.seekBackwardButton.clicked.connect(lambda: self._nudge_position(-10000))
+        self.seekForwardButton.clicked.connect(lambda: self._nudge_position(10000))
 
         self.shuffleButton.clicked.connect(self.toggle_shuffle)
         self.repeatButton.clicked.connect(self.toggle_repeat)
@@ -12099,6 +12601,16 @@ class AngollaPlayer(QMainWindow):
             self.lblCurrentTime.setText(current_time)
             self.lblTotalTime.setText(total_time)
 
+            # Auto Crossfade Trigger
+            cf_dur = self.config_data.get("crossfade_duration", 0)
+            if cf_dur > 0 and not getattr(self, "_crossfade_triggered", False):
+                remaining = total_duration - position
+                if remaining <= cf_dur and self.audio_engine.media_player.state() == QMediaPlayer.PlayingState:
+                    if self.playlist.currentIndex() < self.playlist.mediaCount() - 1 or \
+                       self.playlist.playbackMode() in (QMediaPlaylist.Loop, QMediaPlaylist.CurrentItemInLoop):
+                        self._crossfade_triggered = True
+                        self._next_track()
+
     def duration_changed(self, duration):
         self.positionSlider.setRange(0, duration)
         if duration > 0:
@@ -12291,6 +12803,7 @@ class AngollaPlayer(QMainWindow):
             effect.setOpacity(1.0 if active else 0.7)
 
     def playlist_position_changed(self, index):
+        self._crossfade_triggered = False
         # ═══════════════════════════════════════════════════════════════
         # YEREL MÜZİK: Web monitor yakalamayı durdur
         # ═══════════════════════════════════════════════════════════════
@@ -12974,6 +13487,35 @@ class AngollaPlayer(QMainWindow):
                         return
                 except Exception:
                     pass
+            
+            # Playback rate kısayolları (video modunda)
+            if hasattr(self, "mainContentStack") and self.mainContentStack.currentIndex() == 1:
+                # ] tuşu: Hızı artır
+                if event.key() == Qt.Key_BracketRight:
+                    try:
+                        self._increase_playback_rate()
+                        event.accept()
+                        return
+                    except Exception:
+                        pass
+                
+                # [ tuşu: Hızı azalt
+                if event.key() == Qt.Key_BracketLeft:
+                    try:
+                        self._decrease_playback_rate()
+                        event.accept()
+                        return
+                    except Exception:
+                        pass
+                
+                # \ veya = tuşu: Normal hız
+                if event.key() in (Qt.Key_Backslash, Qt.Key_Equal):
+                    try:
+                        self._set_playback_rate_normal()
+                        event.accept()
+                        return
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -13974,7 +14516,49 @@ class AngollaPlayer(QMainWindow):
         if name not in self.themes:
             return
         self.theme = name
-        primary_color, text_color, bg_color = self.themes[name]
+        if save:
+            self.config_data["theme"] = name
+
+        # Tema modunu al (Varsayılan: Koyu)
+        mode = self.config_data.get("theme_mode", "Koyu")
+        
+        # Temel renkleri al
+        primary_color, default_text, default_bg = self.themes[name]
+        
+        if mode == "Açık":
+            # Açık Tema Renkleri
+            bg_color = "#F5F5F5"
+            text_color = "#222222"
+            widget_bg = "#FFFFFF"
+            list_bg = "#FFFFFF"
+            border_color = primary_color
+            slider_groove = "#CCCCCC"
+            slider_add = "#DDDDDD"
+            handle_border = "#AAAAAA"
+            list_border = "#DDDDDD"
+            
+            # Butonlar için özel açık tema ayarı
+            btn_bg = "#FFFFFF"
+            btn_hover = QColor(primary_color).lighter(160).name()
+            btn_pressed = QColor(primary_color).lighter(140).name()
+            selected_text_color = "white"
+            
+        else:
+            # Koyu Tema Renkleri (Varsayılan)
+            bg_color = default_bg
+            text_color = default_text
+            widget_bg = QColor(bg_color).lighter(110).name()
+            list_bg = QColor(bg_color).lighter(105).name()
+            border_color = primary_color
+            slider_groove = "#555"
+            slider_add = "#2d2d2d"
+            handle_border = "#333"
+            list_border = "#444"
+            
+            btn_bg = widget_bg
+            btn_hover = QColor(primary_color).darker(150).name()
+            btn_pressed = QColor(primary_color).darker(200).name()
+            selected_text_color = "black"
 
         style = f"""
         QMainWindow, QWidget, QDialog {{
@@ -13983,20 +14567,20 @@ class AngollaPlayer(QMainWindow):
         }}
         QPushButton, QComboBox, QLineEdit {{
             color: {text_color};
-            background-color: {QColor(bg_color).lighter(110).name()};
-            border: 1px solid {primary_color};
+            background-color: {btn_bg};
+            border: 1px solid {border_color};
             border-radius: 4px;
         }}
         QPushButton:hover {{
-            background-color: {QColor(primary_color).darker(150).name()};
+            background-color: {btn_hover};
         }}
         QPushButton:pressed {{
-            background-color: {QColor(primary_color).darker(200).name()};
+            background-color: {btn_pressed};
         }}
         QSlider::groove:horizontal {{
             border: 0px;
             height: 6px;
-            background: #555;
+            background: {slider_groove};
             margin: 2px 0;
             border-radius: 3px;
         }}
@@ -14006,13 +14590,13 @@ class AngollaPlayer(QMainWindow):
             border-radius: 3px;
         }}
         QSlider::add-page:horizontal {{
-            background: #2d2d2d;
+            background: {slider_add};
             height: 6px;
             border-radius: 3px;
         }}
         QSlider::handle:horizontal {{
             background: {primary_color};
-            border: 1px solid #333;
+            border: 1px solid {handle_border};
             width: 14px;
             margin: -4px 0;
             border-radius: 7px;
@@ -14021,20 +14605,99 @@ class AngollaPlayer(QMainWindow):
             color: {text_color};
         }}
         QListWidget, QTreeView, QTableWidget {{
-            border: 1px solid #444;
-            background-color: {QColor(bg_color).lighter(105).name()};
+            border: 1px solid {list_border};
+            background-color: {list_bg};
+            color: {text_color};
         }}
         QListWidget::item:selected, QTreeView::item:selected,
         QTableWidget::item:selected {{
             background: {primary_color};
-            color: black;
+            color: {selected_text_color};
         }}
         QSplitter::handle {{
             background-color: {QColor(primary_color).darker(130).name()};
         }}
+        QMenu {{
+            background-color: {widget_bg};
+            border: 1px solid {border_color};
+            color: {text_color};
+        }}
+        QMenu::item:selected {{
+            background-color: {primary_color};
+            color: {selected_text_color};
+        }}
         """
 
         QApplication.instance().setStyleSheet(style)
+
+        # Altbar gradient ve transparan arka planını tema rengine göre güncelle
+        if hasattr(self, 'bottom_widget') and self.bottom_widget:
+            # Tema rengi için gradient oluştur
+            primary_rgb = QColor(primary_color)
+            bg_rgb = QColor(bg_color)
+            
+            # Gradient için renk geçişi hesapla (koyu/açık tema uyumlu)
+            if mode == "Koyu":  # Koyu tema
+                grad_start = f"rgba({bg_rgb.red()}, {bg_rgb.green()}, {bg_rgb.blue()}, 240)"
+                grad_end = f"rgba({max(0, bg_rgb.red()-20)}, {max(0, bg_rgb.green()-20)}, {max(0, bg_rgb.blue()-20)}, 250)"
+                border_col_rgba = f"rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 180)"
+            else:  # Açık tema
+                grad_start = f"rgba(255, 255, 255, 240)"
+                grad_end = f"rgba(240, 240, 240, 250)"
+                border_col_rgba = f"rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 100)"
+            
+            self.bottom_widget.setStyleSheet(f"""
+                QWidget#bottomWidget {{
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 {grad_start},
+                        stop:1 {grad_end});
+                    border-top: 2px solid {border_col_rgba};
+                    border-radius: 0px;
+                }}
+            """)
+        
+        # Butonları tema rengine göre güncelle
+        if hasattr(self, 'prevButton'):
+            control_buttons = [self.prevButton, self.playButton, self.nextButton, 
+                             self.shuffleButton, self.repeatButton, 
+                             self.seekBackwardButton, self.seekForwardButton]
+            primary_rgb = QColor(primary_color)
+            btn_style = f"""
+                QPushButton {{
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(70, 70, 70, 180),
+                        stop:1 rgba(50, 50, 50, 200));
+                    border: 1px solid rgba(100, 100, 100, 150);
+                    border-radius: 19px;
+                    padding: 2px;
+                }}
+                QPushButton:hover {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 220),
+                        stop:0.5 rgba({max(0, primary_rgb.red()-20)}, {max(0, primary_rgb.green()-20)}, {max(0, primary_rgb.blue()-20)}, 230),
+                        stop:1 rgba({max(0, primary_rgb.red()-30)}, {max(0, primary_rgb.green()-30)}, {max(0, primary_rgb.blue()-30)}, 240));
+                    border: 2px solid rgba({min(255, primary_rgb.red()+40)}, {min(255, primary_rgb.green()+40)}, {min(255, primary_rgb.blue()+40)}, 255);
+                }}
+                QPushButton:pressed {{
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba({max(0, primary_rgb.red()-30)}, {max(0, primary_rgb.green()-30)}, {max(0, primary_rgb.blue()-30)}, 240),
+                        stop:1 rgba({max(0, primary_rgb.red()-60)}, {max(0, primary_rgb.green()-60)}, {max(0, primary_rgb.blue()-60)}, 255));
+                    border: 2px solid rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 255);
+                }}
+                QPushButton:checked {{ 
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 220),
+                        stop:1 rgba({max(0, primary_rgb.red()-30)}, {max(0, primary_rgb.green()-30)}, {max(0, primary_rgb.blue()-30)}, 240));
+                    border: 2px solid rgba({min(255, primary_rgb.red()+40)}, {min(255, primary_rgb.green()+40)}, {min(255, primary_rgb.blue()+40)}, 255);
+                }}
+                QPushButton:focus {{ outline: none; }}
+            """
+            for btn in control_buttons:
+                btn.setStyleSheet(btn_style)
+        
+        # Volume slider'a tema rengini uygula
+        if hasattr(self, 'volumeSlider') and hasattr(self.volumeSlider, 'set_aura_base_color'):
+            self.volumeSlider.set_aura_base_color(QColor(primary_color))
 
         # Görselleştirme widget'larını güncelle
         if self.vis_widget_main_window and hasattr(self.vis_widget_main_window, 'set_color_theme'):
@@ -14141,6 +14804,7 @@ class AngollaPlayer(QMainWindow):
         self.config_data["vis_favorites"] = self.vis_favorites
         self.config_data["vis_auto_cycle"] = self.vis_auto_cycle
         self.config_data["lang"] = self.lang
+        self.config_data["playback_rate"] = getattr(self, '_current_playback_rate', 1.0)
 
         # Config'i dosyaya JSON olarak kaydet (pickle yok)
         try:
@@ -14218,6 +14882,20 @@ class AngollaPlayer(QMainWindow):
 
         self.vis_mode = self.config_data.get("vis_mode", "Çizgiler")
         self.use_projectm = self.config_data.get("use_projectm", False)
+        
+        # Crossfade
+        cf_dur = self.config_data.get("crossfade_duration", 1000)
+        if hasattr(self, 'audio_engine'):
+            self.audio_engine.set_crossfade_duration(cf_dur)
+        
+        # Playback rate'i yükle
+        saved_rate = self.config_data.get("playback_rate", 1.0)
+        try:
+            self._current_playback_rate = float(saved_rate)
+            if hasattr(self, 'playbackRateLabel'):
+                self.playbackRateLabel.setText(f"{self._current_playback_rate:.2f}x")
+        except Exception:
+            self._current_playback_rate = 1.0
         self.lang = self.config_data.get("lang", self.lang)
 
         # Çubuk rengi ve stili yükle (Eski AnimatedVisualizationWidget için)
@@ -14440,6 +15118,11 @@ class PreferencesDialog(QDialog):
         self.themeCombo = QComboBox(); self.themeCombo.addItems(self.parent.themes.keys())
         self.themeCombo.setCurrentText(self.parent.config_data.get("theme", "AURA Mavi"))
 
+        self.themeModeLabel = QLabel("Tema Modu:")
+        self.themeModeCombo = QComboBox()
+        self.themeModeCombo.addItems(["Koyu", "Açık"])
+        self.themeModeCombo.setCurrentText(self.parent.config_data.get("theme_mode", "Koyu"))
+
         self.langLabel = QLabel("Dil:")
         self.langCombo = QComboBox()
         lang_map = {"en": "English", "tr": "Türkçe", "es": "Español", "fr": "Français", "de": "Deutsch", "ar": "العربية"}
@@ -14473,7 +15156,7 @@ class PreferencesDialog(QDialog):
             self.projectmCheck.setToolTip("ProjectM yüklenmedi - viz_engine modülü gerekli")
 
         self.crossfadeLabel = QLabel("Crossfade Süresi (ms):")
-        self.crossfadeSlider = QSlider(Qt.Horizontal); self.crossfadeSlider.setRange(0, 5000); self.crossfadeSlider.setSingleStep(100)
+        self.crossfadeSlider = QSlider(Qt.Horizontal); self.crossfadeSlider.setRange(0, 10000); self.crossfadeSlider.setSingleStep(100)
         self.crossfadeSlider.setValue(self.parent.config_data.get("crossfade_duration", 1000))
         self.crossfadeValueLabel = QLabel(f"{self.crossfadeSlider.value()} ms")
 
@@ -14498,9 +15181,10 @@ class PreferencesDialog(QDialog):
         widget = QWidget(); layout = QGridLayout(widget); layout.setColumnStretch(1, 1)
         layout.addWidget(self.albumArtCheck, 0, 0, 1, 2)
         layout.addWidget(self.themeLabel, 1, 0); layout.addWidget(self.themeCombo, 1, 1)
-        layout.addWidget(self.langLabel, 2, 0); layout.addWidget(self.langCombo, 2, 1)
-        layout.addWidget(self.shareLabel, 3, 0); layout.addWidget(self.shareButton, 3, 1)
-        layout.setRowStretch(4, 1)
+        layout.addWidget(self.themeModeLabel, 2, 0); layout.addWidget(self.themeModeCombo, 2, 1)
+        layout.addWidget(self.langLabel, 3, 0); layout.addWidget(self.langCombo, 3, 1)
+        layout.addWidget(self.shareLabel, 4, 0); layout.addWidget(self.shareButton, 4, 1)
+        layout.setRowStretch(5, 1)
         return widget
 
     def _create_playback_page(self):
@@ -14587,6 +15271,7 @@ class PreferencesDialog(QDialog):
     def _connect_signals(self):
         self.categoryList.itemClicked.connect(self._on_category_selected)
         self.albumArtCheck.stateChanged.connect(self._on_value_changed)
+        self.themeModeCombo.currentTextChanged.connect(self._on_value_changed)
         self.themeCombo.currentTextChanged.connect(self._on_value_changed)
         self.langCombo.currentIndexChanged.connect(self._on_value_changed)
         self.crossfadeSlider.valueChanged.connect(self._update_crossfade_label)
@@ -14626,7 +15311,10 @@ class PreferencesDialog(QDialog):
 
     def _apply_settings(self):
         self.parent.config_data["show_album_art"] = self.albumArtCheck.isChecked()
-        self.parent.config_data["crossfade_duration"] = self.crossfadeSlider.value()
+        cf_val = self.crossfadeSlider.value()
+        self.parent.config_data["crossfade_duration"] = cf_val
+        if hasattr(self.parent, 'audio_engine'):
+            self.parent.audio_engine.set_crossfade_duration(cf_val)
         
         # ProjectM ayarı
         use_projectm = self.projectmCheck.isChecked()
@@ -14637,9 +15325,15 @@ class PreferencesDialog(QDialog):
             if self.parent.vis_window:
                 self.parent.vis_window.close()
                 self.parent.open_visualization_window()
-        
         selected_theme = self.themeCombo.currentText()
-        if self.parent.theme != selected_theme:
+        selected_mode = self.themeModeCombo.currentText()
+        
+        mode_changed = False
+        if self.parent.config_data.get("theme_mode") != selected_mode:
+            self.parent.config_data["theme_mode"] = selected_mode
+            mode_changed = True
+
+        if self.parent.theme != selected_theme or mode_changed:
             self.parent.set_theme(selected_theme, save=False)
 
         lang_code = self.langCombo.currentData()
