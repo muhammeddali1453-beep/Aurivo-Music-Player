@@ -1,0 +1,66 @@
+Angolla Music Player - Proprietary License
+Copyright (c) 2026 Muhammet Dali. All rights reserved.
+
+USAGE TERMS AND CONDITIONS
+
+1. OWNERSHIP
+   This software and all associated files (the "Software") are the exclusive 
+   property of Muhammet Dali. All rights are reserved.
+
+2. PERMITTED USAGE
+   - Personal use: You may use this Software for personal, non-commercial purposes.
+   - Evaluation: You may evaluate the Software for 30 days.
+   - Distribution: You may share the compiled package as provided.
+
+3. RESTRICTIONS
+   The following actions are STRICTLY PROHIBITED without explicit written permission:
+   
+   a) Copying or reproducing the source code
+   b) Modifying, adapting, or creating derivative works
+   c) Reverse engineering, decompiling, or disassembling
+   d) Commercial use or redistribution for profit
+   e) Removing or altering any proprietary notices
+   f) Using the Software in any competing product
+   g) Sublicensing or transferring rights to third parties
+
+4. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+   IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS 
+   FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHOR 
+   BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF 
+   THE SOFTWARE.
+
+5. TERMINATION
+   This license is effective until terminated. Your rights will terminate 
+   automatically if you fail to comply with any term. Upon termination, you must 
+   destroy all copies of the Software.
+
+6. COMMERCIAL LICENSING
+   For commercial use, enterprise licensing, or custom features, contact:
+   - Email: [your-email@example.com]
+   - GitHub: https://github.com/muhammeddali1453-beep
+
+7. UPDATES AND SUPPORT
+   - Updates are provided at the sole discretion of the author
+   - Support is provided on a best-effort basis via GitHub Issues
+   - No guaranteed support or maintenance is implied
+
+8. THIRD-PARTY COMPONENTS
+   This Software includes open-source components with their own licenses:
+   - PyQt5 (GPL/Commercial)
+   - NumPy (BSD)
+   - GStreamer (LGPL)
+   - Mutagen (GPL)
+   See individual component licenses for details.
+
+9. GOVERNING LAW
+   This license shall be governed by the laws of Turkey.
+
+10. ACCEPTANCE
+    By using this Software, you acknowledge that you have read this license, 
+    understand it, and agree to be bound by its terms.
+
+---
+
+For questions or permissions, please open an issue at:
+https://github.com/muhammeddali1453-beep/Angolla-Music-Player/issues
