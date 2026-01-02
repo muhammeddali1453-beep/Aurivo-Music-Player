@@ -75,7 +75,32 @@ Detaylı kurulum talimatları için [INSTALL.md](INSTALL.md) dosyasına bakın.
 
 ## 📸 Ekran Görüntüleri
 
-*(Buraya ekran görüntüleri eklenebilir)*
+### Ana Arayüz
+<div align="center">
+  <img src="screenshots/01-main-interface.png" alt="Ana Arayüz" width="80%">
+  <p><em>Playlist yönetimi ve görselleştirme</em></p>
+</div>
+
+### Görselleştirme Modları
+<div align="center">
+  <img src="screenshots/02-visualization-1.png" alt="Görselleştirme 1" width="45%">
+  <img src="screenshots/03-visualization-2.png" alt="Görselleştirme 2" width="45%">
+  <p><em>11 farklı FFT tabanlı görselleştirme modu</em></p>
+</div>
+
+### Ekolayzır & Kütüphane
+<div align="center">
+  <img src="screenshots/04-equalizer.png" alt="10 Bantlı Ekolayzır" width="45%">
+  <img src="screenshots/05-library-view.png" alt="Kütüphane Görünümü" width="45%">
+  <p><em>10 bantlı EQ ve SQLite kütüphane yönetimi</em></p>
+</div>
+
+### Tam Ekran & Video Desteği
+<div align="center">
+  <img src="screenshots/07-fullscreen.png" alt="Tam Ekran Görselleştirme" width="45%">
+  <img src="screenshots/08-video-subtitle.png" alt="Video + Altyazı" width="45%">
+  <p><em>Tam ekran mod ve çoklu dil altyazı desteği</em></p>
+</div>
 
 ## 💻 Teknik Detaylar
 
