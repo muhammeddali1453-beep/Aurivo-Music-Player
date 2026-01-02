@@ -1,5 +1,13 @@
 # Angolla Music Player - Kurulum Rehberi
 
+## ⚠️ DİKKAT
+
+> **Bu uygulama geliştirme aşamasındadır!**  
+> Kararsız davranışlar, hatalar ve eksik özellikler bekleyebilirsiniz.  
+> Lütfen karşılaştığınız sorunları [GitHub Issues](../../issues)'da bildirin.
+
+---
+
 ## 📦 İndirme
 
 ### GitHub Releases'tan İndirme

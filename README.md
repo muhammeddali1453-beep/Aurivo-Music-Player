@@ -9,9 +9,37 @@
 [![Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)](https://github.com)
 [![Python](https://img.shields.io/badge/Python-3.11+-green.svg)](https://python.org)
 [![PyQt5](https://img.shields.io/badge/GUI-PyQt5-orange.svg)](https://riverbankcomputing.com/software/pyqt/)
-[![License](https://img.shields.io/badge/License-GPL--3.0-red.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 
 [📥 İndir](../../releases) | [📖 Kurulum](INSTALL.md) | [🐛 Hata Bildir](../../issues) | [💬 Tartışmalar](../../discussions)
+
+</div>
+
+---
+
+## ⚠️ DİKKAT / WARNING
+
+<div align="center">
+
+### 🇹🇷 Türkçe
+**Bu uygulama aktif geliştirme aşamasındadır!**
+
+- Beklenmedik hatalar ve çökmeler yaşanabilir
+- Bazı özellikler eksik veya dengesiz olabilir
+- API ve yapı değişiklikleri beklenmelidir
+- Üretim ortamında kullanım önerilmez
+- Geri bildirimleriniz çok değerlidir!
+
+---
+
+### 🇬🇧 English
+**This application is under active development!**
+
+- Unexpected bugs and crashes may occur
+- Some features may be incomplete or unstable
+- API and structural changes should be expected
+- Not recommended for production use
+- Your feedback is highly appreciated!
 
 </div>
 
