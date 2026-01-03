@@ -214,7 +214,7 @@ from PyQt5.QtWidgets import (
     QDialog, QCheckBox, QGridLayout, QComboBox, QLineEdit, QDial, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QListView,
     QColorDialog, QToolBar, QToolButton, QStyle, QSizePolicy, QProgressBar,
-    QCompleter, QKeySequenceEdit, QActionGroup, QSpinBox, QGroupBox
+    QCompleter, QKeySequenceEdit, QActionGroup, QSpinBox, QGroupBox, QProgressDialog
 )
 from PyQt5.QtWidgets import QPlainTextEdit
 from PyQt5.QtMultimedia import (
