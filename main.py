@@ -147,7 +147,10 @@ import numpy as np
 from pathlib import Path
 from config import TRUSTED_DOMAINS, BRIDGE_ALLOWED_SITES
 import web_engine_handler
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 try:
     import soundfile as sf
 except ImportError:
@@ -211,7 +214,7 @@ from PyQt5.QtWidgets import (
     QDialog, QCheckBox, QGridLayout, QComboBox, QLineEdit, QDial, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QListView,
     QColorDialog, QToolBar, QToolButton, QStyle, QSizePolicy, QProgressBar,
-    QCompleter, QKeySequenceEdit, QActionGroup
+    QCompleter, QKeySequenceEdit, QActionGroup, QSpinBox, QGroupBox
 )
 from PyQt5.QtWidgets import QPlainTextEdit
 from PyQt5.QtMultimedia import (
@@ -220,8 +223,8 @@ from PyQt5.QtMultimedia import (
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5.QtCore import (
     QUrl, Qt, QTime, QDir, QModelIndex, QTimer, QByteArray,
-    QSettings, QPointF, QPoint, QRectF, pyqtSignal, pyqtSlot, QEvent, QObject, QSize, QLocale,
-    QStandardPaths, QStringListModel, QThread, QPropertyAnimation, QEasingCurve
+    QSettings, QPointF, QPoint, QRectF, QRect, pyqtSignal, pyqtSlot, QEvent, QObject, QSize, QLocale,
+    QStandardPaths, QStringListModel, QThread, QPropertyAnimation, QEasingCurve, QSortFilterProxyModel
 )
 import threading
 from PyQt5.QtGui import QPolygonF
@@ -232,7 +235,8 @@ DownloadFormatDialog = DownloadDialog
 
 from PyQt5.QtGui import (
     QPainter, QBrush, QColor, QPixmap, QKeySequence, QPen,
-    QFont, QIcon, QPainterPath, QRadialGradient, QLinearGradient, QDesktopServices, QImage, QPalette
+    QFont, QIcon, QPainterPath, QRadialGradient, QLinearGradient, QDesktopServices, QImage, QPalette,
+    QCursor
 )
 try:
     from PyQt5.QtSvg import QSvgRenderer
@@ -645,12 +649,57 @@ class GlobalAudioEngine(QThread):
         self._web_remainder_pos = 0
         self._stream_mode = "local"
         self._web_lpf_freq = 8000.0
+
+        # Transport Fade (Pause/Resume/Stop)
+        self._transport_gain = 1.0
+        self._fade_active = False
+        self._fade_from = 1.0
+        self._fade_to = 1.0
+        self._fade_pos = 0
+        self._fade_len = 0
+        self._fade_finish_action = None  # None | "pause" | "stop"
+        self._fade_ms = 400
+        self._fade_out_on_pause = False
+        self._fade_in_on_resume = False
+        self._fade_out_on_stop = False
+        self._paused_reason = "load"
+
+        # Async load/switch (gap-free next/prev)
+        self._pending_audio_data = None
+        self._pending_ready = False
+        self._pending_request_id = 0
+        self._ui_track_changed = False
         
         # Crossfade Variables
         self.crossfade_duration_ms = 0
         self.crossfade_buffer = None
         self.crossfade_pos = 0
         self.crossfade_active = False
+
+        # Crossfade tuning (tek noktadan ayarlanabilir sabitler)
+        # Not: Bunlar UI ayarı değildir; sadece motor içi ince ayar değerleri.
+        self._crossfade_tuning = {
+            "proc_tail_extra_frames": 4096,   # async switch gecikmesi için güvenli pay (~85ms @48kHz)
+            "micro_ms_manual": 4.0,           # click/tık engelleme micro fade-in
+            "micro_ms_auto": 8.0,
+            "in_pow_manual": 0.70,            # <1 => daha hızlı yükseliş
+            "in_pow_auto": 1.00,
+            "out_pow_manual": 1.15,           # >1 => daha yumuşak düşüş
+            "out_pow_auto": 1.00,
+        }
+
+        # Crossfade context: affects only transition curve (does not change DSP effects)
+        self._crossfade_context = ""
+
+        # Crossfade (processed tail) - old track tail is pre-processed with DSP to avoid
+        # bass/eq transient "patlama" during manual next/prev at high tone settings.
+        self._cf_proc_buffer = None
+        self._cf_proc_ready = False
+        self._cf_proc_request_id = 0
+        self._cf_proc_start_frame = 0
+
+        # Transition limiter state (smoothes crossfade peaks without "pumping")
+        self._transition_limiter_gain = 1.0
         
         # Connect manager updates (thread-safe)
         self.mgr.state_changed.connect(self.sync_dsp_params)
@@ -671,6 +720,15 @@ class GlobalAudioEngine(QThread):
         print("👋 GlobalAudioEngine Stopping.")
 
     def _emit_ui_updates(self):
+        # Track değişimi sonrası UI sinyalleri (callback thread yerine burada)
+        try:
+            if getattr(self, "_ui_track_changed", False):
+                self._ui_track_changed = False
+                self.media_player.durationChanged.emit(self.get_duration_ms())
+                self.media_player._status = QMediaPlayer.LoadedMedia
+                self.media_player.mediaStatusChanged.emit(self.media_player._status)
+        except Exception:
+            pass
         if not self.paused:
             self.media_player.positionChanged.emit(self.get_position_ms())
 
@@ -698,6 +756,292 @@ class GlobalAudioEngine(QThread):
 
     def set_crossfade_duration(self, ms):
         self.crossfade_duration_ms = max(0, int(ms))
+
+    def set_crossfade_context(self, reason: str):
+        """UI'dan gelen parça değişim nedenine göre crossfade davranışını ayarlar."""
+        try:
+            self._crossfade_context = str(reason or "")
+        except Exception:
+            self._crossfade_context = ""
+
+    def configure_transport_fades(self, fade_ms: int = 400, stop_fade_enabled: bool = False,
+                                  fade_out_on_pause: bool = False, fade_in_on_resume: bool = False):
+        """Configure pause/resume/stop fades (LOCAL playback only)."""
+        with self._lock:
+            self._fade_ms = max(0, int(fade_ms))
+            self._fade_out_on_stop = bool(stop_fade_enabled)
+            self._fade_out_on_pause = bool(fade_out_on_pause)
+            self._fade_in_on_resume = bool(fade_in_on_resume)
+
+    def _start_transport_fade_locked(self, target_gain: float, duration_ms: int, finish_action: str = None):
+        try:
+            dur_ms = max(0, int(duration_ms))
+            if dur_ms <= 0:
+                self._fade_active = False
+                self._fade_from = float(target_gain)
+                self._fade_to = float(target_gain)
+                self._fade_pos = 0
+                self._fade_len = 0
+                self._fade_finish_action = None
+                self._transport_gain = float(target_gain)
+                return
+            self._fade_active = True
+            self._fade_from = float(self._transport_gain)
+            self._fade_to = float(target_gain)
+            self._fade_pos = 0
+            self._fade_len = max(1, int((dur_ms / 1000.0) * self.samplerate))
+            self._fade_finish_action = finish_action
+        except Exception:
+            self._fade_active = False
+            self._fade_finish_action = None
+
+    def _decode_audio_file_to_stereo(self, path: str):
+        """Decode file into stereo float32 ndarray and samplerate."""
+        if not sf:
+            return None, None
+        try:
+            data, sr = sf.read(path, dtype="float32")
+        except Exception:
+            data, sr = self._decode_with_ffmpeg(path)
+        if data is None or sr is None:
+            return None, None
+        if np is None:
+            # NumPy yoksa güvenli dönüşüm yapamayız; mevcut davranışa bırak.
+            return None, None
+        try:
+            data = np.asarray(data, dtype=np.float32)
+            if data.ndim == 1:
+                data = np.column_stack((data, data))
+            elif data.shape[1] == 1:
+                data = np.column_stack((data[:, 0], data[:, 0]))
+            elif data.shape[1] >= 2:
+                data = data[:, :2]
+            return data, int(sr)
+        except Exception:
+            return None, None
+
+    def _resample_stereo(self, data, sr: int, target_sr: int = 48000):
+        if np is None or data is None or sr is None:
+            return data, sr
+        try:
+            sr = int(sr)
+        except Exception:
+            return data, sr
+        if sr <= 0 or sr == target_sr:
+            return data, sr
+        try:
+            frames = int(data.shape[0])
+            if frames <= 1:
+                return data, target_sr
+            duration = frames / float(sr)
+            target_frames = max(1, int(round(duration * target_sr)))
+            src_idx = np.linspace(0.0, frames - 1, num=frames, dtype=np.float32)
+            dst_idx = np.linspace(0.0, frames - 1, num=target_frames, dtype=np.float32)
+            out = np.zeros((target_frames, 2), dtype=np.float32)
+            out[:, 0] = np.interp(dst_idx, src_idx, data[:, 0]).astype(np.float32)
+            out[:, 1] = np.interp(dst_idx, src_idx, data[:, 1]).astype(np.float32)
+            return out, target_sr
+        except Exception:
+            return data, sr
+
+    def request_play_file(self, file_path: str):
+        """Asynchronously decode track; switch inside audio callback to minimize gaps."""
+        if not file_path:
+            return
+        if np is None:
+            # NumPy yoksa async yol güvenilir değil.
+            return
+
+        with self._lock:
+            self._pending_request_id += 1
+            req_id = int(self._pending_request_id)
+            self._pending_ready = False
+            self._pending_audio_data = None
+
+            # Prepare DSP-processed crossfade tail snapshot (old track)
+            self._cf_proc_request_id = req_id
+            self._cf_proc_ready = False
+            self._cf_proc_buffer = None
+            self._cf_proc_start_frame = int(self.current_frame)
+
+            cf_tail = None
+            cf_preroll = None
+            cf_settings = None
+            try:
+                if (not self.paused) and self.crossfade_duration_ms > 0 and self.audio_data is not None:
+                    cf_len = int((self.crossfade_duration_ms / 1000.0) * self.samplerate)
+                    if cf_len > 0:
+                        remaining = len(self.audio_data) - self.current_frame
+                        # Not: switch anı async decode yüzünden birkaç blok gecikebilir.
+                        # Eğer yalnızca cf_len kadar tail alırsak ve switch gecikirse,
+                        # eski tail "geri sarma" gibi duyulabilir. Biraz ekstra pay bırak.
+                        extra = int(getattr(self, "_crossfade_tuning", {}).get("proc_tail_extra_frames", 4096))
+                        take = min(remaining, cf_len + extra)
+                        if take > 0:
+                            # Small warmup to prime IIR filter state (does not change effect, only avoids transient)
+                            warm = min(int(0.20 * float(self.samplerate)), int(self.current_frame))
+                            if warm > 0:
+                                cf_preroll = self.audio_data[self.current_frame - warm : self.current_frame].copy()
+                            cf_tail = self.audio_data[self.current_frame : self.current_frame + take].copy()
+
+                            # Snapshot current DSP settings (do not touch algorithms)
+                            try:
+                                eq = getattr(self.mgr, "eq_bands", None)
+                                eq_list = list(eq) if eq is not None else None
+                            except Exception:
+                                eq_list = None
+                            cf_settings = {
+                                "dsp_enabled": bool(getattr(self.mgr, "dsp_enabled", True)),
+                                "eq_bands": eq_list,
+                                "tone_bass": float(getattr(self.mgr, "tone_bass", 0.0)),
+                                "tone_mid": float(getattr(self.mgr, "tone_mid", 0.0)),
+                                "tone_treble": float(getattr(self.mgr, "tone_treble", 0.0)),
+                                "stereo_width": float(getattr(self.mgr, "stereo_width", 1.0)),
+                                "smart_audio_enabled": bool(getattr(self.mgr, "smart_audio_enabled", True)),
+                                "web_lpf": float(getattr(self, "_web_lpf_freq", 8000.0)),
+                                "samplerate": int(self.samplerate),
+                            }
+            except Exception:
+                cf_tail = None
+                cf_preroll = None
+                cf_settings = None
+
+        def _worker():
+            try:
+                # 0) Pre-process old-track crossfade tail with DSP (if we have a snapshot)
+                try:
+                    if cf_tail is not None and cf_settings is not None:
+                        from live_dsp_bridge import LiveDSPBridge
+                        dsp_cf = LiveDSPBridge()
+
+                        # Apply same DSP settings
+                        try:
+                            dsp_cf.set_dsp_enabled(bool(cf_settings.get("dsp_enabled", True)))
+                            if cf_settings.get("eq_bands") is not None:
+                                dsp_cf.set_eq_bands(np.asarray(cf_settings["eq_bands"], dtype=np.float32))
+                            dsp_cf.set_tone_params(
+                                float(cf_settings.get("tone_bass", 0.0)),
+                                float(cf_settings.get("tone_mid", 0.0)),
+                                float(cf_settings.get("tone_treble", 0.0)),
+                            )
+                            if hasattr(dsp_cf, "set_bass_gain"):
+                                dsp_cf.set_bass_gain(float(cf_settings.get("tone_bass", 0.0)))
+                            if hasattr(dsp_cf, "set_treble_gain"):
+                                dsp_cf.set_treble_gain(float(cf_settings.get("tone_treble", 0.0)))
+                            dsp_cf.set_stereo_width(float(cf_settings.get("stereo_width", 1.0)))
+                            dsp_cf.set_master_toggle(bool(cf_settings.get("smart_audio_enabled", True)))
+                            if hasattr(dsp_cf, "set_sample_rate"):
+                                dsp_cf.set_sample_rate(float(cf_settings.get("samplerate", 48000)))
+                            if hasattr(dsp_cf, "set_web_lpf"):
+                                dsp_cf.set_web_lpf(float(cf_settings.get("web_lpf", 8000.0)))
+                        except Exception:
+                            pass
+
+                        # Warm up filter state (discard output)
+                        try:
+                            if cf_preroll is not None:
+                                warm_buf = np.asarray(cf_preroll, dtype=np.float32).reshape(-1, 2).copy().flatten()
+                                dsp_cf.process_buffer(warm_buf)
+                        except Exception:
+                            pass
+
+                        # Process tail
+                        tail_buf = np.asarray(cf_tail, dtype=np.float32).reshape(-1, 2).copy().flatten()
+                        dsp_cf.process_buffer(tail_buf)
+                        tail_proc = tail_buf.reshape(-1, 2).astype(np.float32, copy=False)
+
+                        with self._lock:
+                            if req_id == int(getattr(self, "_cf_proc_request_id", 0)):
+                                self._cf_proc_buffer = tail_proc
+                                self._cf_proc_ready = True
+                except Exception:
+                    # Fallback: no processed tail
+                    pass
+
+                data, sr = self._decode_audio_file_to_stereo(file_path)
+                if data is None or sr is None:
+                    return
+                data, _ = self._resample_stereo(data, int(sr), target_sr=48000)
+                with self._lock:
+                    if req_id != self._pending_request_id:
+                        return
+                    self._pending_audio_data = data
+                    self._pending_ready = True
+            except Exception:
+                return
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _switch_to_pending_if_ready_locked(self):
+        """Must be called under _lock; keep it lightweight (callback-safe)."""
+        if not getattr(self, "_pending_ready", False):
+            return
+        data = self._pending_audio_data
+        if data is None:
+            self._pending_ready = False
+            return
+
+        was_paused = bool(self.paused)
+
+        # Crossfade: capture from current track at the exact cut point
+        try:
+            if (not was_paused) and self.crossfade_duration_ms > 0 and self.audio_data is not None:
+                cf_samples = int((self.crossfade_duration_ms / 1000.0) * self.samplerate)
+                if cf_samples > 0:
+                    # Prefer DSP-processed tail (precomputed) to avoid bass transient/"patlama"
+                    use_proc = bool(getattr(self, "_cf_proc_ready", False)) and getattr(self, "_cf_proc_buffer", None) is not None
+                    if use_proc:
+                        # Align precomputed tail to *actual* cut point to avoid "tekrarlanma/geri sarma" hissi.
+                        start_frame = int(getattr(self, "_cf_proc_start_frame", 0) or 0)
+                        offset = int(self.current_frame) - start_frame
+                        if offset < 0:
+                            offset = 0
+                        buf = self._cf_proc_buffer
+                        if offset >= len(buf):
+                            # Too late; fallback to live capture
+                            buf = None
+                        else:
+                            buf = buf[offset : offset + cf_samples]
+
+                        if buf is None or len(buf) <= 0:
+                            remaining = len(self.audio_data) - self.current_frame
+                            take = min(remaining, cf_samples)
+                            if take > 0:
+                                self.crossfade_buffer = self.audio_data[self.current_frame : self.current_frame + take].copy()
+                                self.crossfade_pos = 0
+                                self.crossfade_active = True
+                            else:
+                                self.crossfade_active = False
+                        else:
+                            self.crossfade_buffer = buf
+                            self.crossfade_pos = 0
+                            self.crossfade_active = True
+                        self._cf_proc_buffer = None
+                        self._cf_proc_ready = False
+                    else:
+                        remaining = len(self.audio_data) - self.current_frame
+                        take = min(remaining, cf_samples)
+                        if take > 0:
+                            self.crossfade_buffer = self.audio_data[self.current_frame : self.current_frame + take].copy()
+                            self.crossfade_pos = 0
+                            self.crossfade_active = True
+                        else:
+                            self.crossfade_active = False
+                else:
+                    self.crossfade_active = False
+            else:
+                self.crossfade_active = False
+        except Exception:
+            self.crossfade_active = False
+
+        # Switch
+        self.audio_data = data
+        self.current_frame = 0
+        self.samplerate = 48000
+        self.paused = was_paused
+        self._pending_audio_data = None
+        self._pending_ready = False
+        self._ui_track_changed = True
 
     def set_force_mute(self, mute: bool):
         """Phase 3: Hard mute for absolute silence."""
@@ -948,40 +1292,74 @@ class GlobalAudioEngine(QThread):
             self.audio_data = None
             self.current_frame = 0
             self.paused = True
+            self._paused_reason = "load"
+            self._transport_gain = 1.0
+            self._fade_active = False
+            self._fade_finish_action = None
 
         try:
-            data, self.samplerate = sf.read(path, dtype='float32')
+            data, sr = sf.read(path, dtype='float32')
         except Exception as e:
-            data, decoded_rate = self._decode_with_ffmpeg(path)
+            data, sr = self._decode_with_ffmpeg(path)
             if data is None:
                 print(f"❌ Error loading audio {path}: {e}")
                 self.media_player._status = QMediaPlayer.InvalidMedia
                 self.media_player.mediaStatusChanged.emit(self.media_player._status)
                 return
-            self.samplerate = decoded_rate
+
+        # Mümkünse 48kHz'e sabitle (stream restart kaynaklı ses kesilmelerini azaltır)
+        try:
+            if np is not None:
+                data = np.asarray(data, dtype=np.float32)
+                if data.ndim == 1:  # Mono -> Stereo
+                    data = np.column_stack((data, data))
+                elif data.shape[1] == 1:
+                    data = np.column_stack((data[:, 0], data[:, 0]))
+                elif data.shape[1] >= 2:
+                    data = data[:, :2]
+
+                sr = int(sr) if sr else 48000
+                if sr != 48000 and sr > 0:
+                    frames = int(data.shape[0])
+                    duration = frames / float(sr)
+                    target_frames = max(1, int(round(duration * 48000)))
+                    src_idx = np.linspace(0.0, frames - 1, num=frames, dtype=np.float32)
+                    dst_idx = np.linspace(0.0, frames - 1, num=target_frames, dtype=np.float32)
+                    out = np.zeros((target_frames, 2), dtype=np.float32)
+                    out[:, 0] = np.interp(dst_idx, src_idx, data[:, 0]).astype(np.float32)
+                    out[:, 1] = np.interp(dst_idx, src_idx, data[:, 1]).astype(np.float32)
+                    data = out
+                self.samplerate = 48000
+            else:
+                # NumPy yoksa mevcut davranış: file samplerate
+                self.samplerate = int(sr) if sr else 48000
+        except Exception:
+            self.samplerate = int(sr) if sr else 48000
 
         try:
-            if data.ndim == 1: # Mono to Stereo
-                data = np.column_stack((data, data))
-            
             with self._lock:
                 self.audio_data = data
                 self.current_frame = 0
                 self.paused = True
-                
+
             self.media_player.durationChanged.emit(self.get_duration_ms())
             self.media_player._status = QMediaPlayer.LoadedMedia
             self.media_player.mediaStatusChanged.emit(self.media_player._status)
             print(f"🎵 Loaded: {os.path.basename(path)} ({self.samplerate}Hz)")
-            
-            # Restart stream with correct samplerate
-            if self.stream:
-                self.stream.stop()
-                self.stream.close()
-            
-            if self.dsp and hasattr(self.dsp, "set_sample_rate"):
-                self.dsp.set_sample_rate(self.samplerate)
-            self._start_output_stream(self.samplerate, 1024, self._audio_callback)
+
+            # Stream'i mümkün olduğunca sabit tut: sadece yoksa başlat veya samplerate değiştiyse yeniden başlat
+            need_restart = (not self.stream) or (int(getattr(self, 'samplerate', 48000)) != int(getattr(self, '_stream_samplerate', 0) or 0))
+            if need_restart:
+                try:
+                    if self.stream:
+                        self.stream.stop()
+                        self.stream.close()
+                except Exception:
+                    pass
+                if self.dsp and hasattr(self.dsp, "set_sample_rate"):
+                    self.dsp.set_sample_rate(self.samplerate)
+                self._start_output_stream(self.samplerate, 1024, self._audio_callback)
+                self._stream_samplerate = int(self.samplerate)
             self._stream_mode = "local"
             self.web_active = False
             self._clear_web_queue()
@@ -1044,11 +1422,17 @@ class GlobalAudioEngine(QThread):
 
     def _audio_callback(self, outdata, frames, time, status):
         # High-performance callback
-        if self.paused or self.audio_data is None:
-            outdata.fill(0)
-            return
-
         with self._lock:
+            # Eğer yeni parça hazırsa, sessizliğe düşmeden hemen switch et
+            try:
+                self._switch_to_pending_if_ready_locked()
+            except Exception:
+                pass
+
+            if self.paused or self.audio_data is None:
+                outdata.fill(0)
+                return
+
             start = self.current_frame
             end = start + frames
             
@@ -1075,13 +1459,50 @@ class GlobalAudioEngine(QThread):
             self._apply_crossfade(proc_buf, actual_frames)
             # ---------------------------
 
+            # --- TRANSPORT FADE (Pause/Resume/Stop) ---
+            self._apply_transport_fade(proc_buf, actual_frames)
+            # ------------------------------------------
+
+            # Transition limiter (crossfade overlap can create peaks at high volume)
+            is_transition = False
+            try:
+                if self.crossfade_duration_ms > 0:
+                    cf_len = int((self.crossfade_duration_ms / 1000.0) * self.samplerate)
+                    if cf_len > 0 and (self.crossfade_active or self.current_frame < cf_len):
+                        is_transition = True
+            except Exception:
+                is_transition = False
+
+            if not is_transition:
+                # Geçiş yokken limiter reset
+                try:
+                    self._transition_limiter_gain = 1.0
+                except Exception:
+                    pass
+
             # Apply Volume and copy to output
             out_view = outdata
             if out_view.ndim == 1:
                 if out_view.size == frames * 2:
                     out_view = out_view.reshape(frames, 2)
                 else:
-                    out_view[:actual_frames] = proc_buf.reshape(-1, 2).mean(axis=1) * self.volume
+                    mono = proc_buf.reshape(-1, 2)[:actual_frames].mean(axis=1) * self.volume
+                    if is_transition and np is not None:
+                        try:
+                            peak = float(np.max(np.abs(mono)))
+                            ceiling = 0.99
+                            target = 1.0 if peak <= ceiling else (ceiling / peak)
+                            g0 = float(getattr(self, "_transition_limiter_gain", 1.0))
+                            # Attack: hızlı azalt, Release: yavaş toparla (pompalanma olmasın)
+                            if target < g0:
+                                g1 = target
+                            else:
+                                g1 = g0 + (target - g0) * 0.08
+                            self._transition_limiter_gain = float(g1)
+                            mono *= float(g1)
+                        except Exception:
+                            pass
+                    out_view[:actual_frames] = mono
                     if actual_frames < frames:
                         out_view[actual_frames:].fill(0)
                         self.paused = True
@@ -1093,7 +1514,22 @@ class GlobalAudioEngine(QThread):
                     viz_buf = raw_buf
                     self.viz_data_ready.emit(viz_buf.tobytes(), 32, 2, self.samplerate)
                     return
-            out_view[:actual_frames] = proc_buf.reshape(-1, 2) * self.volume
+            stereo = proc_buf.reshape(-1, 2)[:actual_frames] * self.volume
+            if is_transition and np is not None:
+                try:
+                    peak = float(np.max(np.abs(stereo)))
+                    ceiling = 0.99
+                    target = 1.0 if peak <= ceiling else (ceiling / peak)
+                    g0 = float(getattr(self, "_transition_limiter_gain", 1.0))
+                    if target < g0:
+                        g1 = target
+                    else:
+                        g1 = g0 + (target - g0) * 0.08
+                    self._transition_limiter_gain = float(g1)
+                    stereo *= float(g1)
+                except Exception:
+                    pass
+            out_view[:actual_frames] = stereo
             if actual_frames < frames:
                 outdata[actual_frames:].fill(0)
                 self.paused = True
@@ -1108,6 +1544,77 @@ class GlobalAudioEngine(QThread):
             viz_buf = raw_buf
             self.viz_data_ready.emit(viz_buf.tobytes(), 32, 2, self.samplerate)
 
+    def _apply_transport_fade(self, proc_buf, actual_frames):
+        """Applies pause/resume/stop fades to the processed buffer."""
+        try:
+            # Fast path: constant gain
+            if not self._fade_active:
+                if abs(self._transport_gain - 1.0) > 1e-6:
+                    proc_view = proc_buf.reshape(-1, 2)
+                    proc_view *= float(self._transport_gain)
+                return
+
+            # Fade path
+            proc_view = proc_buf.reshape(-1, 2)
+            remaining = max(0, int(self._fade_len) - int(self._fade_pos))
+            if remaining <= 0:
+                self._fade_active = False
+                self._transport_gain = float(self._fade_to)
+                self._finish_transport_fade_if_needed()
+                if abs(self._transport_gain - 1.0) > 1e-6:
+                    proc_view *= float(self._transport_gain)
+                return
+
+            take = min(int(actual_frames), remaining)
+            if take > 0:
+                start_pos = int(self._fade_pos)
+                end_pos = start_pos + take
+                if self._fade_len <= 0:
+                    gains = np.full((take,), float(self._fade_to), dtype=np.float32)
+                else:
+                    t0 = start_pos / float(self._fade_len)
+                    t1 = end_pos / float(self._fade_len)
+                    gains = np.linspace(
+                        self._fade_from + (self._fade_to - self._fade_from) * t0,
+                        self._fade_from + (self._fade_to - self._fade_from) * t1,
+                        take,
+                        dtype=np.float32,
+                    )
+                proc_view[:take] *= gains[:, np.newaxis]
+
+            if actual_frames > take:
+                # After fade ends within this block, use the target gain
+                tail_gain = float(self._fade_to)
+                proc_view[take:actual_frames] *= tail_gain
+
+            self._fade_pos += int(actual_frames)
+            if self._fade_pos >= self._fade_len:
+                self._fade_active = False
+                self._transport_gain = float(self._fade_to)
+                self._finish_transport_fade_if_needed()
+        except Exception:
+            pass
+
+    def _finish_transport_fade_if_needed(self):
+        action = self._fade_finish_action
+        if not action:
+            return
+        self._fade_finish_action = None
+        try:
+            if action == "pause":
+                self.paused = True
+                self._paused_reason = "user_pause"
+                self.media_player._state = QMediaPlayer.PausedState
+                self.media_player.stateChanged.emit(self.media_player._state)
+            elif action == "stop":
+                self.paused = True
+                self.current_frame = 0
+                self._paused_reason = "user_stop"
+                self.media_player._state = QMediaPlayer.StoppedState
+                self.media_player.stateChanged.emit(self.media_player._state)
+        except Exception:
+            pass
+
     def _apply_crossfade(self, proc_buf, actual_frames):
         """Applies crossfade logic to the processed buffer."""
         if self.crossfade_duration_ms <= 0:
@@ -1118,36 +1625,88 @@ class GlobalAudioEngine(QThread):
             if cf_len <= 0:
                 return
 
-            # 1. Fade In (New Track)
-            if self.current_frame < cf_len:
-                start_pos = self.current_frame
-                end_pos = self.current_frame + actual_frames
-                ramp_in = np.linspace(start_pos / cf_len, end_pos / cf_len, actual_frames, dtype=np.float32)
-                ramp_in = np.clip(ramp_in, 0.0, 1.0)
-                
-                proc_view = proc_buf.reshape(-1, 2)
-                proc_view *= ramp_in[:, np.newaxis]
+            # 1) Fade In (New Track)
+            # Not: Kazanç toplamı > 1 olursa algısal "ses yükselmesi" ve tepe oluşabilir.
+            # Bu yüzden equal-power eğriyi kullanıp, miks bölgesinde toplam kazancı 1'e normalize edeceğiz.
+            proc_view = proc_buf.reshape(-1, 2)
+            ctx = (getattr(self, "_crossfade_context", "") or "").strip().lower()
+            manual_ctx = ctx in ("manual_next", "manual_prev", "manual_select")
 
-            # 2. Fade Out (Old Track)
+            # Not: Eski parçanın sesi "akıcı" azalmalı.
+            # Bu yüzden miks eğrisini equal-power tabanlı tutuyoruz:
+            # yeni_gain = sin(t*pi/2), eski_gain = cos(t*pi/2)
+            # Manuel geçişte yeni biraz daha hızlı belirir (tık/ani his olmadan).
+            tuning = getattr(self, "_crossfade_tuning", {}) or {}
+            in_pow = float(tuning.get("in_pow_manual" if manual_ctx else "in_pow_auto", 1.0))
+            out_pow = float(tuning.get("out_pow_manual" if manual_ctx else "out_pow_auto", 1.0))
+
+            ramp_in = None
+            if self.current_frame < cf_len:
+                start_pos = int(self.current_frame)
+                t = (np.arange(actual_frames, dtype=np.float32) + float(start_pos)) / float(cf_len)
+                t = np.clip(t, 0.0, 1.0)
+                base_in = np.sin(t * (np.pi / 2.0)).astype(np.float32, copy=False)
+                # power-shape (manual: daha hızlı)
+                try:
+                    ramp_in = np.power(base_in, np.float32(in_pow)).astype(np.float32, copy=False)
+                except Exception:
+                    ramp_in = base_in
+
+                # "Tık" engelleme: yeni parça başlangıcında çok kısa micro fade-in.
+                # 4-8ms gibi çok kısa bir yükseliş, hem pürüzsüz yapar hem de 'akıcı crossfade' hissini bozmaz.
+                try:
+                    micro_ms = float(tuning.get("micro_ms_manual" if manual_ctx else "micro_ms_auto", 6.0))
+                    micro_len = int((micro_ms / 1000.0) * float(self.samplerate))
+                    if micro_len > 1:
+                        mt = (np.arange(actual_frames, dtype=np.float32) + float(start_pos)) / float(micro_len)
+                        mt = np.clip(mt, 0.0, 1.0)
+                        micro_env = (0.5 - 0.5 * np.cos(np.pi * mt)).astype(np.float32, copy=False)
+                        ramp_in = (ramp_in * micro_env).astype(np.float32, copy=False)
+                except Exception:
+                    pass
+                proc_view[:actual_frames] *= ramp_in[:, np.newaxis]
+
+            # 2) Fade Out (Old Track)
             if self.crossfade_active and self.crossfade_buffer is not None:
                 cf_avail = len(self.crossfade_buffer) - self.crossfade_pos
                 if cf_avail > 0:
                     mix_len = min(actual_frames, cf_avail)
                     cf_chunk = self.crossfade_buffer[self.crossfade_pos : self.crossfade_pos + mix_len]
                     
-                    start_pos = self.crossfade_pos
-                    end_pos = self.crossfade_pos + mix_len
-                    ramp_out = 1.0 - np.linspace(start_pos / cf_len, end_pos / cf_len, mix_len, dtype=np.float32)
-                    ramp_out = np.clip(ramp_out, 0.0, 1.0)
-                    
-                    cf_chunk_faded = cf_chunk * ramp_out[:, np.newaxis]
-                    
-                    proc_view = proc_buf.reshape(-1, 2)
-                    proc_view[:mix_len] += cf_chunk_faded
+                    start_pos = int(self.crossfade_pos)
+                    t = (np.arange(mix_len, dtype=np.float32) + float(start_pos)) / float(cf_len)
+                    t = np.clip(t, 0.0, 1.0)
+                    base_out = np.cos(t * (np.pi / 2.0)).astype(np.float32, copy=False)
+                    try:
+                        ramp_out = np.power(base_out, np.float32(out_pow)).astype(np.float32, copy=False)
+                    except Exception:
+                        ramp_out = base_out
+
+                    # Old + New mix
+                    proc_view[:mix_len] += cf_chunk * ramp_out[:, np.newaxis]
+
+                    # Gain-bump önleme: (ramp_in + ramp_out) > 1 ise 1'e normalize et
+                    try:
+                        if ramp_in is None:
+                            in_mix = np.zeros((mix_len,), dtype=np.float32)
+                        else:
+                            in_mix = ramp_in[:mix_len]
+                        denom = in_mix + ramp_out
+                        denom = np.maximum(1.0, denom).astype(np.float32, copy=False)
+                        proc_view[:mix_len] /= denom[:, np.newaxis]
+                    except Exception:
+                        pass
                     
                     self.crossfade_pos += mix_len
                 else:
                     self.crossfade_active = False
+
+            # Crossfade bittiğinde manuel bağlamı temizle (bir sonraki geçişi etkilemesin)
+            try:
+                if self.current_frame >= cf_len and not self.crossfade_active:
+                    self._crossfade_context = ""
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1167,18 +1726,47 @@ class GlobalAudioEngine(QThread):
             self.current_frame = max(0, min(self.current_frame, len(self.audio_data) if self.audio_data is not None else 0))
 
     def play(self):
-        self.paused = False
+        with self._lock:
+            was_paused = bool(self.paused)
+            reason = getattr(self, "_paused_reason", None)
+            self.paused = False
+            self._paused_reason = None
+            # Only apply fade-in on resume from a user pause
+            if was_paused and reason == "user_pause" and self._fade_in_on_resume and self._fade_ms > 0:
+                self._transport_gain = 0.0
+                self._start_transport_fade_locked(1.0, self._fade_ms, finish_action=None)
+            else:
+                self._transport_gain = 1.0
+                self._fade_active = False
+                self._fade_finish_action = None
         self.media_player._state = QMediaPlayer.PlayingState
         self.media_player.stateChanged.emit(self.media_player._state)
 
     def pause(self):
-        self.paused = True
+        with self._lock:
+            if self.paused:
+                return
+            if self._fade_out_on_pause and self._fade_ms > 0:
+                self._paused_reason = "user_pause"
+                self._start_transport_fade_locked(0.0, self._fade_ms, finish_action="pause")
+                return
+            self.paused = True
+            self._paused_reason = "user_pause"
         self.media_player._state = QMediaPlayer.PausedState
         self.media_player.stateChanged.emit(self.media_player._state)
 
     def stop(self):
-        self.paused = True
-        self.current_frame = 0
+        with self._lock:
+            if (not self.paused) and self._fade_out_on_stop and self._fade_ms > 0:
+                self._paused_reason = "user_stop"
+                self._start_transport_fade_locked(0.0, self._fade_ms, finish_action="stop")
+                return
+            self.paused = True
+            self._paused_reason = "user_stop"
+            self.current_frame = 0
+            self._transport_gain = 1.0
+            self._fade_active = False
+            self._fade_finish_action = None
         self.media_player._state = QMediaPlayer.StoppedState
         self.media_player.stateChanged.emit(self.media_player._state)
 
@@ -1205,7 +1793,17 @@ class GlobalAudioEngine(QThread):
 
     def play_file(self, file_path):
         """Compatibility slot for playlist integration"""
-        self.load_file(file_path)
+        if np is not None:
+            try:
+                self.request_play_file(file_path)
+                # Eğer stream hiç başlamadıysa, hızlı bir şekilde oynatmayı başlat
+                if not self.stream:
+                    # Fallback: ilk parçada gecikmeyi minimize etmek için sync yükle
+                    self.load_file(file_path)
+            except Exception:
+                self.load_file(file_path)
+        else:
+            self.load_file(file_path)
         self.play()
 
 # ---------------------------------------------------------------------------
@@ -1416,28 +2014,21 @@ class VisualizerWorker(QObject):
                         samples
                     ).astype(np.float32)
                     N = len(samples)
-                    sample_rate = TARGET_RATE
-            
-            # Anti-Jitter Gain: 1.2x with clipping prevention
-            samples = np.clip(samples * 1.2, -1.0, 1.0)
 
-            # Phase 6: 20Hz HPF to remove digital noise/DC offset
-            # Simple recursive HPF: y[n] = x[n] - x[n-1] + 0.995*y[n-1]
-            if not hasattr(self, "_hpf_state"): self._hpf_state = 0.0
-            filtered = np.zeros_like(samples)
-            for i in range(1, N):
-                filtered[i] = samples[i] - samples[i-1] + 0.995 * filtered[i-1]
-            samples = filtered
-
+            # FFT
+            effective_rate = float(TARGET_RATE if (sample_rate != TARGET_RATE and sample_rate > 0) else sample_rate)
             window = np.hanning(N)
             windowed = samples * window
             fft = np.fft.rfft(windowed, n=4096)
-            magnitude = np.abs(fft)
 
-            freqs = np.fft.rfftfreq(4096, 1.0 / sample_rate)
-            nyquist = sample_rate / 2.0
+            magnitude = np.abs(fft)
+            nyquist = effective_rate / 2.0
             min_freq = 20.0
             max_freq = min(20000.0, nyquist)
+
+            freqs = np.fft.rfftfreq(4096, d=1.0 / effective_rate) if effective_rate > 0 else None
+            if freqs is None:
+                return
 
             start_idx = int(np.searchsorted(freqs, min_freq))
             end_idx = int(np.searchsorted(freqs, max_freq))
@@ -1667,21 +2258,24 @@ class ToneKnob(QDial):
                 event.ignore()
                 return
 
-        steps = delta / 120.0
-        if event.angleDelta().y() == 0:
-            steps = delta / 15.0
+        # Kullanıcı İsteği #3: 10 kademeli ses yükseltme
+        # Standart mouse wheel delta = 120
+        # Her tıkta 10 birim artış/azalış istiyoruz.
+        
+        steps = 0
+        if delta > 0:
+            steps = 10
+        else:
+            steps = -10
+            
         if event.modifiers() & Qt.ShiftModifier:
-            steps *= 0.25
+            steps = int(steps * 0.25) # Shift ile hassas ayar
 
-        self._wheel_accum += steps
-        if abs(self._wheel_accum) >= 1.0:
-            step_int = int(self._wheel_accum)
-            self._wheel_accum -= step_int
-            wheel_scale = 4.0
-            target = int(round(self.value() + step_int * self.singleStep() * wheel_scale))
-            target = max(self.minimum(), min(self.maximum(), target))
-            if target != self.value():
-                self.setValue(target)
+        target = self.value() + steps
+        target = max(self.minimum(), min(self.maximum(), target))
+        
+        if target != self.value():
+            self.setValue(target)
 
         event.accept()
 
@@ -3601,7 +4195,7 @@ class GradientSlider(QSlider):
             event.ignore()
             return
 
-        step = 10000
+        step = 10
         if delta < 0:
             step = -step
         new_val = max(self.minimum(), min(self.maximum(), self.value() + step))
@@ -3658,15 +4252,6 @@ class GradientSlider(QSlider):
             painter.setBrush(QBrush(grad))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(progress_rect, 4, 4)
-            
-            # Işıltı efekti (üst kısımda parlak çizgi)
-            shimmer_rect = progress_rect.adjusted(2, 1, -2, -progress_rect.height()//2 - 1)
-            if shimmer_rect.width() > 0 and shimmer_rect.height() > 0:
-                shimmer_grad = QLinearGradient(shimmer_rect.topLeft(), shimmer_rect.bottomLeft())
-                shimmer_grad.setColorAt(0.0, QColor(255, 255, 255, 60))
-                shimmer_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-                painter.setBrush(QBrush(shimmer_grad))
-                painter.drawRoundedRect(shimmer_rect, 2, 2)
         
         # 3. Animasyonlu Nokta (Handle) - Daha büyük ve parlak
         def _draw_dot(x_pos):
@@ -3714,6 +4299,9 @@ class VideoDisplayWidget(QGraphicsView):
         self.video_item = QGraphicsVideoItem()
         self.scene.addItem(self.video_item)
         
+        # Set aspect ratio mode to keep aspect ratio (prevents distortion)
+        self.video_item.setAspectRatioMode(Qt.KeepAspectRatio)
+        
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setStyleSheet("background-color: black; border: none;")
@@ -3722,8 +4310,65 @@ class VideoDisplayWidget(QGraphicsView):
         # Rotation State
         self.current_rotation = 0
         
+        # Scale Mode State
+        # 0: Fill (KeepAspectRatioByExpanding - Fill Screen)
+        # 1: Original (No scale)
+        # 2: Fit (KeepAspectRatio - Entire Video Visible) - DEFAULT
+        self.scale_mode = 2  
+        
         # Orijin noktasını item'in ortası yap (başlangıçta)
         self.video_item.setTransformOriginPoint(self.width()/2, self.height()/2)
+        
+        # Enable Mouse Tracking for Fullscreen
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        
+        # Ensure the view fills the container
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        # Video fullscreen state
+        self.video_fullscreen = False
+
+        # Hide controls timer
+        self.hide_controls_timer = QTimer(self)
+        self.hide_controls_timer.setInterval(5000)  # 5 seconds
+        self.hide_controls_timer.timeout.connect(self.hide_video_controls)
+
+        # Controls widget (to be shown/hidden)
+        self.controls_widget = None
+
+    def resizeEvent(self, event):
+        """Pencere boyutu değişince videoyu yeniden sığdır."""
+        super().resizeEvent(event)
+        self._update_video_transform()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(50, self._update_video_transform)
+
+    def set_scale_mode(self, mode):
+        """
+        0: Fit (Fill Screen - Default)
+        1: 1:1 (Original Size)
+        2: Fit (Entire Video Visible)
+        """
+        self.scale_mode = mode
+        if mode == 0:
+            self.video_item.setAspectRatioMode(Qt.KeepAspectRatioByExpanding)
+        elif mode == 1:
+            self.video_item.setAspectRatioMode(Qt.KeepAspectRatio)
+            # Reset transform to identity (1:1)
+            self.resetTransform()
+        elif mode == 2:
+            self.video_item.setAspectRatioMode(Qt.KeepAspectRatio)
+        
+        self._update_video_transform()
+
+    def zoom_in(self):
+        self.scale(1.1, 1.1)
+
+    def zoom_out(self):
+        self.scale(0.9, 0.9)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -3785,6 +4430,61 @@ class VideoDisplayWidget(QGraphicsView):
             pass
         super().keyPressEvent(event)
 
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if self.video_fullscreen:
+            # Show controls on mouse move
+            self.show_video_controls()
+            # Restart hide timer
+            self.hide_controls_timer.start()
+
+    def show_video_controls(self):
+        """Show video controls with smooth animation"""
+        if not hasattr(self, 'controls_widget') or not self.controls_widget:
+            return
+
+        if self.controls_widget.isVisible():
+            return  # Already visible
+
+        # Stop any ongoing animation
+        if hasattr(self, '_controls_anim') and self._controls_anim:
+            self._controls_anim.stop()
+
+        # Create slide-in animation from bottom
+        self._controls_anim = QPropertyAnimation(self.controls_widget, b"pos", self)
+        self._controls_anim.setDuration(300)  # 300ms smooth
+        self._controls_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        start_pos = QPoint(self.controls_widget.x(), self.parent().height())
+        end_pos = QPoint(self.controls_widget.x(), self.parent().height() - self.controls_widget.height())
+        self._controls_anim.setStartValue(start_pos)
+        self._controls_anim.setEndValue(end_pos)
+
+        self.controls_widget.show()
+        self._controls_anim.start()
+
+    def hide_video_controls(self):
+        """Hide video controls with smooth animation"""
+        if not hasattr(self, 'controls_widget') or not self.controls_widget:
+            return
+
+        if not self.controls_widget.isVisible():
+            return  # Already hidden
+
+        # Stop any ongoing animation
+        if hasattr(self, '_controls_anim') and self._controls_anim:
+            self._controls_anim.stop()
+
+        # Create slide-out animation to bottom
+        self._controls_anim = QPropertyAnimation(self.controls_widget, b"pos", self)
+        self._controls_anim.setDuration(300)  # 300ms smooth
+        self._controls_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        start_pos = self.controls_widget.pos()
+        end_pos = QPoint(self.controls_widget.x(), self.parent().height())
+        self._controls_anim.setStartValue(start_pos)
+        self._controls_anim.setEndValue(end_pos)
+        self._controls_anim.finished.connect(lambda: self.controls_widget.hide())
+        self._controls_anim.start()
+
     def paintEvent(self, event):
         super().paintEvent(event)
         try:
@@ -3812,15 +4512,15 @@ class VideoDisplayWidget(QGraphicsView):
         if not self.video_item:
             return
             
-        rect = self.rect()
+        rect = self.viewport().rect()
         view_w = rect.width()
         view_h = rect.height()
         
+        if view_w <= 0 or view_h <= 0:
+            return
+
         # 90 veya 270 derece dönüşte boyutları takas etmemiz gerekir
-        # ki video ekrana sığsın (Landscape ekranda Portrait video gibi)
         if self.current_rotation in [90, 270]:
-            # Mantık: Item'ın genişliği view'in yüksekliği kadar olmalı
-            # Item'ın yüksekliği view'in genişliği kadar olmalı (stretch to fit)
             target_w = view_h
             target_h = view_w
         else:
@@ -3828,6 +4528,7 @@ class VideoDisplayWidget(QGraphicsView):
             target_h = view_h
             
         self.video_item.setSize(QSizeF(target_w, target_h))
+        self.video_item.setPos(0, 0)
         
         # Dönüş merkezini ayarla
         center = QPointF(target_w / 2, target_h / 2)
@@ -3836,7 +4537,18 @@ class VideoDisplayWidget(QGraphicsView):
         
         # Sahneye ve View'e göre ortala
         self.scene.setSceneRect(0, 0, target_w, target_h)
-        self.fitInView(self.video_item, Qt.KeepAspectRatio)
+        
+        # Ölçekleme moduna göre sığdır
+        if self.scale_mode == 0:
+            # Fill Screen
+            self.fitInView(self.video_item, Qt.KeepAspectRatioByExpanding)
+        elif self.scale_mode == 1:
+            # 1:1 modunda fitInView çağırma, sadece ortala
+            pass
+        else:
+            # Fit (Entire Video Visible)
+            self.fitInView(self.video_item, Qt.KeepAspectRatio)
+            
         self.centerOn(self.video_item)
 
 # ---------------------------------------------------------------------------
@@ -3991,6 +4703,20 @@ class PlaylistListWidget(QListWidget):
             self.clear()
             if self.player:
                 self.player.playlist.clear()
+
+    def _update_video_transform(self):
+        """Video boyut/döndürme güncelleme."""
+        if not self.scene or not self.video_item:
+            return
+            
+        # Eğer Scale Mode 1 (Original) ise otomatik fit yapma
+        if hasattr(self, 'scale_mode') and self.scale_mode == 1:
+            return
+
+        # Döndürme varsa manuel fit gerekebilir
+        # Şimdilik basitçe fitInView çağırıyoruz
+        keep_mode = Qt.KeepAspectRatioByExpanding if getattr(self, 'scale_mode', 0) == 0 else Qt.KeepAspectRatio
+        self.fitInView(self.video_item, keep_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -7557,6 +8283,41 @@ class VisualizationWindow(QMainWindow):
 
 class AngollaPlayer(QMainWindow):
 
+    class _VideoOnlyProxyModel(QSortFilterProxyModel):
+        """Video panelinde sadece klasörler + video dosyalarını göster."""
+
+        def __init__(self, exts: set, parent=None):
+            super().__init__(parent)
+            self._exts = {str(e).lower() for e in (exts or set())}
+
+        def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+            try:
+                src = self.sourceModel()
+                if src is None:
+                    return False
+                idx = src.index(source_row, 0, source_parent)
+                if not idx.isValid():
+                    return False
+                # Klasörler her zaman görünsün
+                try:
+                    if src.isDir(idx):
+                        return True
+                except Exception:
+                    pass
+                # Dosyalarda sadece video uzantılarına izin ver
+                path = ""
+                try:
+                    path = src.filePath(idx)
+                except Exception:
+                    return False
+                ext = os.path.splitext(path)[1].lower()
+                return ext in self._exts
+            except Exception:
+                return False
+    
+    # Signal to bridge QAudioProbe (Main Thread) -> VisualizerWorker (Worker Thread)
+    video_audio_ready = pyqtSignal(bytes, int, int, int)
+
     @pyqtSlot(bool, bool, bool, bool, int)
     def _on_web_playback_state(self, paused, ended, loading, ad_active, video_count=0):
         """QWebChannel üzerinden gelen oynatma durumu sinyali."""
@@ -7628,6 +8389,18 @@ class AngollaPlayer(QMainWindow):
         # Connect audio engine's signal directly to worker (High Performance)
         self.audio_engine.viz_data_ready.connect(self.viz_worker.process_buffer)
         self.viz_worker.data_ready.connect(self._on_viz_data_ready)
+
+        # Video sekmesine özel: ayrı visualizer worker (ana spectrum'u etkilemesin)
+        self._video_band_dynamic_max = []
+        self.video_viz_worker = VisualizerWorker()
+        self.video_viz_worker.moveToThread(self.viz_thread)
+        self.video_audio_ready.connect(self.video_viz_worker.process_buffer)
+        self.video_viz_worker.data_ready.connect(self._on_video_viz_data_ready)
+
+        # Video klasör playlist durumu
+        self._video_playlist_paths = []
+        self._video_playlist_index = -1
+        self._video_playlist_folder = ""
         
         print("✓ GlobalAudioEngine + VisualizerWorker (Direct Link) Active")
 
@@ -7663,6 +8436,7 @@ class AngollaPlayer(QMainWindow):
 
         self.vis_window = None
         self.vis_widget_main_window = None
+        self.vis_widget_video_window = None
         self._visualizer_paused = False
         self._web_playing = False
         self._web_audio_last_ts = 0.0
@@ -7699,6 +8473,37 @@ class AngollaPlayer(QMainWindow):
         except Exception as e:
             print(f"⚠ Güvenli web bileşenleri kurulamadı: {e}")
 
+    def _on_video_viz_data_ready(self, band_vals, pcm_raw):
+        """Video sekmesine özel FFT verisi: sadece video ritim çubuklarını güncelle."""
+        try:
+            num_bars = len(band_vals)
+            if num_bars <= 0:
+                return
+
+            if not isinstance(getattr(self, "_video_band_dynamic_max", None), list) or len(self._video_band_dynamic_max) != num_bars:
+                self._video_band_dynamic_max = [1e-6] * num_bars
+
+            decay = 0.96
+            normalized = []
+            for i, val in enumerate(band_vals):
+                prev = self._video_band_dynamic_max[i] * decay
+                peak = max(prev, val)
+                self._video_band_dynamic_max[i] = peak
+                normalized.append(min(1.0, float(val) / (peak + 1e-6)))
+
+            intensity = sum(normalized) / num_bars
+            self.send_video_visual_data(min(1.0, intensity * 1.5), normalized)
+        except Exception:
+            pass
+
+    def send_video_visual_data(self, intensity, band_vals):
+        """Video sekmesine özel görselleştirme: ana spectrum'u etkilemez."""
+        try:
+            if self.vis_widget_video_window and hasattr(self.vis_widget_video_window, 'update_sound_data'):
+                self.vis_widget_video_window.update_sound_data(intensity, band_vals)
+        except Exception:
+            pass
+
     def _detect_language(self):
         code = QLocale.system().name().split("_")[0].lower()
         if code not in TRANSLATIONS:
@@ -7708,6 +8513,52 @@ class AngollaPlayer(QMainWindow):
     def _tr(self, key: str) -> str:
         lang_dict = TRANSLATIONS.get(self.lang, TRANSLATIONS["en"])
         return lang_dict.get(key, TRANSLATIONS["en"].get(key, key))
+
+    def _get_default_video_folder(self) -> str:
+        """Sistemin varsayılan Video dizinini bul (XDG_VIDEOS_DIR).
+
+        Linux'ta bu dizin genelde ~/Videos veya yerel dile göre ~/Videolar olabilir.
+        Bulunamazsa makul adaylara düşer.
+        """
+        home = os.path.expanduser("~")
+
+        # 1) XDG user-dirs
+        try:
+            cfg = os.path.join(home, ".config", "user-dirs.dirs")
+            if os.path.exists(cfg):
+                with open(cfg, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if not line.startswith("XDG_VIDEOS_DIR"):
+                            continue
+                        # Format: XDG_VIDEOS_DIR="$HOME/Videos"
+                        parts = line.split("=", 1)
+                        if len(parts) != 2:
+                            break
+                        raw = parts[1].strip().strip('"').strip("'")
+                        raw = raw.replace("$HOME", home)
+                        raw = os.path.expandvars(raw)
+                        raw = os.path.expanduser(raw)
+                        if raw:
+                            return raw
+        except Exception:
+            pass
+
+        # 2) Yaygın adaylar (TR + EN + olası yazımlar)
+        candidates = [
+            os.path.join(home, "Videolar"),
+            os.path.join(home, "Videos"),
+            os.path.join(home, "Videyolar"),
+            os.path.join(home, "Video"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+
+        # 3) Son çare: home
+        return home
 
     def _build_visual_modes(self):
         base_modes = [
@@ -7915,6 +8766,10 @@ class AngollaPlayer(QMainWindow):
             self.webView.urlChanged.connect(self._on_web_url_changed)
         except Exception:
             pass
+
+        # Video display widget
+        self.video_display_widget = VideoDisplayWidget()
+        self.playlist_stack.addWidget(self.video_display_widget)
 
         # Stack'e ekle (tekil olacak şekilde)
         # NOT: Artık mainContentStack içinde playlist_stack var. Oraya eklemeliyiz.
@@ -8277,12 +9132,31 @@ class AngollaPlayer(QMainWindow):
                         self.main_splitter.setSizes([0, w])
                 except Exception:
                     pass
+                
+                # Hide fileLabel (Top Bar) explicitly
+                if hasattr(self, 'fileLabel') and self.fileLabel:
+                    self.fileLabel.hide()
+
+                # Force layout update to remove black gaps
+                if hasattr(self, 'centralWidget') and self.centralWidget():
+                    self.centralWidget().layout().setContentsMargins(0, 0, 0, 0)
+                    self.centralWidget().layout().setSpacing(0)
+
                 try:
                     self.showFullScreen()
                 except Exception:
                     self.showMaximized()
                 self.raise_()
                 print("🖥️ [WEB_FS] Tam ekran modu: AÇIK")
+                
+                # RECURSIVE EVENT FILTER FOR WEBVIEW CHILDREN (Fixes mouse tracking in web fs)
+                try:
+                    self.webView.installEventFilter(self)
+                    for child in self.webView.findChildren(QObject):
+                        child.installEventFilter(self)
+                except Exception:
+                    pass
+
             else:
                 self._exit_web_fullscreen_ui()
         except Exception as e:
@@ -8334,12 +9208,26 @@ class AngollaPlayer(QMainWindow):
             pass
 
         try:
+            # GEOMETRY RESTORE FIX
             if state.get("was_maximized"):
                 self.showMaximized()
             else:
-                self.setGeometry(state.get("geometry", self.geometry()))
+                geom = state.get("geometry")
+                if geom and not geom.isEmpty():
+                     self.setGeometry(geom)
                 self.showNormal()
+                
+            # FORCE UI UPDATE
+            QApplication.processEvents()
+            # self.centralWidget().updateGeometry() -> centralWidget update
+            if self.centralWidget():
+                self.centralWidget().update()
+            
         except Exception:
+            try:
+                self.showNormal()
+            except:
+                pass
             try:
                 self.showNormal()
             except Exception:
@@ -8471,8 +9359,10 @@ class AngollaPlayer(QMainWindow):
             self.prevButton: "media-skip-backward.png",   # önceki parça
             self.playButton: "media-playback-start.png",  # play
             self.nextButton: "media-skip-forward.png",    # sonraki parça
-            self.seekBackwardButton: "media-seek-backward.png",  # 10sn geri
-            self.seekForwardButton: "media-seek-forward.png",    # 10sn ileri
+            # Not: bazı ikon setlerinde forward/backward dosya yönleri ters olabiliyor;
+            # kullanıcı beklentisi: soldaki sola, sağdaki sağa baksın.
+            self.seekBackwardButton: "media-seek-forward.png",   # 10sn geri (ikon yön düzeltme)
+            self.seekForwardButton: "media-seek-backward.png",   # 10sn ileri (ikon yön düzeltme)
         }
         for btn, icon_name in icon_map.items():
             btn.setIcon(QIcon(os.path.join("icons", icon_name)))
@@ -8584,65 +9474,9 @@ class AngollaPlayer(QMainWindow):
         self.popup_eq = PopupEqualizerWidget(parent=self, manager=self.audio_manager)
         # Popup'i gizli baslat
         
-        # Playback Rate Controls (Video Hızlandırma/Yavaşlatma)
-        self.playbackRateLabel = QLabel("1.0x")
-        self.playbackRateLabel.setFixedWidth(45)
-        self.playbackRateLabel.setAlignment(Qt.AlignCenter)
-        self.playbackRateLabel.setStyleSheet("""
-            QLabel {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(50, 50, 50, 200),
-                    stop:1 rgba(30, 30, 30, 220));
-                border: 1px solid rgba(80, 80, 80, 150);
-                border-radius: 6px;
-                color: #40C4FF;
-                font-weight: bold;
-                font-size: 11px;
-                padding: 2px 4px;
-            }
-        """)
-        self.playbackRateLabel.setToolTip("Video Oynatma Hızı")
-        
-        self.playbackRateNormalBtn = QPushButton("Norm.")
-        self.playbackRateDecreaseBtn = QPushButton("−")
-        self.playbackRateIncreaseBtn = QPushButton("+")
-        
-        for btn in [self.playbackRateNormalBtn, self.playbackRateDecreaseBtn, self.playbackRateIncreaseBtn]:
-            btn.setFixedSize(40, 28)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(60, 70, 80, 200),
-                        stop:1 rgba(38, 50, 56, 230));
-                    border: 1px solid rgba(85, 85, 85, 180);
-                    font-size: 12px;
-                    font-weight: bold;
-                    border-radius: 6px;
-                    color: #E0E0E0;
-                }
-                QPushButton:hover {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(80, 100, 120, 220),
-                        stop:1 rgba(55, 71, 79, 250));
-                    border: 1px solid rgba(64, 196, 255, 200);
-                    color: #40C4FF;
-                }
-                QPushButton:pressed {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(64, 196, 255, 240),
-                        stop:1 rgba(40, 160, 220, 255));
-                    border: 1px solid rgba(100, 220, 255, 255);
-                    color: #000;
-                }
-            """)
-        
-        self.playbackRateNormalBtn.setToolTip("Normal Hız (1.0x) - Klavye: \\ veya =")
-        self.playbackRateDecreaseBtn.setToolTip("Hızı Azalt - Klavye: [")
-        self.playbackRateIncreaseBtn.setToolTip("Hızı Artır - Klavye: ]")
-        
-        self.playbackRateNormalBtn.clicked.connect(self._set_playback_rate_normal)
-        self.playbackRateDecreaseBtn.clicked.connect(self._decrease_playback_rate)
-        self.playbackRateIncreaseBtn.clicked.connect(self._increase_playback_rate)
+        # Playback Rate Controls moved to Video HUD
+        # self.playbackRateLabel, self.playbackRateNormalBtn, etc. are now in video_hud
+
         
         # Playback rate değişkeni
         self._current_playback_rate = 1.0
@@ -8767,6 +9601,16 @@ class AngollaPlayer(QMainWindow):
         self.vis_widget_main_window.setFixedHeight(100)
         self.vis_widget_main_window.set_fps(30)
 
+        # 🎬 VIDEO'YA ÖZEL RİTİM ÇUBUKLARI (ana spectrum'dan bağımsız)
+        self.vis_widget_video_window = AnimatedVisualizationWidget(
+            parent=None,
+            initial_mode="Spektrum Çubukları",
+            show_full_visual=False
+        )
+        self.vis_widget_video_window.parent_player = self
+        self.vis_widget_video_window.setFixedHeight(100)
+        self.vis_widget_video_window.set_fps(30)
+
         # Hover opaklık efekti: fare geldiğinde butonlar belirsin (opacity düşsün)
         from PyQt5.QtCore import QObject
         from PyQt5.QtWidgets import QGraphicsOpacityEffect
@@ -8814,11 +9658,115 @@ class AngollaPlayer(QMainWindow):
 
 
 
+    def _toggle_video_fullscreen(self):
+        """Toggle video fullscreen mode"""
+        if not hasattr(self, 'video_display_widget'):
+            return
+
+        video_widget = self.video_display_widget
+        video_widget.controls_widget = getattr(self, 'bottom_widget', None)
+
+        if video_widget.video_fullscreen:
+            # Exit fullscreen
+            video_widget.video_fullscreen = False
+            self.showNormal()
+            self.showMaximized() if self.isMaximized() else self.showNormal()
+
+            # Reset controls position
+            if hasattr(self, 'bottom_widget'):
+                # Reset to original position (assuming bottom layout)
+                self.bottom_widget.move(0, self.height() - self.bottom_widget.height())
+                self.bottom_widget.show()
+
+            if hasattr(self, 'toolbar'):
+                self.toolbar.show()
+
+            if hasattr(self, 'menuBar') and self.menuBar():
+                self.menuBar().show()
+
+            video_widget.hide_controls_timer.stop()
+
+        else:
+            # Enter fullscreen
+            video_widget.video_fullscreen = True
+            self.showFullScreen()
+
+            # Position controls at bottom
+            if hasattr(self, 'bottom_widget'):
+                self.bottom_widget.move(0, self.height() - self.bottom_widget.height())
+                self.bottom_widget.show()
+
+            if hasattr(self, 'toolbar'):
+                self.toolbar.hide()
+
+            if hasattr(self, 'menuBar') and self.menuBar():
+                self.menuBar().hide()
+
+            # Start hide timer
+            video_widget.hide_controls_timer.start()
+
     def _on_video_tree_double_click(self, index):
         """Video ağacından çift tıklama ile oynat"""
+        try:
+            if hasattr(self, 'video_proxy') and self.video_proxy is not None:
+                index = self.video_proxy.mapToSource(index)
+        except Exception:
+            pass
         file_path = self.video_model.filePath(index)
         if os.path.isfile(file_path):
             self._play_video_file(file_path)
+
+    def _set_video_playlist_from_folder(self, selected_path: str):
+        """Seçilen videonun klasöründeki tüm videoları ada göre sıralı liste yap."""
+        try:
+            folder = os.path.dirname(selected_path)
+            exts = self._supported_video_exts()
+            entries = []
+            for name in os.listdir(folder):
+                p = os.path.join(folder, name)
+                if not os.path.isfile(p):
+                    continue
+                if os.path.splitext(name)[1].lower() not in exts:
+                    continue
+                entries.append(p)
+            entries.sort(key=lambda p: os.path.basename(p).lower())
+            self._video_playlist_paths = entries
+            self._video_playlist_folder = folder
+            self._video_playlist_index = entries.index(selected_path) if selected_path in entries else (0 if entries else -1)
+        except Exception:
+            self._video_playlist_paths = [selected_path] if selected_path else []
+            self._video_playlist_folder = os.path.dirname(selected_path) if selected_path else ""
+            self._video_playlist_index = 0 if selected_path else -1
+
+    def _video_get_next_path(self):
+        try:
+            paths = getattr(self, "_video_playlist_paths", []) or []
+            idx = int(getattr(self, "_video_playlist_index", -1))
+            if idx >= 0 and (idx + 1) < len(paths):
+                return paths[idx + 1]
+        except Exception:
+            pass
+        return None
+
+    def _update_video_playlist_ui(self):
+        """Klasör/mevcut/sonraki video bilgisini kullanıcıya göster."""
+        try:
+            paths = getattr(self, "_video_playlist_paths", []) or []
+            idx = int(getattr(self, "_video_playlist_index", -1))
+            cur = getattr(self, "_video_current_path", "") or ""
+            folder = getattr(self, "_video_playlist_folder", "") or (os.path.dirname(cur) if cur else "")
+            total = len(paths)
+            cur_name = os.path.basename(cur) if cur else "-"
+            next_path = self._video_get_next_path()
+            next_name = os.path.basename(next_path) if next_path else "-"
+            pos_txt = f"{idx+1}/{total}" if total > 0 and idx >= 0 else "-"
+            self.fileLabel.setText(f"Video Klasörü: {os.path.basename(folder) or folder} | {pos_txt} | {cur_name} | Sonraki: {next_name}")
+            try:
+                self.statusBar().showMessage(f"Video Klasörü: {folder} | {pos_txt}: {cur_name} | Sonraki: {next_name}", 6000)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     @staticmethod
     def _supported_video_exts() -> set:
@@ -8833,9 +9781,17 @@ class AngollaPlayer(QMainWindow):
     def _supported_video_globs(cls) -> list:
         return [f"*{ext}" for ext in sorted(cls._supported_video_exts())]
 
-    def _play_video_file(self, path):
+    def _play_video_file(self, path, _build_playlist: bool = True):
         """Verilen yoldaki videoyu oynat"""
         if path and os.path.exists(path):
+            # Önceki videoya ait temp altyazıları temizle (video değiştiyse)
+            try:
+                prev = str(getattr(self, '_video_current_path', '') or '')
+                if prev and os.path.abspath(prev) != os.path.abspath(path):
+                    self._cleanup_video_temp_files()
+            except Exception:
+                pass
+
             # Yalnızca yaygın yerel video uzantıları desteklenir
             ext = os.path.splitext(path)[1].lower()
             if ext not in self._supported_video_exts():
@@ -8853,6 +9809,35 @@ class AngollaPlayer(QMainWindow):
                 except Exception:
                     pass
                 return
+
+            # Klasörde sıralı otomatik oynatma için playlist'i hazırla
+            # Not: Eğer playlist boşsa veya klasör değiştiyse, _build_playlist False olsa bile kur.
+            try:
+                need_build = bool(_build_playlist)
+                try:
+                    paths = getattr(self, "_video_playlist_paths", None)
+                    folder = str(getattr(self, "_video_playlist_folder", "") or "")
+                    if not isinstance(paths, list) or not paths:
+                        need_build = True
+                    elif os.path.dirname(path) != folder:
+                        need_build = True
+                except Exception:
+                    need_build = True
+
+                if need_build:
+                    self._set_video_playlist_from_folder(path)
+                else:
+                    # Playlist önceden hazırlanmışsa index'i güncelle
+                    try:
+                        if path in (getattr(self, "_video_playlist_paths", []) or []):
+                            self._video_playlist_index = self._video_playlist_paths.index(path)
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    self._set_video_playlist_from_folder(path)
+                except Exception:
+                    pass
             # Ana medya oynatıcıyı durdur (ses karışmasın)
             self.mediaPlayer.stop()
             
@@ -8861,13 +9846,41 @@ class AngollaPlayer(QMainWindow):
                 url = QUrl.fromLocalFile(path)
                 self._video_last_source_url = url
                 self._video_last_source_text = path
+                self._video_current_path = path
+                try:
+                    # Yeni video: altyazı cache'ini sıfırla (varsa)
+                    st = getattr(self, '_video_settings_state', None)
+                    if isinstance(st, dict):
+                        st['subtitle_items'] = []
+                        st['subtitle_index'] = 0
+                        st['subtitle_path'] = None
+                        st['subtitle_label'] = None
+                        st['subtitle_loaded_path'] = None
+                        self._video_settings_state = st
+                except Exception:
+                    pass
                 try:
                     self._clear_video_error()
                 except Exception:
                     pass
+                
+                # Re-set probe source to ensure it catches the new media
+                if hasattr(self, 'videoProbe'):
+                    try:
+                        self.videoProbe.setSource(None)
+                        self.videoProbe.setSource(self.videoPlayer)
+                    except Exception:
+                        pass
+
                 self.videoPlayer.setMedia(QMediaContent(url))
                 self.videoPlayer.play()
                 self.statusBar().showMessage(f"Oynatılıyor: {os.path.basename(path)}", 5000)
+
+                # UI bilgilendirme (klasör/mevcut/sonraki)
+                try:
+                    self._update_video_playlist_ui()
+                except Exception:
+                    pass
                 
                 # Playback rate'i uygula (kaydedilmiş veya mevcut değeri koru)
                 try:
@@ -8875,12 +9888,109 @@ class AngollaPlayer(QMainWindow):
                         self.videoPlayer.setPlaybackRate(self._current_playback_rate)
                 except Exception:
                     pass
+
+                # Altyazı: mümkünse otomatik etkinleştir ve yükle
+                try:
+                    st = getattr(self, '_video_settings_state', {})
+                    if not isinstance(st, dict):
+                        st = {}
+                    # Kaynak varsa ve kullanıcı kapatmadıysa (default false) otomatik aç
+                    sources = []
+                    try:
+                        sources = self._discover_video_subtitle_sources(create_templates=False)
+                    except Exception:
+                        sources = []
+                    if sources and not bool(st.get('subtitles_enabled')):
+                        st['subtitles_enabled'] = True
+                        self._video_settings_state = st
+                    if bool(st.get('subtitles_enabled')):
+                        self._ensure_video_subtitles_loaded()
+                        try:
+                            pos = int(self.videoPlayer.position() or 0)
+                        except Exception:
+                            pos = 0
+                        self._update_video_subtitle_overlay(pos)
+                except Exception:
+                    pass
+
+                # Ek açıklamalar açıksa güncelle
+                try:
+                    st = getattr(self, '_video_settings_state', {})
+                    if isinstance(st, dict) and st.get('annotations'):
+                        self._update_video_info_overlay()
+                except Exception:
+                    pass
+                
+                # Video rotation'ı ffprobe ile tespit et ve uygula
+                try:
+                    rotation = self._detect_video_rotation(path)
+                    if rotation != 0 and hasattr(self, 'video_output_widget'):
+                        self.video_output_widget.rotate_video(rotation, absolute=True)
+                        self.statusBar().showMessage(f"Oynatılıyor: {os.path.basename(path)} (Döndürme: {rotation}°)", 5000)
+                except Exception as e:
+                    print(f"Rotation detection error: {e}")
                 
                 try:
                     # Kontrollerin videoPlayer'a göre aktifleşmesini tetikle
                     self._on_video_media_status_changed(QMediaPlayer.LoadedMedia)
                 except Exception:
                     pass
+
+    def _detect_video_rotation(self, path: str) -> int:
+        """FFprobe veya ffmpeg ile video rotation metadata'sını tespit et."""
+        import subprocess
+        import json
+        
+        rotation = 0
+        
+        # Önce ffprobe ile dene
+        try:
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_streams', '-select_streams', 'v:0', path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                streams = data.get('streams', [])
+                if streams:
+                    stream = streams[0]
+                    # rotation side_data veya tags içinde olabilir
+                    side_data = stream.get('side_data_list', [])
+                    for sd in side_data:
+                        if 'rotation' in sd:
+                            rotation = int(sd['rotation'])
+                            break
+                    if rotation == 0:
+                        tags = stream.get('tags', {})
+                        if 'rotate' in tags:
+                            rotation = int(tags['rotate'])
+        except FileNotFoundError:
+            # ffprobe yok, mediainfo ile dene
+            try:
+                cmd = ['mediainfo', '--Output=Video;%Rotation%', path]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and result.stdout.strip():
+                    rotation = int(float(result.stdout.strip()))
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"FFprobe error: {e}")
+        
+        # Negatif değerleri pozitife çevir
+        if rotation < 0:
+            rotation = 360 + rotation
+        
+        # Geçerli rotation değerlerine normalize et
+        if rotation not in [0, 90, 180, 270]:
+            # En yakın değere yuvarla
+            valid = [0, 90, 180, 270, 360]
+            rotation = min(valid, key=lambda x: abs(x - rotation))
+            if rotation == 360:
+                rotation = 0
+        
+        print(f"🎬 Video Rotation Detected: {rotation}° for {os.path.basename(path)}")
+        return rotation
 
     def _clear_video_error(self):
         try:
@@ -8998,6 +10108,7 @@ class AngollaPlayer(QMainWindow):
         try:
             mode = self._get_active_media_mode()
             self._apply_exclusive_mode(mode)
+            self._sync_ui_with_active_mode(mode)
         finally:
             self._exclusive_mode_guard = False
 
@@ -9061,6 +10172,74 @@ class AngollaPlayer(QMainWindow):
                 pass
             return
 
+    def _sync_ui_with_active_mode(self, mode: str):
+        """Aktif moda göre ana kontrol barını güncelle."""
+        try:
+            if mode == 'video':
+                # Video durumunu yansıt
+                state = self.videoPlayer.state()
+                playing = (state == QMediaPlayer.PlayingState)
+                self.update_play_button_state(playing, source="video")
+                
+                # Slider ve süreleri güncelle
+                dur = self.videoPlayer.duration()
+                pos = self.videoPlayer.position()
+                self._on_video_duration_changed(dur)
+                self._on_video_position_changed(pos)
+                
+                # Volume
+                vol = self.videoPlayer.volume()
+                self.volumeSlider.blockSignals(True)
+                self.volumeSlider.setValue(vol)
+                self.volumeSlider.blockSignals(False)
+                self._update_volume_label(vol)
+
+                # Video modunda: video ritim çubukları aktif + kapak alanı kapalı
+                try:
+                    if hasattr(self, 'bottom_vis_stack') and self.bottom_vis_stack:
+                        self.bottom_vis_stack.setCurrentIndex(1)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, 'album_container') and self.album_container:
+                        self.album_container.setVisible(False)
+                except Exception:
+                    pass
+                
+            elif mode == 'music':
+                # Müzik durumunu yansıt
+                state = self.audio_engine.media_player.state()
+                playing = (state == QMediaPlayer.PlayingState)
+                self.update_play_button_state(playing, source="music")
+
+                # Müzik modunda: ana spectrum + kapak alanı açık
+                try:
+                    if hasattr(self, 'bottom_vis_stack') and self.bottom_vis_stack:
+                        self.bottom_vis_stack.setCurrentIndex(0)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, 'album_container') and self.album_container:
+                        self.album_container.setVisible(True)
+                except Exception:
+                    pass
+                
+                # Slider ve süreleri güncelle
+                dur = self.audio_engine.media_player.duration()
+                pos = self.audio_engine.media_player.position()
+                self._on_audio_duration_changed(dur)
+                self._on_audio_position_changed(pos)
+                
+                # Volume
+                vol = self.audio_engine.media_player.volume()
+                self.volumeSlider.blockSignals(True)
+                self.volumeSlider.setValue(vol)
+                self.volumeSlider.blockSignals(False)
+                self._update_volume_label(vol)
+                
+        except Exception as e:
+            print(f"UI Sync Error: {e}")
+
     def _deactivate_video_player(self, release: bool = True):
         """Video oynatıcıyı durdur ve (istersen) kaynağı serbest bırak."""
         try:
@@ -9072,11 +10251,6 @@ class AngollaPlayer(QMainWindow):
         try:
             if hasattr(self, '_video_fps_timer') and self._video_fps_timer:
                 self._video_fps_timer.stop()
-        except Exception:
-            pass
-        try:
-            if hasattr(self, '_video_hud_aura_timer') and self._video_hud_aura_timer:
-                self._video_hud_aura_timer.stop()
         except Exception:
             pass
         try:
@@ -9098,6 +10272,12 @@ class AngollaPlayer(QMainWindow):
 
         try:
             self._clear_video_error()
+        except Exception:
+            pass
+
+        # Video modülüne özel temp altyazıları temizle (sekmeden çıkış / mod değişimi)
+        try:
+            self._cleanup_video_temp_files()
         except Exception:
             pass
 
@@ -9146,37 +10326,15 @@ class AngollaPlayer(QMainWindow):
         except Exception:
             pass
 
-    def _on_video_position_changed(self, position):
-        """Video ilerledikçe slider güncelle"""
-        if hasattr(self, 'video_seek_slider') and not self.video_seek_slider.isSliderDown():
-            self.video_seek_slider.setValue(position)
-        if hasattr(self, 'video_hud_progress') and self.video_hud_progress and not self.video_hud_progress.isSliderDown():
-            self.video_hud_progress.setValue(position)
+    # def _on_video_position_changed(self, position):
+    #     """Video ilerledikçe slider güncelle"""
+    #     # MERGED into the other definition
+    #     pass
 
-        try:
-            txt = self._format_ms_time(position)
-            if hasattr(self, 'video_time_current') and self.video_time_current:
-                self.video_time_current.setText(txt)
-            if hasattr(self, 'video_hud_time_current') and self.video_hud_time_current:
-                self.video_hud_time_current.setText(txt)
-        except Exception:
-            pass
-
-    def _on_video_duration_changed(self, duration):
-        """Video süresi değişince slider aralığı güncelle"""
-        if hasattr(self, 'video_seek_slider'):
-            self.video_seek_slider.setRange(0, duration)
-        if hasattr(self, 'video_hud_progress') and self.video_hud_progress:
-            self.video_hud_progress.setRange(0, duration)
-
-        try:
-            txt = self._format_ms_time(duration)
-            if hasattr(self, 'video_time_total') and self.video_time_total:
-                self.video_time_total.setText(txt)
-            if hasattr(self, 'video_hud_time_total') and self.video_hud_time_total:
-                self.video_hud_time_total.setText(txt)
-        except Exception:
-            pass
+    # def _on_video_duration_changed(self, duration):
+    #     """Video süresi değişince slider aralığı güncelle"""
+    #     # MERGED into the other definition
+    #     pass
 
     @staticmethod
     def _format_ms_time(ms: int) -> str:
@@ -9194,46 +10352,26 @@ class AngollaPlayer(QMainWindow):
             return f"{h:02d}:{m:02d}:{s:02d}"
         return f"{m:02d}:{s:02d}"
 
-    def _on_video_state_changed(self, state):
-        """HUD play ikonunu güncelle."""
+    def _format_time(self, ms):
+        """Milisaniyeyi 'mm:ss' veya 'H:mm:ss' formatına çevirir."""
+        # 3600000ms = 1 saat. Eğer 1 saatten uzunsa H:mm:ss, değilse mm:ss
         try:
-            if not hasattr(self, 'video_hud_play'):
-                return
-            if state == QMediaPlayer.PlayingState:
-                self.video_hud_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-                try:
-                    if hasattr(self, 'video_ctl_play') and self.video_ctl_play:
-                        self.video_ctl_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-                except Exception:
-                    pass
-                try:
-                    self._clear_video_error()
-                except Exception:
-                    pass
-                self._set_video_aura_speed(1.0)
-            else:
-                self.video_hud_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-                try:
-                    if hasattr(self, 'video_ctl_play') and self.video_ctl_play:
-                        self.video_ctl_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-                except Exception:
-                    pass
-                if state == QMediaPlayer.PausedState:
-                    self._set_video_aura_speed(0.20)
-                else:
-                    self._set_video_aura_speed(0.08)
-
-            # Hedef FPS refresh timer'ını state'e göre yönet
-            try:
-                self._apply_video_target_fps_timer()
-            except Exception:
-                pass
-
-            # HUD açıksa, border/volume stilini de yenile
-            if getattr(self, '_in_video_fullscreen', False):
-                self._update_video_hud_aura()
+            total_seconds = max(0, int(ms) // 1000)
         except Exception:
-            pass
+            total_seconds = 0
+
+        h = total_seconds // 3600
+        m = (total_seconds % 3600) // 60
+        s = total_seconds % 60
+
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    # def _on_video_state_changed(self, state):
+    #     """HUD play ikonunu güncelle."""
+    #     # MERGED into the other _on_video_state_changed definition
+    #     pass
 
     def _video_toggle_play(self):
         if not hasattr(self, 'videoPlayer'):
@@ -9261,6 +10399,33 @@ class AngollaPlayer(QMainWindow):
         if not hasattr(self, 'videoPlayer'):
             return
         try:
+            v = int(v)
+        except Exception:
+            v = 0
+
+        v = max(0, min(100, v))
+
+        st = getattr(self, '_video_settings_state', {})
+        try:
+            if isinstance(st, dict) and st.get('stable_volume'):
+                v = min(v, 80)
+        except Exception:
+            pass
+
+        # Boost aktifse base volume olarak kaydet, sonra boost uygula
+        try:
+            if isinstance(st, dict) and st.get('volume_boost'):
+                st['base_volume'] = v
+                v = min(100, int(round(v * 1.35)))
+                self._video_settings_state = st
+            else:
+                if isinstance(st, dict):
+                    st['base_volume'] = v
+                    self._video_settings_state = st
+        except Exception:
+            pass
+
+        try:
             self.videoPlayer.setMuted(False)
             self.videoPlayer.setVolume(int(v))
         except Exception:
@@ -9272,9 +10437,262 @@ class AngollaPlayer(QMainWindow):
         try:
             muted = bool(self.videoPlayer.isMuted())
             self.videoPlayer.setMuted(not muted)
-            if hasattr(self, 'video_hud_mute'):
-                ico = QStyle.SP_MediaVolumeMuted if self.videoPlayer.isMuted() else QStyle.SP_MediaVolume
-                self.video_hud_mute.setIcon(self.style().standardIcon(ico))
+        except Exception:
+            pass
+
+    # =========================================================================
+    # VIDEO EKRANI SES/PARLAKLIK KONTROLÜ (FARE TEKERLEĞİ İLE)
+    # =========================================================================
+    def _adjust_video_volume_with_indicator(self, delta):
+        """Video ekranının sol tarafında fare tekerleği ile ses seviyesini ayarla."""
+        if not hasattr(self, 'videoPlayer'):
+            return
+        try:
+            current = self.videoPlayer.volume()
+            step = 5
+            if delta > 0:
+                new_vol = min(100, current + step)
+            else:
+                new_vol = max(0, current - step)
+
+            self._video_set_volume(new_vol)
+            
+            # Dikey gösterge çubuğunu göster
+            self._show_volume_indicator(new_vol)
+        except Exception:
+            pass
+
+    def _adjust_video_brightness_with_indicator(self, delta):
+        """Video ekranının sağ tarafında fare tekerleği ile parlaklığı ayarla.
+        
+        Parlaklık değerleri:
+        - 0.0 = Tamamen karanlık
+        - 1.0 = Normal (orijinal video parlaklığı)
+        - 2.0 = Maksimum parlaklık
+        
+        Bu sadece video görüntüsünü etkiler, sistem parlaklığına dokunmaz.
+        """
+        step = 0.08  # Her adımda %8 değişim
+        if delta > 0:
+            self._video_brightness = min(2.0, self._video_brightness + step)
+        else:
+            self._video_brightness = max(0.0, self._video_brightness - step)
+        
+        # Parlaklık overlay'ini güncelle
+        self._update_brightness_overlay()
+        
+        # Dikey gösterge çubuğunu göster (0-200 aralığını 0-100'e dönüştür)
+        display_value = int(self._video_brightness * 50)  # 0-100 arası göster
+        self._show_brightness_indicator(display_value)
+
+    def _show_volume_indicator(self, value):
+        """Sol tarafta dikey ses göstergesi göster."""
+        video_widget = getattr(self, 'video_output_widget', None)
+        if not video_widget:
+            return
+        
+        # Indicator'ı oluştur veya güncelle
+        if not hasattr(self, '_volume_indicator') or self._volume_indicator is None:
+            self._volume_indicator = QWidget(video_widget)
+            self._volume_indicator.setFixedSize(60, 200)
+            self._volume_indicator.setStyleSheet("background: transparent;")
+            self._volume_indicator.setAttribute(Qt.WA_TransparentForMouseEvents)
+        
+        # Pozisyonu ayarla (sol taraf, dikey orta)
+        x = 40
+        y = (video_widget.height() - 200) // 2
+        self._volume_indicator.move(x, y)
+        self._volume_indicator.show()
+        self._volume_indicator.raise_()
+        
+        # İçeriği çiz
+        self._draw_vertical_indicator(self._volume_indicator, value, "🔊", QColor(64, 196, 255))
+        
+        # Otomatik gizleme timer'ı
+        if hasattr(self, '_volume_hide_timer'):
+            self._volume_hide_timer.stop()
+        else:
+            self._volume_hide_timer = QTimer(self)
+            self._volume_hide_timer.setSingleShot(True)
+            self._volume_hide_timer.timeout.connect(lambda: self._hide_indicator(self._volume_indicator))
+        self._volume_hide_timer.start(1500)
+
+    def _show_brightness_indicator(self, value):
+        """Sağ tarafta dikey parlaklık göstergesi göster."""
+        video_widget = getattr(self, 'video_output_widget', None)
+        if not video_widget:
+            return
+        
+        # Indicator'ı oluştur veya güncelle
+        if not hasattr(self, '_brightness_indicator') or self._brightness_indicator is None:
+            self._brightness_indicator = QWidget(video_widget)
+            self._brightness_indicator.setFixedSize(60, 200)
+            self._brightness_indicator.setStyleSheet("background: transparent;")
+            self._brightness_indicator.setAttribute(Qt.WA_TransparentForMouseEvents)
+        
+        # Pozisyonu ayarla (sağ taraf, dikey orta)
+        x = video_widget.width() - 100
+        y = (video_widget.height() - 200) // 2
+        self._brightness_indicator.move(x, y)
+        self._brightness_indicator.show()
+        self._brightness_indicator.raise_()
+        
+        # İçeriği çiz
+        self._draw_vertical_indicator(self._brightness_indicator, value, "☀", QColor(255, 193, 7))
+        
+        # Otomatik gizleme timer'ı
+        if hasattr(self, '_brightness_hide_timer'):
+            self._brightness_hide_timer.stop()
+        else:
+            self._brightness_hide_timer = QTimer(self)
+            self._brightness_hide_timer.setSingleShot(True)
+            self._brightness_hide_timer.timeout.connect(lambda: self._hide_indicator(self._brightness_indicator))
+        self._brightness_hide_timer.start(1500)
+
+    def _draw_vertical_indicator(self, widget, value, icon, color):
+        """Dikey gösterge çubuğunu çiz."""
+        # Mevcut pixmap'i temizle ve yeniden çiz
+        pixmap = QPixmap(widget.size())
+        pixmap.fill(Qt.transparent)
+        
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Arka plan (yarı saydam yuvarlak dikdörtgen)
+        bg_rect = QRectF(0, 0, 60, 200)
+        painter.setBrush(QColor(0, 0, 0, 180))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(bg_rect, 15, 15)
+        
+        # İkon (üstte)
+        painter.setPen(QColor(255, 255, 255))
+        font = painter.font()
+        font.setPointSize(18)
+        painter.setFont(font)
+        painter.drawText(QRectF(0, 10, 60, 30), Qt.AlignCenter, icon)
+        
+        # Değer yüzdesi (ortada)
+        font.setPointSize(14)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(QRectF(0, 40, 60, 25), Qt.AlignCenter, f"{value}%")
+        
+        # Dikey çubuk (altta)
+        bar_x = 22
+        bar_y = 75
+        bar_width = 16
+        bar_height = 110
+        
+        # Çubuk arka planı
+        painter.setBrush(QColor(60, 60, 60))
+        painter.drawRoundedRect(QRectF(bar_x, bar_y, bar_width, bar_height), 8, 8)
+        
+        # Dolu kısım (aşağıdan yukarı)
+        fill_height = int((value / 100.0) * bar_height)
+        if fill_height > 0:
+            fill_y = bar_y + bar_height - fill_height
+            grad = QLinearGradient(bar_x, fill_y, bar_x, bar_y + bar_height)
+            grad.setColorAt(0, color)
+            grad.setColorAt(1, color.darker(120))
+            painter.setBrush(grad)
+            painter.drawRoundedRect(QRectF(bar_x, fill_y, bar_width, fill_height), 8, 8)
+        
+        painter.end()
+        
+        # Widget'a label olarak ekle
+        if not hasattr(widget, '_indicator_label'):
+            widget._indicator_label = QLabel(widget)
+            widget._indicator_label.setGeometry(0, 0, 60, 200)
+        widget._indicator_label.setPixmap(pixmap)
+        widget._indicator_label.show()
+
+    def _hide_indicator(self, indicator):
+        """Göstergeyi gizle."""
+        if indicator:
+            indicator.hide()
+
+    def _update_brightness_overlay(self):
+        """Video parlaklık overlay'ini güncelle.
+        
+        Bu fonksiyon SADECE video görüntüsünü etkiler, sistem parlaklığına dokunmaz.
+        
+        Parlaklık değerleri:
+        - 0.0 = Tamamen karanlık (siyah overlay %100)
+        - 1.0 = Normal (overlay yok)
+        - 2.0 = Maksimum parlaklık (beyaz overlay ile parlaklaştırma)
+        """
+        video_widget = getattr(self, 'video_output_widget', None)
+        if not video_widget:
+            return
+        
+        # Karartma overlay'i oluştur (siyah)
+        if not hasattr(self, '_brightness_overlay') or self._brightness_overlay is None:
+            self._brightness_overlay = QWidget(video_widget)
+            self._brightness_overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+            self._brightness_overlay.setObjectName("videoBrightnessOverlay")
+        
+        # Parlaklaştırma overlay'i oluştur (beyaz)
+        if not hasattr(self, '_brighten_overlay') or self._brighten_overlay is None:
+            self._brighten_overlay = QWidget(video_widget)
+            self._brighten_overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+            self._brighten_overlay.setObjectName("videoBrightenOverlay")
+        
+        # Tam ekran boyutunda
+        self._brightness_overlay.setGeometry(0, 0, video_widget.width(), video_widget.height())
+        self._brighten_overlay.setGeometry(0, 0, video_widget.width(), video_widget.height())
+        
+        brightness = self._video_brightness
+        
+        if brightness < 1.0:
+            # KARARTMA: 0.0-1.0 arası = siyah overlay ile karart
+            # brightness=0.0 -> alpha=255 (tamamen siyah)
+            # brightness=1.0 -> alpha=0 (şeffaf)
+            alpha = int((1.0 - brightness) * 255)
+            self._brightness_overlay.setStyleSheet(f"background: rgba(0, 0, 0, {alpha});")
+            self._brightness_overlay.show()
+            self._brightness_overlay.raise_()
+            self._brighten_overlay.hide()
+            
+        elif brightness > 1.0:
+            # PARLAKLAŞTIRMA: 1.0-2.0 arası = beyaz overlay ile parlaklaştır
+            # brightness=1.0 -> alpha=0 (şeffaf)
+            # brightness=2.0 -> alpha=180 (parlak beyaz, tam beyaz değil)
+            alpha = int((brightness - 1.0) * 180)
+            self._brighten_overlay.setStyleSheet(f"background: rgba(255, 255, 255, {alpha});")
+            self._brighten_overlay.show()
+            self._brighten_overlay.raise_()
+            self._brightness_overlay.hide()
+            
+        else:
+            # NORMAL: brightness=1.0, her iki overlay da gizli
+            self._brightness_overlay.hide()
+            self._brighten_overlay.hide()
+        
+        # Indicator'ları her zaman en üstte tut
+        if hasattr(self, '_volume_indicator') and self._volume_indicator:
+            self._volume_indicator.raise_()
+        if hasattr(self, '_brightness_indicator') and self._brightness_indicator:
+            self._brightness_indicator.raise_()
+
+        # Altyazıyı her zaman görünür tut (sadece video overlay alanında)
+        try:
+            if hasattr(self, '_video_subtitle_label') and self._video_subtitle_label and self._video_subtitle_label.isVisible():
+                self._video_subtitle_label.raise_()
+        except Exception:
+            pass
+
+        # Altyazı overlay'ini parlaklık katmanlarının üstünde tut
+        try:
+            self._raise_video_subtitle_overlay()
+        except Exception:
+            pass
+
+    def _raise_video_subtitle_overlay(self):
+        """Video altyazı label'ini her durumda en üstte tut (yalnız video overlay alanı)."""
+        try:
+            if hasattr(self, '_video_subtitle_label') and self._video_subtitle_label:
+                # Sadece video overlay host içindeki stacking'i etkiler
+                self._video_subtitle_label.raise_()
         except Exception:
             pass
 
@@ -9296,6 +10714,19 @@ class AngollaPlayer(QMainWindow):
             self.statusBar().showMessage(f"Oynatma hızı: {rate:.2f}x", 2000)
         except Exception as e:
             print(f"Playback rate ayarlama hatası: {e}")
+
+    def _cycle_playback_rate(self):
+        """Oynatma hızını döngüsel olarak değiştir."""
+        rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+        current = getattr(self, '_current_playback_rate', 1.0)
+        next_rate = 1.0
+        for r in rates:
+            if r > current + 0.01: # Küçük tolerans
+                next_rate = r
+                break
+        else:
+            next_rate = rates[0]
+        self._set_playback_rate(next_rate)
 
     def _set_playback_rate_normal(self):
         """Normal hıza (1.0x) dön."""
@@ -9340,27 +10771,12 @@ class AngollaPlayer(QMainWindow):
             print(f"Hız azaltma hatası: {e}")
 
     def _on_video_volume_changed(self, v: int):
-        """VideoPlayer ses değiştiğinde HUD slider'ı senkronla (izole)."""
-        try:
-            if hasattr(self, 'video_hud_volume') and self.video_hud_volume:
-                if self.video_hud_volume.value() != int(v):
-                    self.video_hud_volume.blockSignals(True)
-                    self.video_hud_volume.setValue(int(v))
-                    self.video_hud_volume.blockSignals(False)
-        except Exception:
-            try:
-                self.video_hud_volume.blockSignals(False)
-            except Exception:
-                pass
+        """VideoPlayer ses değiştiğinde (izole)."""
+        pass  # HUD kaldırıldı, ana bar kontrolü yeterli
 
     def _on_video_muted_changed(self, muted: bool):
-        """VideoPlayer mute değişince HUD ikonunu güncelle (izole)."""
-        try:
-            if hasattr(self, 'video_hud_mute') and self.video_hud_mute:
-                ico = QStyle.SP_MediaVolumeMuted if bool(muted) else QStyle.SP_MediaVolume
-                self.video_hud_mute.setIcon(self.style().standardIcon(ico))
-        except Exception:
-            pass
+        """VideoPlayer mute değişince (izole)."""
+        pass  # HUD kaldırıldı, ana bar kontrolü yeterli
 
     def _on_video_media_status_changed(self, status):
         """Medya yokken video HUD kontrollerini pasifleştir."""
@@ -9379,19 +10795,36 @@ class AngollaPlayer(QMainWindow):
                 # Enum erişimi yoksa en azından duration ile yaklaş
                 has_media = bool(getattr(self.videoPlayer, 'duration', lambda: 0)() > 0)
 
-            for w in (
-                getattr(self, 'video_hud_prev', None),
-                getattr(self, 'video_hud_play', None),
-                getattr(self, 'video_hud_next', None),
-                getattr(self, 'video_hud_progress', None),
-                getattr(self, 'video_hud_mute', None),
-                getattr(self, 'video_hud_volume', None),
-                getattr(self, 'video_ctl_prev', None),
-                getattr(self, 'video_ctl_play', None),
-                getattr(self, 'video_ctl_next', None),
-            ):
-                if w is not None:
-                    w.setEnabled(bool(has_media))
+            # Video kontrolleri artık ana bar üzerinden yönetiliyor
+            # Klasör içi otomatik oynatma: video bittiğinde sıradakine geç
+            try:
+                if status == QMediaPlayer.EndOfMedia:
+                    # Video bitti: bu videoya ait temp altyazıları temizle
+                    try:
+                        self._cleanup_video_temp_files()
+                    except Exception:
+                        pass
+
+                    paths = getattr(self, "_video_playlist_paths", []) or []
+                    idx = int(getattr(self, "_video_playlist_index", -1))
+                    if idx >= 0 and (idx + 1) < len(paths):
+                        next_path = paths[idx + 1]
+                        self._video_playlist_index = idx + 1
+                        self._play_video_file(next_path, _build_playlist=False)
+                        return
+                    elif idx >= 0 and len(paths) > 0:
+                        # Liste bitti
+                        try:
+                            self.statusBar().showMessage("Video listesi bitti.", 4000)
+                        except Exception:
+                            pass
+                        try:
+                            # Çubukları yumuşakça düşür
+                            self.send_video_visual_data(0.0, [0.0] * 96)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -9402,15 +10835,11 @@ class AngollaPlayer(QMainWindow):
             pass
 
     def _update_video_fps(self):
+        """Video FPS güncelleme - HUD kaldırıldı."""
         try:
             fps = int(getattr(self, '_video_fps_frames', 0))
             self._video_fps_frames = 0
-            target = int(getattr(self, '_video_target_fps', 0) or 0)
-            txt = f"FPS: {fps} / {target}" if target > 0 else f"FPS: {fps}"
-            if hasattr(self, 'video_hud_fps') and self.video_hud_fps:
-                self.video_hud_fps.setText(txt)
-            if hasattr(self, 'video_ctl_fps') and self.video_ctl_fps:
-                self.video_ctl_fps.setText(txt)
+            # FPS göstergesi kaldırıldı - tek bar prensibi
         except Exception:
             pass
 
@@ -9472,58 +10901,72 @@ class AngollaPlayer(QMainWindow):
         time_style = f"color: {self._qcolor_rgba(text, 220)}; padding: 0 6px;"
 
         # Normal mod zaman etiketleri
-        for w in (getattr(self, 'video_time_current', None), getattr(self, 'video_time_total', None),
-                  getattr(self, 'video_hud_time_current', None), getattr(self, 'video_hud_time_total', None)):
+        for w in (getattr(self, 'video_time_current', None), getattr(self, 'video_time_total', None)):
             try:
                 if w is not None:
                     w.setStyleSheet(time_style)
             except Exception:
                 pass
 
-        # FPS etiketleri
-        for w in (getattr(self, 'video_hud_fps', None), getattr(self, 'video_ctl_fps', None)):
+        # Sadece video_fs_button için tema güncelle
+        if hasattr(self, 'video_fs_button') and self.video_fs_button:
             try:
-                if w is not None:
-                    w.setStyleSheet(lbl_style)
+                self.video_fs_button.setStyleSheet(btn_style)
+                self.video_fs_button.setCursor(Qt.PointingHandCursor)
+                self.video_fs_button.setIconSize(QSize(18, 18))
             except Exception:
                 pass
 
-        # Butonlar (HUD + normal)
-        btns = [
-            getattr(self, 'video_hud_prev', None), getattr(self, 'video_hud_play', None), getattr(self, 'video_hud_next', None),
-            getattr(self, 'video_hud_mute', None), getattr(self, 'video_hud_settings', None), getattr(self, 'video_hud_fullscreen', None),
-            getattr(self, 'video_ctl_prev', None), getattr(self, 'video_ctl_play', None), getattr(self, 'video_ctl_next', None),
-            getattr(self, 'video_ctl_fullscreen', None), getattr(self, 'video_fs_button', None),
-        ]
-        for b in btns:
-            try:
-                if b is None:
-                    continue
-                b.setStyleSheet(btn_style)
-                b.setCursor(Qt.PointingHandCursor)
-                try:
-                    b.setIconSize(QSize(18, 18))
-                except Exception:
-                    pass
-            except Exception:
-                pass
+    def _on_fullscreen_mouse_move(self):
+        """Unified handler for mouse movement in any fullscreen mode (Video or Web)."""
+        is_video_fs = getattr(self, '_in_video_fullscreen', False)
+        is_web_fs = getattr(self, '_in_web_fullscreen', False)
 
-        # HUD volume slider (tema uyumu için)
+        if not (is_video_fs or is_web_fs):
+            return
+        
+        # Cursor'ı hemen göster
+        self.setCursor(Qt.ArrowCursor)
+        if is_web_fs and hasattr(self, 'webView') and self.webView:
+            self.webView.setCursor(Qt.ArrowCursor)
+        if is_video_fs and hasattr(self, 'video_output_widget') and self.video_output_widget:
+            self.video_output_widget.setCursor(Qt.ArrowCursor)
+            if self.video_output_widget.viewport():
+                self.video_output_widget.viewport().setCursor(Qt.ArrowCursor)
+            
+            # Video tam ekran bar auto-hide sistemini tetikle
+            self._on_fs_mouse_move()
+    
+    # HUD fonksiyonları kaldırıldı - tam ekran HUD artık kullanılmıyor
+    def _show_hud_with_animation(self):
+        """HUD kaldırıldı - bu fonksiyon artık kullanılmıyor"""
+        pass
+
+    def _hide_video_hud(self):
+        """HUD kaldırıldı - bu fonksiyon artık kullanılmıyor"""
+        pass
+
+    def _is_any_menu_open(self):
+        """Herhangi bir menü veya popup açık mı kontrol et."""
         try:
-            if hasattr(self, 'video_hud_volume') and self.video_hud_volume:
-                groove = self._mix_qcolors(bg, mix_to, 0.10 if is_dark else 0.06)
-                self.video_hud_volume.setStyleSheet(
-                    "QSlider::groove:horizontal { height: 8px; border-radius: 4px; "
-                    f"background: {self._qcolor_rgba(groove, 140)}; }}"
-                    "QSlider::sub-page:horizontal { height: 8px; border-radius: 4px; "
-                    f"background: {self._qcolor_rgba(primary, 210)}; }}"
-                    "QSlider::handle:horizontal { width: 14px; margin: -4px 0; border-radius: 7px; "
-                    f"background: {self._qcolor_rgba(primary, 230)}; border: 1px solid {self._qcolor_rgba(border, 200)}; }}"
-                )
+            app = QApplication.instance()
+            if app:
+                active_popup = app.activePopupWidget()
+                if active_popup:
+                    return True
+                active_modal = app.activeModalWidget()
+                if active_modal:
+                    return True
         except Exception:
             pass
+        return False
+
+    def _toggle_hud_pin(self):
+        """HUD kaldırıldı - bu fonksiyon artık kullanılmıyor"""
+        pass
 
     def _update_video_fullscreen_icons(self):
+        """Video tam ekran buton simgesini güncelle (tek bar prensibi)."""
         in_fs = bool(getattr(self, '_in_video_fullscreen', False))
         try:
             if hasattr(self, 'video_fs_button') and self.video_fs_button:
@@ -9531,23 +10974,6 @@ class AngollaPlayer(QMainWindow):
                     self.style().standardIcon(QStyle.SP_TitleBarNormalButton if in_fs else QStyle.SP_TitleBarMaxButton)
                 )
                 self.video_fs_button.setToolTip("Tam ekrandan çık (ESC)" if in_fs else "Tam Ekran (F11)")
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self, 'video_ctl_fullscreen') and self.video_ctl_fullscreen:
-                self.video_ctl_fullscreen.setIcon(
-                    self.style().standardIcon(QStyle.SP_TitleBarNormalButton if in_fs else QStyle.SP_TitleBarMaxButton)
-                )
-                self.video_ctl_fullscreen.setToolTip("Tam ekrandan çık (ESC)" if in_fs else "Tam Ekran (F11)")
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self, 'video_hud_fullscreen') and self.video_hud_fullscreen:
-                # HUD içinde her zaman "çık" anlamında normal icon daha anlaşılır
-                self.video_hud_fullscreen.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
-                self.video_hud_fullscreen.setToolTip("Tam ekrandan çık (ESC)")
         except Exception:
             pass
 
@@ -9607,6 +11033,7 @@ class AngollaPlayer(QMainWindow):
         if fps not in (0, 24, 30, 60):
             fps = 0
         self._video_target_fps = fps
+        
         try:
             self._apply_video_target_fps_timer()
         except Exception:
@@ -9654,6 +11081,1839 @@ class AngollaPlayer(QMainWindow):
         except Exception:
             pass
 
+    # =========================================================================
+    # VIDEO: YouTube tarzı ayarlar paneli (Sadece video overlay içinde)
+    # =========================================================================
+    def _create_video_settings_ui(self):
+        """Video penceresi üstünde (overlay) dişli + YouTube benzeri ayar paneli oluştur."""
+        if not hasattr(self, 'video_overlay_host') or self.video_overlay_host is None:
+            return
+
+        # Durumlar (Sadece video için)
+        if not hasattr(self, '_video_settings_state'):
+            self._video_settings_state = {
+                'volume_boost': False,
+                'stable_volume': False,
+                'cinematic': False,
+                'annotations': False,
+                'subtitles_enabled': False,
+                'sleep_minutes': 0,
+                'subtitle_items': [],
+                'subtitle_index': 0,
+                'subtitle_path': None,
+                'subtitle_label': None,
+                'subtitle_loaded_path': None,
+                'base_volume': None,
+            }
+
+        # Dişli butonu (video üstünde, bardan bağımsız)
+        try:
+            if hasattr(self, 'video_settings_button') and self.video_settings_button:
+                return
+        except Exception:
+            pass
+
+        self.video_settings_button = QToolButton(self.video_overlay_host)
+        self.video_settings_button.setObjectName('videoSettingsButton')
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), 'icons', 'configure.png')
+            if os.path.exists(icon_path):
+                self.video_settings_button.setIcon(QIcon(icon_path))
+            else:
+                self.video_settings_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        except Exception:
+            self.video_settings_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.video_settings_button.setAutoRaise(True)
+        self.video_settings_button.setToolTip('Video Ayarları')
+        self.video_settings_button.setFixedSize(40, 40)
+        self.video_settings_button.setIconSize(QSize(22, 22))
+        self.video_settings_button.setCursor(Qt.PointingHandCursor)
+        self.video_settings_button.clicked.connect(self._toggle_video_settings_panel)
+        self.video_settings_button.setStyleSheet("""
+            QToolButton#videoSettingsButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(50, 50, 50, 200),
+                    stop:1 rgba(30, 30, 30, 230));
+                border: 1px solid rgba(85, 85, 85, 150);
+                border-radius: 10px;
+                padding: 4px;
+            }
+            QToolButton#videoSettingsButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(64, 196, 255, 200),
+                    stop:1 rgba(40, 160, 220, 230));
+                border: 2px solid rgba(100, 220, 255, 255);
+            }
+            QToolButton#videoSettingsButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(40, 160, 220, 240),
+                    stop:1 rgba(20, 120, 180, 255));
+                border: 2px solid rgba(64, 196, 255, 255);
+            }
+        """)
+        self.video_settings_button.show()
+        self.video_settings_button.raise_()
+
+        # Panel
+        self._video_settings_panel = QFrame(self.video_overlay_host)
+        self._video_settings_panel.setObjectName('videoSettingsPanel')
+        self._video_settings_panel.setVisible(False)
+        try:
+            self._video_settings_panel.setAttribute(Qt.WA_StyledBackground, True)
+            self._video_settings_panel.setAutoFillBackground(True)
+        except Exception:
+            pass
+        self._video_settings_panel.setStyleSheet("""
+            QFrame#videoSettingsPanel {
+                background: rgba(15, 15, 15, 165);
+                border: 1px solid rgba(255,255,255,70);
+                border-radius: 14px;
+            }
+            QToolButton#videoSettingsRow {
+                background: transparent;
+                border: none;
+                color: #ffffff;
+                padding: 10px 12px;
+                text-align: left;
+                font-size: 14px;
+            }
+            QToolButton#videoSettingsRow:hover {
+                background: rgba(255,255,255,28);
+                border-radius: 10px;
+            }
+            QToolButton#videoSettingsRow:checked {
+                background: rgba(64,196,255,45);
+                border-radius: 10px;
+            }
+            QLabel#videoSettingsValue {
+                color: rgba(255,255,255,180);
+                font-size: 13px;
+            }
+            QLabel#videoSettingsChevron {
+                color: rgba(255,255,255,150);
+                font-size: 16px;
+                padding-left: 6px;
+            }
+            QLabel#videoSettingsHeader {
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QToolButton#videoSettingsBack {
+                background: transparent;
+                border: none;
+                color: #ffffff;
+                padding: 8px 10px;
+            }
+            QToolButton#videoSettingsOption {
+                background: transparent;
+                border: none;
+                color: #ffffff;
+                padding: 10px 12px;
+                text-align: left;
+                font-size: 14px;
+            }
+            QToolButton#videoSettingsOption:hover {
+                background: rgba(255,255,255,30);
+                border-radius: 10px;
+            }
+            QToolButton#videoSettingsOption:checked {
+                background: rgba(64,196,255,70);
+                border-radius: 10px;
+            }
+        """)
+        self._video_settings_panel.setFixedWidth(360)
+
+        self._video_settings_stack = QStackedWidget(self._video_settings_panel)
+        panel_layout = QVBoxLayout(self._video_settings_panel)
+        panel_layout.setContentsMargins(10, 10, 10, 10)
+        panel_layout.addWidget(self._video_settings_stack)
+
+        self._video_settings_page_main = QWidget()
+        self._video_settings_page_speed = QWidget()
+        self._video_settings_page_quality = QWidget()
+        self._video_settings_page_sleep = QWidget()
+        self._video_settings_page_subtitles = QWidget()
+
+        self._video_settings_stack.addWidget(self._video_settings_page_main)
+        self._video_settings_stack.addWidget(self._video_settings_page_speed)
+        self._video_settings_stack.addWidget(self._video_settings_page_quality)
+        self._video_settings_stack.addWidget(self._video_settings_page_sleep)
+        self._video_settings_stack.addWidget(self._video_settings_page_subtitles)
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)
+
+        self._build_video_settings_pages()
+
+        # Cinematic overlay
+        self._video_cinematic_overlay = QWidget(self.video_overlay_host)
+        self._video_cinematic_overlay.setVisible(False)
+        self._video_cinematic_overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._video_cinematic_overlay.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(0,0,0,20),
+                    stop:0.65 rgba(0,0,0,0),
+                    stop:1 rgba(0,0,0,120));
+            }
+        """)
+        self._video_cinematic_overlay.lower()
+
+        # Annotations/info overlay
+        self._video_info_overlay = QWidget(self.video_overlay_host)
+        self._video_info_overlay.setVisible(False)
+        self._video_info_overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._video_info_overlay.setStyleSheet(
+            "background: rgba(0,0,0,160); border: 1px solid rgba(255,255,255,60); border-radius: 12px;"
+        )
+        info_l = QVBoxLayout(self._video_info_overlay)
+        info_l.setContentsMargins(12, 10, 12, 10)
+        self._video_info_label = QLabel('')
+        self._video_info_label.setStyleSheet('color: white; font-size: 13px;')
+        self._video_info_label.setWordWrap(True)
+        info_l.addWidget(self._video_info_label)
+
+        # Subtitles overlay
+        self._video_subtitle_label = QLabel('', self.video_overlay_host)
+        self._video_subtitle_label.setVisible(False)
+        self._video_subtitle_label.setAlignment(Qt.AlignCenter)
+        self._video_subtitle_label.setWordWrap(True)
+        self._video_subtitle_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._video_subtitle_label.setStyleSheet(
+            "color: white; background: rgba(0,0,0,170); padding: 10px 14px; border-radius: 10px;"
+            " font-size: 18px; font-weight: 600;"
+        )
+
+        # Sleep timer
+        self._video_sleep_timer = QTimer(self)
+        self._video_sleep_timer.setSingleShot(True)
+        self._video_sleep_timer.timeout.connect(self._on_video_sleep_timeout)
+
+        # Video overlay resize izleme
+        try:
+            self.video_overlay_host.installEventFilter(self)
+        except Exception:
+            pass
+
+        try:
+            self._reposition_video_settings_ui()
+        except Exception:
+            pass
+
+    def _build_video_settings_pages(self):
+        """Panel sayfalarını oluştur/güncelle."""
+        def _ensure_vlayout(w: QWidget, margins=(0, 0, 0, 0), spacing=4):
+            lay = w.layout()
+            if lay is None:
+                lay = QVBoxLayout(w)
+            else:
+                while lay.count():
+                    it = lay.takeAt(0)
+                    child = it.widget()
+                    if child:
+                        child.setParent(None)
+            try:
+                lay.setContentsMargins(*margins)
+            except Exception:
+                pass
+            try:
+                lay.setSpacing(int(spacing))
+            except Exception:
+                pass
+            return lay
+
+        def _header(title: str, back_cb):
+            row = QWidget()
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            back = QToolButton()
+            back.setObjectName('videoSettingsBack')
+            back.setText('←')
+            back.setCursor(Qt.PointingHandCursor)
+            back.clicked.connect(back_cb)
+            lab = QLabel(title)
+            lab.setObjectName('videoSettingsHeader')
+            hl.addWidget(back)
+            hl.addWidget(lab, 1)
+            return row
+
+        def _make_row(title: str, value: str, cb, *, icon: QIcon = None, has_submenu: bool = False,
+                      is_toggle: bool = False, checked: bool = False):
+            row = QWidget()
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            btn = QToolButton()
+            btn.setObjectName('videoSettingsRow')
+            btn.setText(title)
+            if icon is not None:
+                btn.setIcon(icon)
+                btn.setIconSize(QSize(22, 22))
+                btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            else:
+                btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setAutoRaise(True)
+            btn.clicked.connect(cb)
+            if is_toggle:
+                btn.setCheckable(True)
+                btn.setChecked(bool(checked))
+            val = QLabel(value)
+            val.setObjectName('videoSettingsValue')
+            chevron = QLabel('›')
+            chevron.setObjectName('videoSettingsChevron')
+            chevron.setVisible(bool(has_submenu))
+            hl.addWidget(btn, 1)
+            hl.addWidget(val, 0, Qt.AlignRight)
+            hl.addWidget(chevron, 0, Qt.AlignRight)
+            return row
+
+        def _make_option_list(w: QWidget, title: str, options, current_key, on_select):
+            lay = _ensure_vlayout(w, margins=(0, 0, 0, 0), spacing=4)
+            lay.addWidget(_header(title, lambda: self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)))
+            for key, label in options:
+                b = QToolButton()
+                b.setObjectName('videoSettingsOption')
+                b.setText(label)
+                b.setCursor(Qt.PointingHandCursor)
+                b.setCheckable(True)
+                b.setAutoRaise(True)
+                b.setChecked(str(key) == str(current_key))
+                b.clicked.connect(lambda _=False, k=key: on_select(k))
+                lay.addWidget(b)
+            lay.addStretch(1)
+
+        st = getattr(self, '_video_settings_state', {})
+
+        def _std_icon(sp):
+            try:
+                return self.style().standardIcon(sp)
+            except Exception:
+                return None
+
+        def _icon_from_file(name: str):
+            try:
+                p = os.path.join(os.path.dirname(__file__), 'icons', name)
+                if os.path.exists(p):
+                    return QIcon(p)
+            except Exception:
+                pass
+            return None
+
+        icon_boost = _icon_from_file('audio-volume-high.png') or _std_icon(QStyle.SP_MediaVolume)
+        icon_stable = _std_icon(QStyle.SP_BrowserReload)
+        icon_cine = _std_icon(QStyle.SP_DesktopIcon)
+        icon_anno = _std_icon(QStyle.SP_MessageBoxInformation)
+        icon_subs = _std_icon(QStyle.SP_FileDialogContentsView)
+        icon_sleep = _std_icon(QStyle.SP_DialogResetButton)
+        icon_speed = _std_icon(QStyle.SP_MediaPlay)
+        icon_quality = _std_icon(QStyle.SP_FileDialogDetailedView)
+
+        # --- MAIN PAGE ---
+        main_l = _ensure_vlayout(self._video_settings_page_main, margins=(0, 0, 0, 0), spacing=4)
+
+        main_l.addWidget(_make_row('Ses artırma', 'Açık' if st.get('volume_boost') else 'Kapalı',
+                       self._toggle_video_volume_boost, icon=icon_boost, is_toggle=True, checked=st.get('volume_boost')))
+        main_l.addWidget(_make_row('Sabit ses', 'Açık' if st.get('stable_volume') else 'Kapalı',
+                       self._toggle_video_stable_volume, icon=icon_stable, is_toggle=True, checked=st.get('stable_volume')))
+        main_l.addWidget(_make_row('Sinematik ışıklandırma', 'Açık' if st.get('cinematic') else 'Kapalı',
+                       self._toggle_video_cinematic, icon=icon_cine, is_toggle=True, checked=st.get('cinematic')))
+        main_l.addWidget(_make_row('Ek Açıklamalar', 'Açık' if st.get('annotations') else 'Kapalı',
+                       self._toggle_video_annotations, icon=icon_anno, is_toggle=True, checked=st.get('annotations')))
+
+        subs_val = 'Kapalı'
+        try:
+            if st.get('subtitles_enabled'):
+                subs_val = str(st.get('subtitle_label') or '').strip() or 'Açık'
+        except Exception:
+            subs_val = 'Açık' if st.get('subtitles_enabled') else 'Kapalı'
+        main_l.addWidget(_make_row('Altyazılar', subs_val,
+                       self._open_video_subtitles_menu, icon=icon_subs, has_submenu=True))
+
+        sleep_val = 'Kapalı'
+        try:
+            mins = int(st.get('sleep_minutes') or 0)
+            if mins > 0:
+                sleep_val = f"{mins} dk"
+        except Exception:
+            pass
+        main_l.addWidget(_make_row('Uyku modu zamanlayıcı', sleep_val, self._open_video_sleep_menu,
+                       icon=icon_sleep, has_submenu=True))
+
+        rate_val = 'Normal'
+        try:
+            r = float(getattr(self, '_current_playback_rate', 1.0) or 1.0)
+            rate_val = 'Normal' if abs(r - 1.0) < 1e-6 else f"{r:.2g}x"
+        except Exception:
+            pass
+        main_l.addWidget(_make_row('Çalma hızı', rate_val, self._open_video_speed_menu,
+                       icon=icon_speed, has_submenu=True))
+
+        q_val = 'Otomatik'
+        try:
+            fps = int(getattr(self, '_video_target_fps', 0) or 0)
+            qmode = str(getattr(self, '_video_quality_mode', 'KALİTE') or 'KALİTE')
+            if fps > 0:
+                q_val = f"{qmode.title()} ({fps}fps)"
+            else:
+                q_val = f"{qmode.title()} (Auto)"
+        except Exception:
+            pass
+        main_l.addWidget(_make_row('Kalite', q_val, self._open_video_quality_menu,
+                       icon=icon_quality, has_submenu=True))
+
+        main_l.addStretch(1)
+
+        # --- SPEED PAGE ---
+        current_rate = float(getattr(self, '_current_playback_rate', 1.0) or 1.0)
+        speed_opts = [(0.25, '0.25x'), (0.5, '0.5x'), (0.75, '0.75x'), (1.0, 'Normal'), (1.25, '1.25x'), (1.5, '1.5x'), (1.75, '1.75x'), (2.0, '2x')]
+        _make_option_list(self._video_settings_page_speed, 'Çalma hızı', speed_opts, current_rate, self._set_video_playback_rate_from_menu)
+
+        # --- QUALITY PAGE ---
+        ql = _ensure_vlayout(self._video_settings_page_quality, margins=(0, 0, 0, 0), spacing=6)
+        ql.addWidget(_header('Kalite', lambda: self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)))
+
+        # Ölçek
+        scale_mode = int(getattr(getattr(self, 'video_output_widget', None), 'scale_mode', 2) or 2)
+        scale_box = QFrame()
+        scale_l = QVBoxLayout(scale_box)
+        scale_l.setContentsMargins(0, 0, 0, 0)
+        scale_l.setSpacing(4)
+        t1 = QLabel('Çözünürlük')
+        t1.setObjectName('videoSettingsHeader')
+        scale_l.addWidget(t1)
+        for key, label in [(2, 'Otomatik (Fit)'), (0, 'Doldur (Fill)'), (1, 'Orijinal (1:1)')]:
+            b = QToolButton()
+            b.setObjectName('videoSettingsOption')
+            b.setText(label)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setCheckable(True)
+            b.setAutoRaise(True)
+            b.setChecked(int(key) == int(scale_mode))
+            b.clicked.connect(lambda _=False, k=key: self._set_video_scale_mode_from_menu(k))
+            scale_l.addWidget(b)
+        ql.addWidget(scale_box)
+
+        # FPS
+        fps_box = QFrame()
+        fps_l = QVBoxLayout(fps_box)
+        fps_l.setContentsMargins(0, 0, 0, 0)
+        fps_l.setSpacing(4)
+        t2 = QLabel('FPS')
+        t2.setObjectName('videoSettingsHeader')
+        fps_l.addWidget(t2)
+        cur_fps = int(getattr(self, '_video_target_fps', 0) or 0)
+        for key, label in [(0, 'Otomatik'), (24, '24 fps'), (30, '30 fps'), (60, '60 fps')]:
+            b = QToolButton()
+            b.setObjectName('videoSettingsOption')
+            b.setText(label)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setCheckable(True)
+            b.setAutoRaise(True)
+            b.setChecked(int(key) == int(cur_fps))
+            b.clicked.connect(lambda _=False, k=key: self._set_video_target_fps_from_menu(k))
+            fps_l.addWidget(b)
+        ql.addWidget(fps_box)
+
+        # Mod
+        mode_box = QFrame()
+        mode_l = QVBoxLayout(mode_box)
+        mode_l.setContentsMargins(0, 0, 0, 0)
+        mode_l.setSpacing(4)
+        t3 = QLabel('Mod')
+        t3.setObjectName('videoSettingsHeader')
+        mode_l.addWidget(t3)
+        cur_mode = str(getattr(self, '_video_quality_mode', 'KALİTE') or 'KALİTE').upper()
+        for key, label in [('KALİTE', 'Kalite'), ('PERFORMANS', 'Performans')]:
+            b = QToolButton()
+            b.setObjectName('videoSettingsOption')
+            b.setText(label)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setCheckable(True)
+            b.setAutoRaise(True)
+            b.setChecked(str(key).upper() == cur_mode)
+            b.clicked.connect(lambda _=False, k=key: self._set_video_quality_mode_from_menu(k))
+            mode_l.addWidget(b)
+        ql.addWidget(mode_box)
+        ql.addStretch(1)
+
+        # --- SLEEP PAGE ---
+        cur_sleep = int(st.get('sleep_minutes') or 0)
+        sleep_opts = [(0, 'Kapalı'), (5, '5 dk'), (10, '10 dk'), (30, '30 dk'), (60, '60 dk')]
+        _make_option_list(self._video_settings_page_sleep, 'Uyku modu', sleep_opts, cur_sleep, self._set_video_sleep_minutes)
+
+        # --- SUBTITLES PAGE ---
+        cur_sub_on = bool(st.get('subtitles_enabled'))
+        cur_sub_path = str(st.get('subtitle_path') or '')
+        sl = _ensure_vlayout(self._video_settings_page_subtitles, margins=(0, 0, 0, 0), spacing=4)
+        sl.addWidget(_header('Altyazılar', lambda: self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)))
+
+        # Kapalı
+        b_off = QToolButton()
+        b_off.setObjectName('videoSettingsOption')
+        b_off.setText('Kapalı')
+        b_off.setCheckable(True)
+        b_off.setAutoRaise(True)
+        b_off.setChecked(not cur_sub_on)
+        b_off.clicked.connect(lambda: self._set_video_subtitles_enabled(False))
+        sl.addWidget(b_off)
+
+        # Hızlı dil seçenekleri (kullanıcının beklediği Türkçe/İngilizce/Arapça)
+        # Not: Dosya yoksa gizli temp şablon oluşturur; klasör yazılamazsa in-memory şablona düşer.
+        for _k in ('turkce', 'ingilizce', 'arapca'):
+            _lbl = self._subtitle_label_from_key(_k)
+            b_lang = QToolButton()
+            b_lang.setObjectName('videoSettingsOption')
+            b_lang.setText(_lbl)
+            b_lang.setCursor(Qt.PointingHandCursor)
+            b_lang.setCheckable(True)
+            b_lang.setAutoRaise(True)
+            b_lang.setChecked(cur_sub_on and (str(st.get('subtitle_label') or '') == str(_lbl)))
+            b_lang.clicked.connect(lambda _=False, k=_k: self._video_select_subtitle_language(k))
+            sl.addWidget(b_lang)
+
+        # Dil kaynakları (video yanındaki .vtt/.srt dosyaları)
+        sources = []
+        try:
+            sources = self._discover_video_subtitle_sources(create_templates=False)
+        except Exception:
+            sources = []
+
+        for key, label, path in sources:
+            b = QToolButton()
+            b.setObjectName('videoSettingsOption')
+            b.setText(label)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setCheckable(True)
+            b.setAutoRaise(True)
+            b.setChecked(cur_sub_on and (os.path.abspath(str(path)) == os.path.abspath(cur_sub_path)))
+            b.clicked.connect(lambda _=False, p=path, l=label: self._set_video_subtitle_source_from_menu(p, l))
+            sl.addWidget(b)
+
+        if not sources:
+            hint = QLabel('Altyazı bulunamadı. Video ile aynı klasöre şu dosyaları koyabilirsiniz:  videoAdi.turkce.vtt / videoAdi.ingilizce.vtt / videoAdi.arapca.vtt  (veya .srt)')
+            hint.setStyleSheet('color: rgba(255,255,255,160); font-size: 12px; padding: 6px 2px;')
+            hint.setWordWrap(True)
+            sl.addWidget(hint)
+
+        # Whisper Otomatik Altyazı Oluşturma
+        try:
+            import whisper
+            whisper_available = True
+        except ImportError:
+            whisper_available = False
+
+        if whisper_available:
+            sl.addSpacing(8)
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setStyleSheet('background: rgba(255,255,255,30); border: none; max-height: 1px;')
+            sl.addWidget(sep)
+            sl.addSpacing(4)
+            
+            b_whisper = QToolButton()
+            b_whisper.setObjectName('videoSettingsOption')
+            b_whisper.setText('🎙️ Whisper ile Otomatik Altyazı Oluştur')
+            b_whisper.setCursor(Qt.PointingHandCursor)
+            b_whisper.setAutoRaise(True)
+            b_whisper.setToolTip('Video sesinden otomatik altyazı oluşturur (ilk kullanımda model indirilir)')
+            b_whisper.clicked.connect(self._start_whisper_transcription)
+            sl.addWidget(b_whisper)
+
+        sl.addStretch(1)
+
+    def _toggle_video_settings_panel(self):
+        try:
+            if not hasattr(self, '_video_settings_panel') or self._video_settings_panel is None:
+                self._create_video_settings_ui()
+        except Exception:
+            self._create_video_settings_ui()
+        if not hasattr(self, '_video_settings_panel') or self._video_settings_panel is None:
+            return
+        if self._video_settings_panel.isVisible():
+            self._hide_video_settings_panel(animate=True)
+        else:
+            self._show_video_settings_panel(animate=True)
+
+    def _show_video_settings_panel(self, animate: bool = True):
+        if not hasattr(self, '_video_settings_panel') or self._video_settings_panel is None:
+            return
+
+        # Tam ekranda: panel açıkken alt bar kaybolmasın + panel stili bar ile uyumlu olsun
+        in_fs = bool(getattr(self, '_in_video_fullscreen', False))
+        if in_fs:
+            try:
+                # Tema/QSS'den izole: sabit yarı saydam modern kart (bar ile aynı şeffaflık)
+                panel_bg = "rgba(0, 0, 0, 90)"      # 90/255 ~= 0.35
+                border = "rgba(255, 255, 255, 35)"
+                fg = "rgba(255,255,255,235)"
+                fg_dim = "rgba(255,255,255,180)"
+                hover_bg = "rgba(255,255,255,18)"
+                checked_bg = "rgba(255,255,255,26)"
+                accent = "rgba(64,196,255,140)"
+                try:
+                    self._video_settings_panel.setAttribute(Qt.WA_StyledBackground, True)
+                    self._video_settings_panel.setAutoFillBackground(True)
+                except Exception:
+                    pass
+                self._video_settings_panel.setStyleSheet(f"""
+                    QFrame#videoSettingsPanel {{
+                        background: {panel_bg};
+                        border: 1px solid {border};
+                        border-radius: 14px;
+                    }}
+                    QFrame#videoSettingsPanel QWidget {{
+                        background: transparent;
+                    }}
+                    QFrame#videoSettingsPanel QFrame {{
+                        background: transparent;
+                    }}
+                    QToolButton#videoSettingsRow {{
+                        background: transparent;
+                        border: none;
+                        color: {fg};
+                        padding: 12px 14px;
+                        text-align: left;
+                        font-size: 16px;
+                        font-weight: 600;
+                    }}
+                    QToolButton#videoSettingsRow:hover {{
+                        background: {hover_bg};
+                        border-radius: 10px;
+                    }}
+                    QToolButton#videoSettingsRow:checked {{
+                        background: {checked_bg};
+                        border: 1px solid {accent};
+                        border-radius: 10px;
+                    }}
+                    QLabel#videoSettingsValue {{
+                        color: {fg_dim};
+                        font-size: 14px;
+                    }}
+                    QLabel#videoSettingsChevron {{
+                        color: {fg_dim};
+                        font-size: 18px;
+                        padding-left: 6px;
+                    }}
+                    QLabel#videoSettingsHeader {{
+                        color: {fg};
+                        font-size: 16px;
+                        font-weight: bold;
+                    }}
+                    QToolButton#videoSettingsBack {{
+                        background: transparent;
+                        border: none;
+                        color: {fg};
+                        padding: 10px 12px;
+                        font-size: 16px;
+                    }}
+                    QToolButton#videoSettingsOption {{
+                        background: transparent;
+                        border: none;
+                        color: {fg};
+                        padding: 12px 14px;
+                        text-align: left;
+                        font-size: 16px;
+                        font-weight: 600;
+                    }}
+                    QToolButton#videoSettingsOption:hover {{
+                        background: {hover_bg};
+                        border-radius: 10px;
+                    }}
+                    QToolButton#videoSettingsOption:checked {{
+                        background: {checked_bg};
+                        border: 1px solid {accent};
+                        border-radius: 10px;
+                    }}
+                """)
+            except Exception:
+                pass
+
+            # Barı görünür tut + auto-hide timer'ını durdur
+            try:
+                if not getattr(self, '_fs_bars_visible', True):
+                    self._animate_fs_bars_show()
+            except Exception:
+                pass
+            try:
+                self._stop_fs_bar_hide_timer()
+            except Exception:
+                pass
+            try:
+                self._fs_bars_visible = True
+            except Exception:
+                pass
+
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)
+        self._video_settings_panel.show()
+        self._video_settings_panel.raise_()
+        try:
+            self.video_settings_button.raise_()
+        except Exception:
+            pass
+        try:
+            self._reposition_video_settings_ui()
+        except Exception:
+            pass
+
+        if not animate:
+            return
+
+        try:
+            from PyQt5.QtWidgets import QGraphicsOpacityEffect
+            from PyQt5.QtCore import QPropertyAnimation, QEasingCurve
+            eff = self._video_settings_panel.graphicsEffect()
+            if not isinstance(eff, QGraphicsOpacityEffect):
+                eff = QGraphicsOpacityEffect(self._video_settings_panel)
+                self._video_settings_panel.setGraphicsEffect(eff)
+            eff.setOpacity(0.0)
+            anim = QPropertyAnimation(eff, b"opacity", self)
+            anim.setDuration(180)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.InOutQuad)
+            self._video_settings_fade_anim = anim
+            anim.start()
+        except Exception:
+            pass
+
+    def _hide_video_settings_panel(self, animate: bool = True):
+        if not hasattr(self, '_video_settings_panel') or self._video_settings_panel is None:
+            return
+        if not self._video_settings_panel.isVisible():
+            return
+
+        in_fs = bool(getattr(self, '_in_video_fullscreen', False))
+        if not animate:
+            self._video_settings_panel.hide()
+            if in_fs:
+                try:
+                    self._start_fs_bar_hide_timer()
+                except Exception:
+                    pass
+            return
+
+        try:
+            from PyQt5.QtWidgets import QGraphicsOpacityEffect
+            from PyQt5.QtCore import QPropertyAnimation, QEasingCurve
+            eff = self._video_settings_panel.graphicsEffect()
+            if not isinstance(eff, QGraphicsOpacityEffect):
+                eff = QGraphicsOpacityEffect(self._video_settings_panel)
+                self._video_settings_panel.setGraphicsEffect(eff)
+            start = float(getattr(eff, 'opacity', lambda: 1.0)())
+            anim = QPropertyAnimation(eff, b"opacity", self)
+            anim.setDuration(160)
+            anim.setStartValue(start)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.InOutQuad)
+            def _after_hide():
+                try:
+                    self._video_settings_panel.hide()
+                except Exception:
+                    pass
+                if in_fs:
+                    try:
+                        self._start_fs_bar_hide_timer()
+                    except Exception:
+                        pass
+            anim.finished.connect(_after_hide)
+            self._video_settings_fade_anim = anim
+            anim.start()
+        except Exception:
+            self._video_settings_panel.hide()
+            if in_fs:
+                try:
+                    self._start_fs_bar_hide_timer()
+                except Exception:
+                    pass
+
+    def _reposition_video_settings_ui(self):
+        """Dişli ve paneli video üzerinde sağ alt köşeye hizala."""
+        if not hasattr(self, 'video_overlay_host') or self.video_overlay_host is None:
+            return
+        host = self.video_overlay_host
+        margin = 16
+
+        in_fs = bool(getattr(self, '_in_video_fullscreen', False))
+
+        # Alt tarafta bar örtüşmesi (gerçek global geometriye göre hesapla)
+        bottom_inset = 0
+        try:
+            host_tl = host.mapToGlobal(QPoint(0, 0))
+            host_br = host.mapToGlobal(QPoint(host.width(), host.height()))
+            host_bottom_y = int(host_br.y())
+
+            def _calc_occlusion(w: QWidget) -> int:
+                try:
+                    if not w or not w.isVisible():
+                        return 0
+                    tl = w.mapToGlobal(QPoint(0, 0))
+                    # Barın üst sınırı
+                    bar_top_y = int(tl.y())
+                    return max(0, host_bottom_y - bar_top_y)
+                except Exception:
+                    return 0
+
+            # Öncelik: Video fullscreen barı
+            if getattr(self, '_in_video_fullscreen', False) and hasattr(self, '_video_fs_controls'):
+                bottom_inset = max(bottom_inset, _calc_occlusion(getattr(self, '_video_fs_controls', None)))
+
+            # Normal mod: global bottom_widget örtüşüyorsa onu da dikkate al
+            try:
+                if hasattr(self, 'bottom_widget') and self.bottom_widget and self.bottom_widget.isVisible():
+                    bottom_inset = max(bottom_inset, _calc_occlusion(self.bottom_widget))
+            except Exception:
+                pass
+        except Exception:
+            bottom_inset = 0
+
+        try:
+            if hasattr(self, '_video_cinematic_overlay') and self._video_cinematic_overlay:
+                self._video_cinematic_overlay.setGeometry(0, 0, host.width(), host.height())
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, '_video_info_overlay') and self._video_info_overlay:
+                self._video_info_overlay.adjustSize()
+                self._video_info_overlay.move(margin, margin)
+                self._video_info_overlay.raise_()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, '_video_subtitle_label') and self._video_subtitle_label:
+                self._video_subtitle_label.setFixedWidth(max(200, int(host.width() * 0.72)))
+                self._video_subtitle_label.adjustSize()
+                x = int((host.width() - self._video_subtitle_label.width()) / 2)
+                y = int(host.height() - bottom_inset - self._video_subtitle_label.height() - margin - 10)
+                self._video_subtitle_label.move(max(0, x), max(0, y))
+                self._video_subtitle_label.raise_()
+        except Exception:
+            pass
+
+        # Tam ekranda: overlay ikonlarını kapat (bar içindeki kontroller kullanılacak)
+        try:
+            if in_fs:
+                if hasattr(self, 'video_settings_button') and self.video_settings_button:
+                    self.video_settings_button.setVisible(False)
+                if hasattr(self, 'video_fs_button') and self.video_fs_button:
+                    self.video_fs_button.setVisible(False)
+            else:
+                # Settings button: mümkünse fullscreen butonunun SOLUNA hizala
+                if hasattr(self, 'video_settings_button') and self.video_settings_button:
+                    self.video_settings_button.setVisible(True)
+                    bx = host.width() - self.video_settings_button.width() - margin
+                    by = host.height() - bottom_inset - self.video_settings_button.height() - margin
+                    try:
+                        if hasattr(self, 'video_fs_button') and self.video_fs_button and self.video_fs_button.isVisible():
+                            fs_geo = self.video_fs_button.geometry()
+                            gap = 10
+                            bx = max(margin, fs_geo.x() - gap - self.video_settings_button.width())
+                            by = max(margin, fs_geo.y())
+                    except Exception:
+                        pass
+                    self.video_settings_button.move(max(0, bx), max(0, by))
+                    self.video_settings_button.raise_()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, '_video_settings_panel') and self._video_settings_panel:
+                self._video_settings_panel.adjustSize()
+                px = host.width() - self._video_settings_panel.width() - margin
+                py = host.height() - bottom_inset - self._video_settings_panel.height() - margin - 44
+                try:
+                    # Tam ekranda paneli bar içindeki Ayarlar butonuna göre hizala
+                    if in_fs and hasattr(self, '_fs_settings_btn') and self._fs_settings_btn and self._fs_settings_btn.isVisible():
+                        gp = self._fs_settings_btn.mapToGlobal(QPoint(0, 0))
+                        lp = host.mapFromGlobal(gp)
+                        ax = int(lp.x())
+                        ay = int(lp.y())
+                        aw = int(self._fs_settings_btn.width())
+                        px = max(margin, ax + aw - self._video_settings_panel.width())
+                        # Panelin altı, barın üst çizgisinin TAM üstünde olsun
+                        try:
+                            if hasattr(self, '_video_fs_controls') and self._video_fs_controls and self._video_fs_controls.isVisible():
+                                bar_gp = self._video_fs_controls.mapToGlobal(QPoint(0, 0))
+                                bar_top_local = host.mapFromGlobal(bar_gp).y()
+                                py = int(bar_top_local) - self._video_settings_panel.height()
+                            else:
+                                py = ay - 8 - self._video_settings_panel.height()
+                        except Exception:
+                            py = ay - 8 - self._video_settings_panel.height()
+                        py = max(margin, int(py))
+                    elif hasattr(self, 'video_settings_button') and self.video_settings_button:
+                        px = max(margin, self.video_settings_button.x() + self.video_settings_button.width() - self._video_settings_panel.width())
+                        py = max(margin, self.video_settings_button.y() - 8 - self._video_settings_panel.height())
+                except Exception:
+                    pass
+                self._video_settings_panel.move(max(0, px), max(0, py))
+                self._video_settings_panel.raise_()
+        except Exception:
+            pass
+
+    def _open_video_speed_menu(self):
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_speed)
+
+    def _open_video_quality_menu(self):
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_quality)
+
+    def _open_video_sleep_menu(self):
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_sleep)
+
+    def _open_video_subtitles_menu(self):
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_subtitles)
+
+    def _set_video_playback_rate_from_menu(self, rate):
+        try:
+            rate = float(rate)
+        except Exception:
+            rate = 1.0
+        try:
+            self._set_playback_rate(rate)
+        except Exception:
+            try:
+                if hasattr(self, 'videoPlayer'):
+                    self.videoPlayer.setPlaybackRate(rate)
+            except Exception:
+                pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)
+
+    def _set_video_scale_mode_from_menu(self, mode: int):
+        try:
+            if hasattr(self, 'video_output_widget') and self.video_output_widget:
+                self.video_output_widget.set_scale_mode(int(mode))
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+
+    def _set_video_target_fps_from_menu(self, fps: int):
+        try:
+            self._set_video_target_fps(int(fps))
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+
+    def _set_video_quality_mode_from_menu(self, mode: str):
+        try:
+            self._set_video_quality_mode(str(mode))
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+
+    def _set_video_sleep_minutes(self, minutes: int):
+        try:
+            minutes = int(minutes)
+        except Exception:
+            minutes = 0
+        st = getattr(self, '_video_settings_state', {})
+        st['sleep_minutes'] = max(0, minutes)
+        self._video_settings_state = st
+        try:
+            if minutes <= 0:
+                if hasattr(self, '_video_sleep_timer') and self._video_sleep_timer.isActive():
+                    self._video_sleep_timer.stop()
+            else:
+                if hasattr(self, '_video_sleep_timer'):
+                    self._video_sleep_timer.start(int(minutes) * 60 * 1000)
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)
+
+    def _on_video_sleep_timeout(self):
+        try:
+            if hasattr(self, 'videoPlayer'):
+                self.videoPlayer.pause()
+        except Exception:
+            pass
+        try:
+            self.statusBar().showMessage('⏰ Uyku modu: Video duraklatıldı', 2500)
+        except Exception:
+            pass
+
+    def _toggle_video_cinematic(self):
+        st = getattr(self, '_video_settings_state', {})
+        st['cinematic'] = not bool(st.get('cinematic'))
+        self._video_settings_state = st
+        try:
+            if hasattr(self, '_video_cinematic_overlay') and self._video_cinematic_overlay:
+                self._video_cinematic_overlay.setVisible(bool(st['cinematic']))
+                self._video_cinematic_overlay.raise_()
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+
+    def _toggle_video_annotations(self):
+        st = getattr(self, '_video_settings_state', {})
+        st['annotations'] = not bool(st.get('annotations'))
+        self._video_settings_state = st
+        try:
+            if hasattr(self, '_video_info_overlay') and self._video_info_overlay:
+                if st['annotations']:
+                    self._update_video_info_overlay()
+                    self._video_info_overlay.show()
+                    self._video_info_overlay.raise_()
+                else:
+                    self._video_info_overlay.hide()
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+
+    def _update_video_info_overlay(self):
+        try:
+            if not hasattr(self, '_video_info_label') or self._video_info_label is None:
+                return
+            src = str(getattr(self, '_video_last_source_text', '') or '')
+            if not src:
+                p = str(getattr(self, '_video_current_path', '') or '')
+                src = os.path.basename(p) if p else 'Video'
+            rate = float(getattr(self, '_current_playback_rate', 1.0) or 1.0)
+            fps = int(getattr(self, '_video_target_fps', 0) or 0)
+            qm = str(getattr(self, '_video_quality_mode', 'KALİTE') or 'KALİTE').title()
+            extra = []
+            if abs(rate - 1.0) > 1e-6:
+                extra.append(f"Hız: {rate:.2g}x")
+            extra.append(f"Mod: {qm}")
+            if fps > 0:
+                extra.append(f"FPS: {fps}")
+            self._video_info_label.setText(src + "\n" + " • ".join(extra))
+            self._video_info_overlay.adjustSize()
+        except Exception:
+            pass
+        try:
+            self._reposition_video_settings_ui()
+        except Exception:
+            pass
+
+    def _toggle_video_volume_boost(self):
+        st = getattr(self, '_video_settings_state', {})
+        st['volume_boost'] = not bool(st.get('volume_boost'))
+        self._video_settings_state = st
+        try:
+            self._apply_video_volume_boost_state()
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+
+    def _toggle_video_stable_volume(self):
+        st = getattr(self, '_video_settings_state', {})
+        st['stable_volume'] = not bool(st.get('stable_volume'))
+        self._video_settings_state = st
+        try:
+            if hasattr(self, 'videoPlayer'):
+                self._video_set_volume(int(self.videoPlayer.volume() or 0))
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+
+    def _apply_video_volume_boost_state(self):
+        if not hasattr(self, 'videoPlayer'):
+            return
+        st = getattr(self, '_video_settings_state', {})
+        try:
+            current = int(self.videoPlayer.volume() or 0)
+        except Exception:
+            current = 0
+        if st.get('base_volume') is None:
+            st['base_volume'] = current
+        try:
+            if st.get('volume_boost'):
+                base = int(st.get('base_volume') or current)
+                boosted = min(100, int(round(base * 1.35)))
+                self.videoPlayer.setVolume(boosted)
+            else:
+                base = int(st.get('base_volume') or current)
+                self.videoPlayer.setVolume(int(base))
+        except Exception:
+            pass
+        self._video_settings_state = st
+
+    def _set_video_subtitles_enabled(self, enabled: bool):
+        st = getattr(self, '_video_settings_state', {})
+        st['subtitles_enabled'] = bool(enabled)
+        self._video_settings_state = st
+        try:
+            if not enabled:
+                if hasattr(self, '_video_subtitle_label') and self._video_subtitle_label:
+                    self._video_subtitle_label.hide()
+            else:
+                self._ensure_video_subtitles_loaded()
+                try:
+                    pos = int(self.videoPlayer.position() or 0)
+                except Exception:
+                    pos = 0
+                self._update_video_subtitle_overlay(pos)
+        except Exception:
+            pass
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)
+
+    def _set_video_subtitle_source_from_menu(self, subtitle_path: str, label: str):
+        """Menüden dil seçilince altyazıyı anında değiştir."""
+        st = getattr(self, '_video_settings_state', {})
+        try:
+            subtitle_path = str(subtitle_path or '')
+        except Exception:
+            subtitle_path = ''
+        try:
+            label = str(label or '').strip() or 'Altyazı'
+        except Exception:
+            label = 'Altyazı'
+
+        st['subtitles_enabled'] = True
+        st['subtitle_path'] = subtitle_path
+        st['subtitle_label'] = label
+        st['subtitle_items'] = []
+        st['subtitle_index'] = 0
+        st['subtitle_loaded_path'] = None
+        self._video_settings_state = st
+
+        try:
+            self._ensure_video_subtitles_loaded()
+        except Exception:
+            pass
+        try:
+            pos = int(self.videoPlayer.position() or 0)
+        except Exception:
+            pos = 0
+        try:
+            self._update_video_subtitle_overlay(pos)
+        except Exception:
+            pass
+
+        try:
+            self._build_video_settings_pages()
+        except Exception:
+            pass
+        try:
+            self._video_settings_stack.setCurrentWidget(self._video_settings_page_main)
+        except Exception:
+            pass
+
+    def _discover_video_subtitle_sources(self, create_templates: bool = False):
+        """Mevcut video için altyazı kaynaklarını keşfet (vtt/srt)."""
+        video_path = str(getattr(self, '_video_current_path', '') or '')
+        if not video_path:
+            return []
+        base, _ = os.path.splitext(video_path)
+        folder = os.path.dirname(video_path)
+        base_name = os.path.basename(base)
+
+        if create_templates:
+            try:
+                self._maybe_create_default_video_subtitle_templates(base)
+            except Exception:
+                pass
+
+        # adaylar: <base>.<lang>.(vtt|srt) ve klasik <base>.srt/<base>.vtt
+        # ayrıca klasörde turkce.vtt / ingilizce.vtt / arapca.vtt gibi ortak adları da destekle
+        candidates = []
+
+        for ext in ('.vtt', '.srt'):
+            candidates.append((None, f'{base}{ext}'))
+            for lang in ('turkce', 'ingilizce', 'arapca', 'tr', 'en', 'ar'):
+                candidates.append((lang, f'{base}.{lang}{ext}'))
+                candidates.append((lang, os.path.join(folder, f'{lang}{ext}')))
+
+        # klasördeki diğer .vtt/.srt dosyalarını da ekle (base_name.<something>.ext)
+        try:
+            for fn in os.listdir(folder):
+                low = fn.lower()
+                if not (low.endswith('.vtt') or low.endswith('.srt')):
+                    continue
+                full = os.path.join(folder, fn)
+                if not os.path.isfile(full):
+                    continue
+                if os.path.abspath(full) in {os.path.abspath(p) for _, p in candidates}:
+                    continue
+                if low.startswith(base_name.lower() + '.'):
+                    candidates.append((None, full))
+        except Exception:
+            pass
+
+        def _label_from_path(p: str):
+            fn = os.path.basename(p)
+            name_no_ext = os.path.splitext(fn)[0]
+            key = None
+            if name_no_ext.lower().startswith(base_name.lower() + '.'):
+                key = name_no_ext[len(base_name) + 1:]
+            return self._subtitle_label_from_key(key), key
+
+        out = []
+        seen = set()
+        for lang_key, p in candidates:
+            try:
+                if not p or not os.path.exists(p):
+                    continue
+                ap = os.path.abspath(p)
+                if ap in seen:
+                    continue
+                seen.add(ap)
+                label = None
+                if lang_key:
+                    label = self._subtitle_label_from_key(lang_key)
+                else:
+                    label, _ = _label_from_path(p)
+                label = str(label or '').strip() or 'Altyazı'
+                out.append((lang_key, label, p))
+            except Exception:
+                continue
+
+        # sabit sıraya oturt
+        order = {'turkce': 0, 'tr': 0, 'ingilizce': 1, 'en': 1, 'arapca': 2, 'ar': 2}
+        def _sort_key(t):
+            k, label, p = t
+            if k in order:
+                return (order[k], label)
+            return (99, label)
+        out.sort(key=_sort_key)
+        return out
+
+    def _video_apply_builtin_subtitle_template(self, lang_key: str):
+        """Klasör yazılamazsa bile Türkçe/İngilizce/Arapça şablon altyazıyı anında uygula.
+
+        Bu yalnızca video overlay'de çalışır ve dosya yazmayı gerektirmez.
+        """
+        try:
+            lang_key = str(lang_key or '').strip().lower()
+        except Exception:
+            lang_key = ''
+        if lang_key not in ('turkce', 'ingilizce', 'arapca'):
+            return
+
+        st = getattr(self, '_video_settings_state', {})
+        if not isinstance(st, dict):
+            st = {}
+
+        label = self._subtitle_label_from_key(lang_key)
+        if lang_key == 'turkce':
+            text = 'Merhaba. Bu bir Türkçe altyazı şablonudur.\nAltyazı eklemek için video ile aynı klasöre .srt/.vtt koyun.'
+        elif lang_key == 'ingilizce':
+            text = 'Hello. This is an English subtitle template.\nPut a .srt/.vtt next to the video to use real subtitles.'
+        else:
+            text = 'مرحباً. هذا قالب ترجمة عربي.\nضع ملف .srt/.vtt بجانب الفيديو لاستخدام ترجمة حقيقية.'
+
+        st['subtitles_enabled'] = True
+        st['subtitle_label'] = label
+        # 10 dakika boyunca tek bir cue (test/rehber amaçlı)
+        st['subtitle_items'] = [(0, 10 * 60 * 1000, text)]
+        st['subtitle_index'] = 0
+        st['subtitle_path'] = None
+        st['subtitle_loaded_path'] = f"__angolla_template__:{lang_key}"
+        self._video_settings_state = st
+
+        try:
+            pos = int(self.videoPlayer.position() or 0)
+        except Exception:
+            pos = 0
+        try:
+            self._update_video_subtitle_overlay(pos)
+        except Exception:
+            pass
+
+    def _video_select_subtitle_language(self, lang_key: str):
+        """Menüden Türkçe/İngilizce/Arapça seçilince:
+        - varsa dosyayı seç
+        - yoksa gizli temp şablon oluşturmayı dene
+        - o da olmazsa in-memory şablona düş
+        """
+        try:
+            lang_key = str(lang_key or '').strip().lower()
+        except Exception:
+            lang_key = ''
+        if lang_key not in ('turkce', 'ingilizce', 'arapca'):
+            return
+
+        video_path = str(getattr(self, '_video_current_path', '') or '')
+        if not video_path:
+            return
+        base_no_ext, _ = os.path.splitext(video_path)
+
+        # Önce mevcut kaynaklar arasında o dili ara
+        try:
+            sources = self._discover_video_subtitle_sources(create_templates=False)
+        except Exception:
+            sources = []
+        picked = None
+        for k, lbl, p in (sources or []):
+            try:
+                if str(k or '').strip().lower() in (lang_key, {'turkce': 'tr', 'ingilizce': 'en', 'arapca': 'ar'}.get(lang_key, '')):
+                    picked = (lbl, p)
+                    break
+            except Exception:
+                continue
+
+        if picked is not None:
+            lbl, p = picked
+            self._set_video_subtitle_source_from_menu(p, lbl)
+            return
+
+        # Gizli temp şablon dosyası oluşturmayı dene
+        try:
+            self._maybe_create_default_video_subtitle_templates(base_no_ext)
+        except Exception:
+            pass
+
+        # Oluştuysa o dosyayı seç
+        try:
+            temp_paths = self._video_get_temp_subtitle_template_paths(base_no_ext)
+        except Exception:
+            temp_paths = []
+        target_path = None
+        for k, p in (temp_paths or []):
+            if str(k or '').strip().lower() == lang_key:
+                target_path = p
+                break
+
+        if target_path and os.path.exists(target_path):
+            self._set_video_subtitle_source_from_menu(target_path, self._subtitle_label_from_key(lang_key))
+            return
+
+        # Son çare: dosyasız (in-memory) şablon
+        self._video_apply_builtin_subtitle_template(lang_key)
+
+    def _video_get_temp_subtitle_template_paths(self, base_no_ext: str):
+        """Bu video için gizli temp altyazı şablon yollarını üret.
+
+        Format: <klasör>/.angolla_sub_<videoAdı>.<dil>.vtt
+        """
+        try:
+            base_no_ext = str(base_no_ext or '')
+        except Exception:
+            return []
+        if not base_no_ext:
+            return []
+        folder = os.path.dirname(base_no_ext)
+        base_name = os.path.basename(base_no_ext)
+        if not folder or not base_name:
+            return []
+        out = []
+        for key in ('turkce', 'ingilizce', 'arapca'):
+            fn = f".angolla_sub_{base_name}.{key}.vtt"
+            out.append((key, os.path.join(folder, fn)))
+        return out
+
+    def _video_register_temp_file(self, path: str):
+        """Oluşturulan temp dosyayı video state'ine kaydet."""
+        try:
+            p = str(path or '')
+        except Exception:
+            return
+        if not p:
+            return
+        st = getattr(self, '_video_settings_state', {})
+        if not isinstance(st, dict):
+            st = {}
+        lst = st.get('temp_subtitle_files')
+        if not isinstance(lst, list):
+            lst = []
+        ap = None
+        try:
+            ap = os.path.abspath(p)
+        except Exception:
+            ap = p
+        if ap and ap not in lst:
+            lst.append(ap)
+        st['temp_subtitle_files'] = lst
+        self._video_settings_state = st
+
+    def _cleanup_video_temp_files(self):
+        """Video modülünün oluşturduğu temp altyazı dosyalarını sil."""
+        st = getattr(self, '_video_settings_state', {})
+        if not isinstance(st, dict):
+            return
+        lst = st.get('temp_subtitle_files')
+        if not isinstance(lst, list) or not lst:
+            return
+
+        keep = []
+        for p in lst:
+            try:
+                if not p:
+                    continue
+                ap = os.path.abspath(str(p))
+                fn = os.path.basename(ap)
+                # Güvenlik: sadece bizim isim şablonumuza uyanları sil
+                if not (fn.startswith('.angolla_sub_') and fn.lower().endswith('.vtt')):
+                    keep.append(ap)
+                    continue
+                if os.path.exists(ap) and os.path.isfile(ap):
+                    try:
+                        os.remove(ap)
+                    except Exception:
+                        keep.append(ap)
+            except Exception:
+                continue
+
+        st['temp_subtitle_files'] = keep
+        self._video_settings_state = st
+
+    @staticmethod
+    def _subtitle_label_from_key(key: str) -> str:
+        try:
+            k = (key or '').strip().lower()
+        except Exception:
+            k = ''
+        if k in ('turkce', 'tr', 'turkish'):
+            return 'Türkçe'
+        if k in ('ingilizce', 'en', 'english'):
+            return 'İngilizce'
+        if k in ('arapca', 'ar', 'arabic'):
+            return 'Arapça'
+        if not k:
+            return 'Altyazı'
+        return k.replace('_', ' ').replace('-', ' ').title()
+
+    def _start_whisper_transcription(self):
+        """Whisper ile video sesinden otomatik altyazı oluştur"""
+        try:
+            from PyQt5.QtCore import QThread, pyqtSignal
+            import whisper
+            import tempfile
+            import subprocess
+        except ImportError as e:
+            QMessageBox.warning(self, 'Hata', f'Gerekli modül eksik: {e}\n\npip install openai-whisper')
+            return
+
+        # Video yolu kontrolü
+        current_video = getattr(self, '_video_current_path', None)
+        if not current_video or not os.path.exists(current_video):
+            QMessageBox.information(self, 'Bilgi', 'Önce bir video açmalısınız!')
+            return
+
+        # Duraklatma önerisi
+        reply = QMessageBox.question(
+            self, 
+            'Whisper Altyazı Oluştur',
+            'Video sesinden otomatik altyazı oluşturulacak.\n\n'
+            'İlk kullanımda ~150MB model indirilecek.\n'
+            'İşlem birkaç dakika sürebilir.\n\n'
+            'Devam edilsin mi?',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Video'yu duraklat
+        try:
+            if hasattr(self, 'videoPlayer'):
+                self.videoPlayer.pause()
+        except:
+            pass
+
+        # Progress dialog
+        progress = QProgressDialog('Whisper ile altyazı oluşturuluyor...', 'İptal', 0, 0, self)
+        progress.setWindowTitle('Otomatik Altyazı')
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)  # İptal butonu yok
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        # Worker thread
+        class WhisperWorker(QThread):
+            finished_signal = pyqtSignal(str, str)  # subtitle_path, error_msg
+            
+            def __init__(self, video_path):
+                super().__init__()
+                self.video_path = video_path
+                
+            def run(self):
+                try:
+                    # 1. Video'dan ses çıkar (WAV)
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
+                        wav_path = tmp_wav.name
+                    
+                    try:
+                        subprocess.run([
+                            'ffmpeg', '-i', self.video_path,
+                            '-vn', '-acodec', 'pcm_s16le',
+                            '-ar', '16000', '-ac', '1',
+                            '-y', wav_path
+                        ], check=True, capture_output=True)
+                    except Exception as e:
+                        self.finished_signal.emit('', f'Ses çıkarma hatası: {e}')
+                        return
+                    
+                    # 2. Whisper ile transkripsiyon
+                    try:
+                        model = whisper.load_model('small')
+                        result = model.transcribe(wav_path, language='tr', task='transcribe')
+                    except Exception as e:
+                        os.unlink(wav_path)
+                        self.finished_signal.emit('', f'Whisper hatası: {e}')
+                        return
+                    
+                    # 3. VTT dosyası oluştur
+                    video_dir = os.path.dirname(self.video_path)
+                    video_base = os.path.splitext(os.path.basename(self.video_path))[0]
+                    subtitle_path = os.path.join(video_dir, f'{video_base}.whisper.vtt')
+                    
+                    try:
+                        with open(subtitle_path, 'w', encoding='utf-8') as f:
+                            f.write('WEBVTT\n\n')
+                            for segment in result['segments']:
+                                start_time = self._format_vtt_time(segment['start'])
+                                end_time = self._format_vtt_time(segment['end'])
+                                text = segment['text'].strip()
+                                f.write(f'{start_time} --> {end_time}\n{text}\n\n')
+                    except Exception as e:
+                        os.unlink(wav_path)
+                        self.finished_signal.emit('', f'VTT yazma hatası: {e}')
+                        return
+                    
+                    # Temizlik
+                    try:
+                        os.unlink(wav_path)
+                    except:
+                        pass
+                    
+                    self.finished_signal.emit(subtitle_path, '')
+                    
+                except Exception as e:
+                    self.finished_signal.emit('', f'Beklenmeyen hata: {e}')
+            
+            @staticmethod
+            def _format_vtt_time(seconds):
+                """Saniyeyi VTT formatına çevir (00:00:00.000)"""
+                hours = int(seconds // 3600)
+                minutes = int((seconds % 3600) // 60)
+                secs = seconds % 60
+                return f'{hours:02d}:{minutes:02d}:{secs:06.3f}'
+
+        def on_whisper_finished(subtitle_path, error_msg):
+            progress.close()
+            
+            if error_msg:
+                QMessageBox.warning(self, 'Hata', f'Altyazı oluşturulamadı:\n\n{error_msg}')
+            elif subtitle_path and os.path.exists(subtitle_path):
+                QMessageBox.information(self, 'Başarılı', 
+                    f'Altyazı oluşturuldu:\n{os.path.basename(subtitle_path)}\n\n'
+                    'Altyazılar menüsünden seçebilirsiniz.')
+                # Altyazıyı otomatik yükle
+                try:
+                    self._set_video_subtitle_source_from_menu(subtitle_path, 'Whisper (Türkçe)')
+                except:
+                    pass
+                # Ayarlar sayfasını yenile
+                try:
+                    self._build_video_settings_pages()
+                except:
+                    pass
+            else:
+                QMessageBox.warning(self, 'Hata', 'Altyazı dosyası oluşturulamadı!')
+
+        worker = WhisperWorker(current_video)
+        worker.finished_signal.connect(on_whisper_finished)
+        worker.start()
+        
+        # Worker'ı sakla (garbage collection'dan kurtarmak için)
+        self._whisper_worker = worker
+
+
+    def _maybe_create_default_video_subtitle_templates(self, base_no_ext: str):
+        """Varsayılan dil şablonlarını oluştur (video klasöründe gizli temp dosya).
+
+        Not:
+        - Dosyalar yalnızca video modülü içinde kullanılır.
+        - Video bittiğinde veya video sekmesinden çıkıldığında otomatik temizlenir.
+        """
+        try:
+            base_no_ext = str(base_no_ext or '')
+        except Exception:
+            return
+        if not base_no_ext:
+            return
+
+        folder = os.path.dirname(base_no_ext)
+        if not folder or not os.path.isdir(folder):
+            return
+
+        # Yazılabilir değilse dokunma
+        try:
+            if not os.access(folder, os.W_OK):
+                return
+        except Exception:
+            pass
+
+        templates = {
+            'turkce': (
+                'WEBVTT\n\n'
+                '00:00:00.000 --> 00:10:00.000\n'
+                'Merhaba. Bu bir Türkçe altyazı şablonudur.\n'
+                'Altyazı eklemek için bu dosyayı düzenleyin veya aynı klasöre .srt/.vtt koyun.\n\n'
+            ),
+            'ingilizce': (
+                'WEBVTT\n\n'
+                '00:00:00.000 --> 00:10:00.000\n'
+                'Hello. This is an English subtitle template.\n'
+                'Edit this file or put a .srt/.vtt next to the video.\n\n'
+            ),
+            'arapca': (
+                'WEBVTT\n\n'
+                '00:00:00.000 --> 00:10:00.000\n'
+                'مرحباً. هذا قالب ترجمة عربي.\n'
+                'حرّر هذا الملف أو ضع ملف .srt/.vtt بجانب الفيديو.\n\n'
+            ),
+        }
+
+        base_name = os.path.basename(base_no_ext)
+        for key, content in templates.items():
+            # Gizli temp: .angolla_sub_<videoAdı>.<dil>.vtt
+            p = os.path.join(folder, f".angolla_sub_{base_name}.{key}.vtt")
+            try:
+                if not os.path.exists(p):
+                    with open(p, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    try:
+                        self._video_register_temp_file(p)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    def _ensure_video_subtitles_loaded(self):
+        st = getattr(self, '_video_settings_state', {})
+        video_path = str(getattr(self, '_video_current_path', '') or '')
+        if not video_path:
+            return
+
+        desired = str(st.get('subtitle_path') or '')
+        loaded = str(st.get('subtitle_loaded_path') or '')
+        if desired and loaded and os.path.abspath(desired) == os.path.abspath(loaded) and st.get('subtitle_items'):
+            return
+
+        sources = []
+        try:
+            sources = self._discover_video_subtitle_sources(create_templates=False)
+        except Exception:
+            sources = []
+        if not sources:
+            return
+
+        # Seçili yoksa ilk kaynağı seç
+        if not desired or not os.path.exists(desired):
+            try:
+                _, lbl, p = sources[0]
+                st['subtitle_path'] = p
+                st['subtitle_label'] = lbl
+                desired = p
+            except Exception:
+                return
+
+        try:
+            items = self._parse_subtitle_file(desired)
+            st['subtitle_items'] = items
+            st['subtitle_index'] = 0
+            st['subtitle_loaded_path'] = desired
+        except Exception:
+            st['subtitle_items'] = []
+            st['subtitle_index'] = 0
+            st['subtitle_loaded_path'] = None
+        self._video_settings_state = st
+
+    def _parse_subtitle_file(self, path: str):
+        ext = ''
+        try:
+            ext = os.path.splitext(str(path or ''))[1].lower()
+        except Exception:
+            ext = ''
+        if ext == '.vtt':
+            return self._parse_vtt_file(path)
+        # varsayılan: srt
+        return self._parse_srt_file(path)
+
+    def _parse_vtt_file(self, path: str):
+        def _ts_to_ms(ts: str) -> int:
+            ts = (ts or '').strip().replace(',', '.')
+            parts = ts.split(':')
+            if len(parts) == 2:
+                h = 0
+                m = int(parts[0])
+                s_part = parts[1]
+            else:
+                h = int(parts[0])
+                m = int(parts[1])
+                s_part = parts[2]
+            if '.' in s_part:
+                s_str, ms_str = s_part.split('.', 1)
+                ms_str = (ms_str + '000')[:3]
+            else:
+                s_str, ms_str = s_part, '000'
+            return (h * 3600 + m * 60 + int(s_str)) * 1000 + int(ms_str)
+
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            raw = f.read()
+        raw = raw.replace('\r', '')
+
+        # WEBVTT header / NOTE bloklarını basitçe ayıkla
+        lines = [ln for ln in raw.split('\n')]
+        # baştaki WEBVTT satırını kaldır
+        if lines and lines[0].strip().upper().startswith('WEBVTT'):
+            lines = lines[1:]
+        raw2 = '\n'.join(lines).strip()
+        blocks = [b.strip() for b in raw2.split('\n\n') if b.strip()]
+
+        items = []
+        for b in blocks:
+            b_lines = [ln.strip() for ln in b.split('\n') if ln.strip()]
+            if not b_lines:
+                continue
+            if b_lines[0].upper().startswith('NOTE'):
+                continue
+
+            # zaman satırı: genelde ilk veya ikinci satır
+            time_line = None
+            for ln in b_lines[:3]:
+                if '-->' in ln:
+                    time_line = ln
+                    break
+            if not time_line:
+                continue
+            try:
+                start_s, end_s = [x.strip() for x in time_line.split('-->')[:2]]
+                # end tarafında ayar (align/position) varsa kırp
+                end_s = end_s.split(' ')[0].strip()
+                start_ms = _ts_to_ms(start_s)
+                end_ms = _ts_to_ms(end_s)
+            except Exception:
+                continue
+
+            # metin: zaman satırından sonraki satırlar
+            try:
+                ti = b_lines.index(time_line)
+            except Exception:
+                ti = 0
+            text_lines = b_lines[ti + 1:]
+            text = ' '.join(text_lines).strip()
+            if not text:
+                continue
+            items.append((start_ms, end_ms, text))
+
+        items.sort(key=lambda x: x[0])
+        return items
+
+    def _parse_srt_file(self, path: str):
+        def _ts_to_ms(ts: str) -> int:
+            h, m, rest = ts.split(':')
+            s, ms = rest.split(',')
+            return (int(h) * 3600 + int(m) * 60 + int(s)) * 1000 + int(ms)
+
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            raw = f.read()
+        blocks = [b.strip() for b in raw.replace('\r', '').split('\n\n') if b.strip()]
+        items = []
+        for b in blocks:
+            lines = [ln.strip() for ln in b.split('\n') if ln.strip()]
+            if len(lines) < 2:
+                continue
+            time_line = lines[1] if '-->' in lines[1] else lines[0]
+            if '-->' not in time_line:
+                continue
+            try:
+                start_s, end_s = [x.strip() for x in time_line.split('-->')[:2]]
+                start_ms = _ts_to_ms(start_s)
+                end_ms = _ts_to_ms(end_s.split(' ')[0])
+            except Exception:
+                continue
+            text_lines = lines[2:] if '-->' in lines[1] else lines[1:]
+            text = ' '.join(text_lines).strip()
+            if not text:
+                continue
+            items.append((start_ms, end_ms, text))
+        items.sort(key=lambda x: x[0])
+        return items
+
+    def _update_video_subtitle_overlay(self, position_ms: int):
+        st = getattr(self, '_video_settings_state', {})
+        if not st.get('subtitles_enabled'):
+            return
+        items = st.get('subtitle_items') or []
+        if not items:
+            return
+
+        try:
+            idx = int(st.get('subtitle_index') or 0)
+        except Exception:
+            idx = 0
+        idx = max(0, min(idx, len(items) - 1))
+
+        try:
+            while idx > 0 and position_ms < items[idx][0]:
+                idx -= 1
+            while idx < len(items) - 1 and position_ms > items[idx][1]:
+                idx += 1
+        except Exception:
+            pass
+
+        st['subtitle_index'] = idx
+        self._video_settings_state = st
+
+        start_ms, end_ms, text = items[idx]
+        show = (start_ms <= position_ms <= end_ms)
+        try:
+            if hasattr(self, '_video_subtitle_label') and self._video_subtitle_label:
+                if show:
+                    self._video_subtitle_label.setText(text)
+                    self._video_subtitle_label.show()
+                    self._video_subtitle_label.raise_()
+                    self._reposition_video_settings_ui()
+                else:
+                    self._video_subtitle_label.hide()
+        except Exception:
+            pass
     def _get_current_theme_colors(self):
         """(primary, text, bg) QColor döndürür (tema uyumu için)."""
         try:
@@ -9688,89 +12948,1034 @@ class AngollaPlayer(QMainWindow):
         try:
             if hasattr(self, 'video_seek_slider') and hasattr(self.video_seek_slider, 'set_aura_speed'):
                 self.video_seek_slider.set_aura_speed(self._video_aura_speed)
-            if hasattr(self, 'video_hud_progress') and hasattr(self.video_hud_progress, 'set_aura_speed'):
-                self.video_hud_progress.set_aura_speed(self._video_aura_speed)
         except Exception:
             pass
 
     def _update_video_hud_aura(self):
-        """Altbar + volume slider için akıcı aura (video oynarken hızlı, durunca yavaş)."""
+        """Video aura güncellemesi - HUD kaldırıldı."""
+        pass  # HUD kaldırıldı, bu fonksiyon artık kullanılmıyor
+
+    def _enable_video_hud_controls(self, enable=True):
+        """Video HUD kontrollerini aktif/pasif yap - HUD kaldırıldı."""
+        pass  # HUD kaldırıldı, bu fonksiyon artık kullanılmıyor
+
+    def _get_fs_controls_theme_style(self):
+        """Tam ekran kontrollerinin tema uyumlu stilini döndür - AURA EFEKTLİ."""
+        primary, text, bg = self._get_current_theme_colors()
+        
+        # Tema parlaklığına göre koyu/açık mod belirle
+        bg_brightness = bg.value()  # 0-255 arası
+        is_dark_theme = bg_brightness < 140
+        
+        # Alt bar arka planını temadan bağımsız sabitle (yarı saydam şeffaf görünüm)
+        # 90/255 ~= 0.35
+        panel_bg = "rgba(0, 0, 0, 90)"
+
+        # Aura gradient renkleri (mavi-cyan-pembe)
+        if is_dark_theme:
+            # Koyu tema
+            btn_bg = "rgba(255, 255, 255, 18)"
+            btn_border = "rgba(255, 255, 255, 30)"
+            btn_text = "rgba(255, 255, 255, 230)"
+            btn_hover_bg = f"rgba({primary.red()}, {primary.green()}, {primary.blue()}, 150)"
+            btn_hover_border = f"rgba({primary.red()}, {primary.green()}, {primary.blue()}, 210)"
+            label_color = "rgba(255, 255, 255, 220)"
+            
+            # PROGRESS BAR - Aura gradient (mavi->cyan->pembe)
+            progress_groove_bg = "rgba(255, 255, 255, 25)"
+            progress_groove_border = "rgba(100, 200, 255, 80)"
+            progress_subpage_gradient_start = "rgba(64, 156, 255, 200)"  # Mavi
+            progress_subpage_gradient_mid = "rgba(64, 224, 208, 220)"     # Cyan
+            progress_subpage_gradient_end = "rgba(255, 105, 180, 200)"    # Pembe
+            progress_subpage_shadow = "0 0 8px rgba(64, 196, 255, 150), 0 0 12px rgba(64, 224, 208, 100)"
+            progress_handle_bg = "rgba(255, 255, 255, 240)"
+            progress_handle_shadow = "0 0 6px rgba(100, 200, 255, 200)"
+            
+            # SES SLIDER - Aura gradient
+            volume_groove_bg = "rgba(255, 255, 255, 30)"
+            volume_groove_border = "rgba(64, 196, 255, 60)"
+            volume_subpage_gradient_start = f"rgba({primary.red()}, {primary.green()}, {primary.blue()}, 200)"
+            volume_subpage_gradient_end = "rgba(64, 224, 208, 200)"
+            volume_subpage_shadow = "0 0 6px rgba(64, 196, 255, 120)"
+            volume_handle_bg = "rgba(255, 255, 255, 240)"
+            volume_handle_shadow = "0 0 4px rgba(100, 200, 255, 180)"
+        else:
+            # Açık tema
+            btn_bg = "rgba(0, 0, 0, 12)"
+            btn_border = "rgba(0, 0, 0, 25)"
+            btn_text = f"rgba({text.red()}, {text.green()}, {text.blue()}, 230)"
+            btn_hover_bg = f"rgba({primary.red()}, {primary.green()}, {primary.blue()}, 120)"
+            btn_hover_border = f"rgba({primary.red()}, {primary.green()}, {primary.blue()}, 190)"
+            label_color = f"rgba({text.red()}, {text.green()}, {text.blue()}, 220)"
+            
+            # PROGRESS BAR - Aura gradient (açık tema)
+            progress_groove_bg = "rgba(0, 0, 0, 20)"
+            progress_groove_border = "rgba(64, 156, 255, 60)"
+            progress_subpage_gradient_start = "rgba(64, 156, 255, 180)"
+            progress_subpage_gradient_mid = "rgba(64, 224, 208, 200)"
+            progress_subpage_gradient_end = "rgba(255, 105, 180, 180)"
+            progress_subpage_shadow = "0 0 6px rgba(64, 156, 255, 120), 0 0 10px rgba(64, 224, 208, 80)"
+            progress_handle_bg = f"rgba({text.red()}, {text.green()}, {text.blue()}, 240)"
+            progress_handle_shadow = "0 0 5px rgba(64, 156, 255, 160)"
+            
+            # SES SLIDER - Aura gradient
+            volume_groove_bg = "rgba(0, 0, 0, 25)"
+            volume_groove_border = "rgba(64, 156, 255, 50)"
+            volume_subpage_gradient_start = f"rgba({primary.red()}, {primary.green()}, {primary.blue()}, 180)"
+            volume_subpage_gradient_end = "rgba(64, 224, 208, 180)"
+            volume_subpage_shadow = "0 0 5px rgba(64, 156, 255, 100)"
+            volume_handle_bg = f"rgba({text.red()}, {text.green()}, {text.blue()}, 240)"
+            volume_handle_shadow = "0 0 4px rgba(64, 156, 255, 140)"
+        
+        return f"""
+            QWidget#videoFsControls {{
+                /* Tek parça görünüm + yarı saydamlık */
+                background: {panel_bg};
+                border: none;
+                border-radius: 0px;
+                min-height: 128px;
+                max-height: 128px;
+            }}
+
+            /* Global tema bazı alt widget'lara koyu arka plan basabiliyor.
+               Slider pseudo-elementlerini bozmayacak şekilde container'ları şeffaf zorla. */
+            QWidget#videoFsControls QWidget {{
+                background: transparent;
+            }}
+            QWidget#videoFsControls QFrame {{
+                background: transparent;
+            }}
+            
+            /* Butonlar - EXTRA BÜYÜK ve Modern */
+            QWidget#videoFsControls QToolButton {{
+                background: rgba(255, 255, 255, 18);
+                border: 1px solid rgba(255, 255, 255, 40);
+                border-radius: 6px;
+                color: rgba(255, 255, 255, 240);
+                padding: 8px 12px;
+                font-size: 14px;
+                font-weight: bold;
+                min-width: 40px;
+                min-height: 36px;
+            }}
+
+            /* Ayarlar (dişli) butonu biraz daha belirgin olsun */
+            QWidget#videoFsControls QToolButton#fsSettingsBtn {{
+                font-size: 18px;
+                padding: 6px 10px;
+            }}
+
+            /* Playback ikonları: sadece ikon görünsün */
+            QWidget#videoFsControls QToolButton#fsBackBtn,
+            QWidget#videoFsControls QToolButton#fsPlayBtn,
+            QWidget#videoFsControls QToolButton#fsFwdBtn {{
+                background: transparent;
+                border: none;
+                padding: 0px;
+                border-radius: 0px;
+                min-width: 0px;
+                min-height: 0px;
+            }}
+
+            /* ±10 saniye: yazı ikonları büyük ve görünür olsun */
+            QWidget#videoFsControls QToolButton#fsBack10Btn,
+            QWidget#videoFsControls QToolButton#fsFwd10Btn {{
+                background: transparent;
+                border: none;
+                padding: 0px;
+                border-radius: 0px;
+                min-width: 0px;
+                min-height: 0px;
+            }}
+            QWidget#videoFsControls QToolButton#fsBackBtn:hover,
+            QWidget#videoFsControls QToolButton#fsPlayBtn:hover,
+            QWidget#videoFsControls QToolButton#fsFwdBtn:hover {{
+                background: transparent;
+                border: none;
+            }}
+            QWidget#videoFsControls QToolButton:hover {{
+                background: rgba(100, 200, 255, 140);
+                border: 1px solid rgba(100, 200, 255, 200);
+            }}
+            QWidget#videoFsControls QToolButton:pressed {{
+                background: rgba(100, 200, 255, 180);
+                border: 2px solid rgba(100, 200, 255, 240);
+            }}
+            
+            /* Label'lar - Büyütülmüş */
+            QWidget#videoFsControls QLabel {{
+                color: rgba(255, 255, 255, 230);
+                background: transparent;
+                font-size: 14px;
+                font-weight: 600;
+            }}
+            
+            /* PROGRESS BAR - AURA EFEKTİ - Daha Kalın ve Belirgin */
+            QWidget#videoFsControls QSlider#_fs_seek_slider::groove:horizontal {{
+                height: 10px;
+                background: rgba(255, 255, 255, 25);
+                border: 1px solid rgba(100, 200, 255, 80);
+                border-radius: 5px;
+            }}
+            QWidget#videoFsControls QSlider#_fs_seek_slider::sub-page:horizontal {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {progress_subpage_gradient_start},
+                    stop:0.5 {progress_subpage_gradient_mid},
+                    stop:1 {progress_subpage_gradient_end});
+                border-radius: 5px;
+                box-shadow: {progress_subpage_shadow};
+            }}
+            QWidget#videoFsControls QSlider#_fs_seek_slider::handle:horizontal {{
+                background: {progress_handle_bg};
+                width: 18px;
+                height: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+                border: 2px solid rgba(100, 200, 255, 200);
+                box-shadow: {progress_handle_shadow};
+            }}
+            QWidget#videoFsControls QSlider#_fs_seek_slider::handle:horizontal:hover {{
+                width: 20px;
+                height: 20px;
+                margin: -6px 0;
+                border-radius: 10px;
+                box-shadow: 0 0 8px rgba(100, 200, 255, 255);
+            }}
+            
+            /* SES SLIDER - AURA EFEKTİ - Daha Kalın */
+            QWidget#videoFsControls QSlider#_fs_volume_slider::groove:horizontal {{
+                height: 6px;
+                background: rgba(255, 255, 255, 30);
+                border: 1px solid rgba(64, 196, 255, 60);
+                border-radius: 3px;
+            }}
+            QWidget#videoFsControls QSlider#_fs_volume_slider::sub-page:horizontal {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {volume_subpage_gradient_start},
+                    stop:1 {volume_subpage_gradient_end});
+                border-radius: 3px;
+                box-shadow: {volume_subpage_shadow};
+            }}
+            QWidget#videoFsControls QSlider#_fs_volume_slider::handle:horizontal {{
+                background: {volume_handle_bg};
+                width: 14px;
+                height: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+                border: 2px solid rgba(64, 196, 255, 180);
+                box-shadow: {volume_handle_shadow};
+            }}
+            QWidget#videoFsControls QSlider#_fs_volume_slider::handle:horizontal:hover {{
+                width: 16px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+                box-shadow: 0 0 6px rgba(100, 200, 255, 220);
+            }}
+            
+            /* Diğer slider'lar (varsayılan) */
+            QWidget#videoFsControls QSlider::groove:horizontal {{
+                height: 5px;
+                background: rgba(255, 255, 255, 30);
+                border-radius: 2px;
+            }}
+            QWidget#videoFsControls QSlider::sub-page:horizontal {{
+                background: rgba(100, 200, 255, 180);
+                border-radius: 2px;
+            }}
+            QWidget#videoFsControls QSlider::handle:horizontal {{
+                background: rgba(255, 255, 255, 220);
+                width: 11px;
+                margin: -3px 0;
+                border-radius: 5px;
+            }}
+        """
+    
+    def _get_fs_bottom_widget_theme_style(self):
+        """Tam ekran bottom_widget için tema uyumlu stil döndür."""
+        primary, text, bg = self._get_current_theme_colors()
+        
+        bg_brightness = bg.value()
+        is_dark_theme = bg_brightness < 140
+        
+        if is_dark_theme:
+            # Koyu tema: şeffaf koyu bar (rgba 0,0,0,0.35 = 89)
+            return f"""
+                QWidget#bottomWidget {{
+                    background: rgba(0, 0, 0, 89);
+                    border-top: 1px solid rgba(255, 255, 255, 15);
+                    border-radius: 0px;
+                }}
+                QWidget#bottomWidget QLabel {{
+                    color: rgba(255, 255, 255, 220);
+                    background: transparent;
+                }}
+                QWidget#bottomWidget QPushButton, QWidget#bottomWidget QToolButton {{
+                    background: rgba(255, 255, 255, 12);
+                    border: 1px solid rgba(255, 255, 255, 20);
+                    border-radius: 5px;
+                    color: rgba(255, 255, 255, 210);
+                }}
+                QWidget#bottomWidget QPushButton:hover, QWidget#bottomWidget QToolButton:hover {{
+                    background: rgba({primary.red()}, {primary.green()}, {primary.blue()}, 110);
+                    border: 1px solid rgba({primary.red()}, {primary.green()}, {primary.blue()}, 180);
+                }}
+                QWidget#bottomWidget QSlider::groove:horizontal {{
+                    height: 5px;
+                    background: rgba(255, 255, 255, 30);
+                    border-radius: 2px;
+                }}
+                QWidget#bottomWidget QSlider::sub-page:horizontal {{
+                    background: rgba({primary.red()}, {primary.green()}, {primary.blue()}, 180);
+                    border-radius: 2px;
+                }}
+                QWidget#bottomWidget QSlider::handle:horizontal {{
+                    background: rgba(255, 255, 255, 220);
+                    width: 12px;
+                    margin: -4px 0;
+                    border-radius: 6px;
+                }}
+            """
+        else:
+            # Açık tema: şeffaf beyaz bar
+            return f"""
+                QWidget#bottomWidget {{
+                    background: rgba(255, 255, 255, 89);
+                    border-top: 1px solid rgba(0, 0, 0, 12);
+                    border-radius: 0px;
+                }}
+                QWidget#bottomWidget QLabel {{
+                    color: rgba({text.red()}, {text.green()}, {text.blue()}, 220);
+                    background: transparent;
+                }}
+                QWidget#bottomWidget QPushButton, QWidget#bottomWidget QToolButton {{
+                    background: rgba(0, 0, 0, 8);
+                    border: 1px solid rgba(0, 0, 0, 15);
+                    border-radius: 5px;
+                    color: rgba({text.red()}, {text.green()}, {text.blue()}, 210);
+                }}
+                QWidget#bottomWidget QPushButton:hover, QWidget#bottomWidget QToolButton:hover {{
+                    background: rgba({primary.red()}, {primary.green()}, {primary.blue()}, 90);
+                    border: 1px solid rgba({primary.red()}, {primary.green()}, {primary.blue()}, 160);
+                }}
+                QWidget#bottomWidget QSlider::groove:horizontal {{
+                    height: 5px;
+                    background: rgba(0, 0, 0, 25);
+                    border-radius: 2px;
+                }}
+                QWidget#bottomWidget QSlider::sub-page:horizontal {{
+                    background: rgba({primary.red()}, {primary.green()}, {primary.blue()}, 180);
+                    border-radius: 2px;
+                }}
+                QWidget#bottomWidget QSlider::handle:horizontal {{
+                    background: rgba({text.red()}, {text.green()}, {text.blue()}, 210);
+                    width: 12px;
+                    margin: -4px 0;
+                    border-radius: 6px;
+                }}
+            """
+
+    def _create_video_fullscreen_controls(self):
+        """Tam ekran modunda görünecek TEK ve KAPSAMLI kontrol barını oluştur."""
+        if hasattr(self, '_video_fs_controls') and self._video_fs_controls:
+            return  # Zaten oluşturulmuş
+        
+        # Ana konteyner - tam ekran tek bar
+        self._video_fs_controls = QWidget(self)
+        self._video_fs_controls.setObjectName("videoFsControls")
+        try:
+            # Bar yarı saydam olacağı için stylesheet arka planının kesin çizilmesini sağla
+            self._video_fs_controls.setAttribute(Qt.WA_StyledBackground, True)
+            self._video_fs_controls.setAttribute(Qt.WA_TranslucentBackground, False)
+            self._video_fs_controls.setAutoFillBackground(True)
+        except Exception:
+            pass
+        self._video_fs_controls.setStyleSheet(self._get_fs_controls_theme_style())
+        # Bazı platformlarda QSS min/max-height her zaman uygulanmadığı için
+        # bar yüksekliğini koddan sabitle (buton kırpılmasını engeller).
+        self._video_fs_controls.setFixedHeight(128)
+        
+        # Ana horizontal layout - TEK SATIR
+        main_layout = QHBoxLayout(self._video_fs_controls)
+        main_layout.setContentsMargins(16, 10, 16, 10)
+        main_layout.setSpacing(14)
+        
+        # === SOL: ZAMAN + SES ===
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+        
+        # Zaman göstergesi
+        self._fs_time_label = QLabel("00:00 / 00:00")
+        self._fs_time_label.setAlignment(Qt.AlignCenter)
+        self._fs_time_label.setStyleSheet("font-size: 14px; font-weight: 600; color: rgba(255,255,255,230);")
+        left_layout.addWidget(self._fs_time_label)
+        
+        main_layout.addWidget(left_container)
+        
+        # === ORTA: PLAYBACK + PROGRESS (MODERN LAYOUT) ===
+        center_container = QWidget()
+        center_layout = QVBoxLayout(center_container)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(3)
+        
+        # Progress bar (üstte)
+        self._fs_seek_slider = QSlider(Qt.Horizontal)
+        self._fs_seek_slider.setObjectName("_fs_seek_slider")
+        self._fs_seek_slider.setRange(0, 0)
+        self._fs_seek_slider.setValue(0)
+        self._fs_seek_slider.setTracking(True)
+        self._fs_seek_slider.setMinimumWidth(400)
+        self._fs_seek_slider.sliderPressed.connect(self._on_fs_seek_pressed)
+        self._fs_seek_slider.sliderMoved.connect(self._on_fs_seek_moved)
+        self._fs_seek_slider.sliderReleased.connect(self._on_fs_seek_released)
+        center_layout.addWidget(self._fs_seek_slider)
+        
+        # Playback butonları (progress bar'ın altında, ortalanmış)
+        playback_row = QWidget()
+        playback_layout = QHBoxLayout(playback_row)
+        # Playback grubunu kullanıcı açısından sağa kaydırmak için
+        # layout'ın sol margin'ini DPI'ye göre arttır.
+        # Not: Sol margin L olursa merkez yaklaşık L/2 sağa kayar.
+        # 4.5cm sağ kayma için margin'i ~9cm ayarlıyoruz.
+        try:
+            dpi = 96.0
+            screen = QApplication.primaryScreen()
+            if screen:
+                dpi = float(screen.logicalDotsPerInch())
+            margin_left = int((dpi / 2.54) * 9.0)  # 9cm margin => ~4.5cm sağ kayma
+        except Exception:
+            margin_left = 150
+        playback_layout.setContentsMargins(max(0, margin_left), 0, 0, 0)
+        playback_layout.setSpacing(8)
+        playback_layout.addStretch(1)
+        
+        # Önceki video (geri getir)
+        self._fs_prev_btn = QToolButton()
+        self._fs_prev_btn.setObjectName("fsBackBtn")
+        self._fs_prev_btn.setAutoRaise(True)
+        try:
+            self._fs_prev_btn.setIcon(QIcon(os.path.join("icons", "media-skip-backward.png")))
+            self._fs_prev_btn.setIconSize(QSize(34, 34))
+            self._fs_prev_btn.setText("")
+        except Exception:
+            self._fs_prev_btn.setText("⏮")
+        self._fs_prev_btn.setToolTip("Önceki video")
+        self._fs_prev_btn.setFixedSize(62, 56)
+        self._fs_prev_btn.clicked.connect(lambda: self._play_video_relative(-1))
+        playback_layout.addWidget(self._fs_prev_btn)
+
+        # -10sn butonu (play'in solunda)
+        self._fs_back10_btn = QToolButton()
+        self._fs_back10_btn.setObjectName("fsBack10Btn")
+        self._fs_back10_btn.setAutoRaise(True)
+        try:
+            self._fs_back10_btn.setIcon(QIcon(os.path.join("icons", "seek10_fwd.svg")))
+            self._fs_back10_btn.setIconSize(QSize(34, 34))
+            self._fs_back10_btn.setText("")
+        except Exception:
+            self._fs_back10_btn.setText("⟲10")
+        self._fs_back10_btn.setToolTip("-10 saniye")
+        self._fs_back10_btn.setFixedSize(62, 56)
+        self._fs_back10_btn.clicked.connect(lambda: self._seek_relative(-10000))
+        playback_layout.addWidget(self._fs_back10_btn)
+        
+        # Play/Pause butonu (EXTRA BÜYÜK MODERN)
+        self._fs_play_btn = QToolButton()
+        self._fs_play_btn.setObjectName("fsPlayBtn")
+        self._fs_play_btn.setAutoRaise(True)
+        try:
+            self._fs_play_btn.setIcon(QIcon(os.path.join("icons", "media-playback-start.png")))
+            self._fs_play_btn.setIconSize(QSize(38, 38))
+            self._fs_play_btn.setText("")
+        except Exception:
+            self._fs_play_btn.setText("▶")
+        self._fs_play_btn.setToolTip("Oynat/Duraklat")
+        self._fs_play_btn.setFixedSize(68, 60)
+        self._fs_play_btn.clicked.connect(self._on_fs_play_clicked)
+        playback_layout.addWidget(self._fs_play_btn)
+
+        # +10sn butonu (play'in sağında)
+        self._fs_fwd10_btn = QToolButton()
+        self._fs_fwd10_btn.setObjectName("fsFwd10Btn")
+        self._fs_fwd10_btn.setAutoRaise(True)
+        try:
+            self._fs_fwd10_btn.setIcon(QIcon(os.path.join("icons", "seek10_back.svg")))
+            self._fs_fwd10_btn.setIconSize(QSize(34, 34))
+            self._fs_fwd10_btn.setText("")
+        except Exception:
+            self._fs_fwd10_btn.setText("⟳10")
+        self._fs_fwd10_btn.setToolTip("+10 saniye")
+        self._fs_fwd10_btn.setFixedSize(62, 56)
+        self._fs_fwd10_btn.clicked.connect(lambda: self._seek_relative(10000))
+        playback_layout.addWidget(self._fs_fwd10_btn)
+        
+        # Sonraki video (geri getir)
+        self._fs_next_btn = QToolButton()
+        self._fs_next_btn.setObjectName("fsFwdBtn")
+        self._fs_next_btn.setAutoRaise(True)
+        try:
+            self._fs_next_btn.setIcon(QIcon(os.path.join("icons", "media-skip-forward.png")))
+            self._fs_next_btn.setIconSize(QSize(34, 34))
+            self._fs_next_btn.setText("")
+        except Exception:
+            self._fs_next_btn.setText("⏭")
+        self._fs_next_btn.setToolTip("Sonraki video")
+        self._fs_next_btn.setFixedSize(62, 56)
+        self._fs_next_btn.clicked.connect(lambda: self._play_video_relative(1))
+        playback_layout.addWidget(self._fs_next_btn)
+        
+        playback_layout.addStretch(1)
+        center_layout.addWidget(playback_row)
+        
+        main_layout.addWidget(center_container, 1)
+        
+        # === SAĞ: HIZ + FPS + AYARLAR ===
+        right_container = QWidget()
+        right_layout = QHBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        # Ses kontrolü (sağ tarafa taşındı)
+        volume_container = QWidget()
+        volume_layout = QHBoxLayout(volume_container)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        volume_layout.setSpacing(4)
+
+        volume_icon = QLabel("🔊")
+        volume_icon.setStyleSheet("font-size: 16px;")
+        self._fs_volume_slider = QSlider(Qt.Horizontal)
+        self._fs_volume_slider.setObjectName("_fs_volume_slider")
+        self._fs_volume_slider.setRange(0, 100)
+        self._fs_volume_slider.setValue(70)
+        self._fs_volume_slider.setFixedWidth(110)
+        self._fs_volume_slider.valueChanged.connect(self._on_fs_volume_changed)
+        self._fs_volume_label = QLabel("70%")
+        self._fs_volume_label.setFixedWidth(35)
+        self._fs_volume_label.setStyleSheet("font-size: 13px; font-weight: 600; color: rgba(255,255,255,230);")
+
+        volume_layout.addWidget(volume_icon)
+        volume_layout.addWidget(self._fs_volume_slider)
+        volume_layout.addWidget(self._fs_volume_label)
+        right_layout.addWidget(volume_container)
+        
+        # Hız
+        self._fs_speed_btn = QToolButton()
+        self._fs_speed_btn.setText("1.0x")
+        self._fs_speed_btn.setToolTip("Oynatma Hızı")
+        self._fs_speed_btn.setFixedSize(52, 36)
+        self._fs_speed_btn.clicked.connect(self._on_fs_speed_clicked)
+        right_layout.addWidget(self._fs_speed_btn)
+        
+        # FPS
+        self._fs_fps_btn = QToolButton()
+        self._fs_fps_btn.setText("Auto")
+        self._fs_fps_btn.setToolTip("Hedef FPS")
+        self._fs_fps_btn.setFixedSize(52, 36)
+        self._fs_fps_btn.clicked.connect(self._on_fs_fps_clicked)
+        right_layout.addWidget(self._fs_fps_btn)
+        
+        # Ayırıcı
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet("background: rgba(255,255,255,30);")
+        sep.setFixedWidth(1)
+        right_layout.addWidget(sep)
+        
+        # Tam ekran çıkış
+        self._fs_exit_btn = QToolButton()
+        self._fs_exit_btn.setText("⛶")
+        self._fs_exit_btn.setToolTip("Çık (ESC)")
+        self._fs_exit_btn.setFixedSize(40, 36)
+        self._fs_exit_btn.clicked.connect(self._exit_video_fullscreen)
+        right_layout.addWidget(self._fs_exit_btn)
+        
+        # Ayarlar
+        self._fs_settings_btn = QToolButton()
+        self._fs_settings_btn.setObjectName("fsSettingsBtn")
+        self._fs_settings_btn.setText("")
+        self._fs_settings_btn.setToolTip("Ayarlar")
+        self._fs_settings_btn.setFixedSize(48, 40)
+        self._fs_settings_btn.setAutoRaise(True)
+        try:
+            # YouTube benzeri dişli: önce sistem tema ikonu dene
+            icon = QIcon.fromTheme('preferences-system')
+            if icon.isNull():
+                icon = QIcon.fromTheme('settings')
+            if icon.isNull():
+                icon = QIcon.fromTheme('preferences-system-settings')
+            if not icon.isNull():
+                self._fs_settings_btn.setIcon(icon)
+            else:
+                # Fallback: unicode dişli
+                self._fs_settings_btn.setText("⚙")
+        except Exception:
+            try:
+                self._fs_settings_btn.setText("⚙")
+            except Exception:
+                pass
+        try:
+            self._fs_settings_btn.setIconSize(QSize(24, 24))
+        except Exception:
+            pass
+        self._fs_settings_btn.clicked.connect(self._on_fs_settings_clicked)
+        right_layout.addWidget(self._fs_settings_btn)
+        
+        main_layout.addWidget(right_container)
+        
+        # RGB LED animasyon timer'ı başlat
+        self._rgb_animation_offset = 0.0
+        self._rgb_timer = QTimer(self)
+        self._rgb_timer.timeout.connect(self._update_rgb_gradient)
+        self._rgb_timer.start(80)  # Daha yavaş ve yumuşak animasyon
+        
+        # Başlangıçta gizle
+        self._video_fs_controls.hide()
+        
+        # Seek tracking durumu
+        self._fs_seeking = False
+    
+    def _on_fs_play_clicked(self):
+        """Tam ekran play/pause butonu."""
+        if not hasattr(self, 'videoPlayer'):
+            return
+        
+        if self.videoPlayer.state() == QMediaPlayer.PlayingState:
+            self.videoPlayer.pause()
+        else:
+            self.videoPlayer.play()
+    
+    def _on_fs_seek_pressed(self):
+        """Seek slider basıldı."""
+        self._fs_seeking = True
+    
+    def _on_fs_seek_moved(self, value):
+        """Seek slider hareket ediyor."""
+        if hasattr(self, '_fs_time_label') and hasattr(self, 'videoPlayer'):
+            duration = self.videoPlayer.duration()
+            time_str = f"{self._format_time(value)} / {self._format_time(duration)}"
+            self._fs_time_label.setText(time_str)
+    
+    def _on_fs_seek_released(self):
+        """Seek slider bırakıldı."""
+        if hasattr(self, 'videoPlayer') and hasattr(self, '_fs_seek_slider'):
+            self.videoPlayer.setPosition(self._fs_seek_slider.value())
+        self._fs_seeking = False
+    
+    def _seek_relative(self, ms):
+        """Göreceli seek (+ veya - ms)."""
+        if not hasattr(self, 'videoPlayer'):
+            return
+        current = self.videoPlayer.position()
+        duration = self.videoPlayer.duration()
+        new_pos = max(0, min(duration, current + ms))
+        self.videoPlayer.setPosition(new_pos)
+
+    def _get_video_sibling_files(self, current_path: str) -> list:
+        """Aynı klasördeki desteklenen videoları (sıralı) döndür."""
+        try:
+            if not current_path or not os.path.isfile(current_path):
+                return []
+            folder = os.path.dirname(current_path)
+            if not folder or not os.path.isdir(folder):
+                return []
+            exts = self._supported_video_exts() if hasattr(self, '_supported_video_exts') else set()
+            files = []
+            for name in os.listdir(folder):
+                path = os.path.join(folder, name)
+                if not os.path.isfile(path):
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if exts and ext not in exts:
+                    continue
+                files.append(path)
+            files.sort(key=lambda p: os.path.basename(p).lower())
+            return files
+        except Exception:
+            return []
+
+    def _play_video_relative(self, delta: int):
+        """Mevcut videoya göre önceki/sonraki videoyu aç (aynı klasör içinde)."""
+        try:
+            delta = int(delta)
+        except Exception:
+            delta = 0
+        if delta == 0:
+            return
+
+        current_path = getattr(self, '_video_last_source_text', '') or ''
+        siblings = self._get_video_sibling_files(current_path)
+        if not siblings:
+            return
+        try:
+            idx = siblings.index(current_path)
+        except ValueError:
+            idx = 0
+        new_idx = (idx + delta) % len(siblings)
+        new_path = siblings[new_idx]
+        try:
+            self._play_video_file(new_path)
+        except Exception:
+            pass
+    
+    def _update_rgb_gradient(self):
+        """RGB LED animasyon güncelleme - progress bar için."""
+        if not hasattr(self, '_fs_seek_slider'):
+            return
+        
+        # Offset'i artır (0.0 → 1.0 → 0.0 döngüsü) - yavaşlatıldı
+        self._rgb_animation_offset += 0.008
+        if self._rgb_animation_offset > 1.0:
+            self._rgb_animation_offset = 0.0
+        
+        # RGB LED renkler: Mavi → Mor → Pembe → Kırmızı → Turuncu → Sarı → Yeşil → Cyan → Mavi
+        colors = [
+            (64, 156, 255),    # Mavi
+            (138, 43, 226),    # Mor
+            (255, 105, 180),   # Pembe  
+            (255, 69, 0),      # Kırmızı-Turuncu
+            (255, 165, 0),     # Turuncu
+            (255, 215, 0),     # Sarı
+            (50, 205, 50),     # Yeşil
+            (64, 224, 208),    # Cyan
+        ]
+        
+        # Offset'e göre renk interpolasyonu
+        num_colors = len(colors)
+        offset = self._rgb_animation_offset * num_colors
+        idx1 = int(offset) % num_colors
+        idx2 = (idx1 + 1) % num_colors
+        frac = offset - int(offset)
+        
+        # İki renk arasında interpolasyon
+        c1, c2 = colors[idx1], colors[idx2]
+        r = int(c1[0] + (c2[0] - c1[0]) * frac)
+        g = int(c1[1] + (c2[1] - c1[1]) * frac)
+        b = int(c1[2] + (c2[2] - c1[2]) * frac)
+        
+        # İkinci renk (gradient için)
+        idx3 = (idx2 + 1) % num_colors
+        c3 = colors[idx3]
+        r2 = int(c2[0] + (c3[0] - c2[0]) * frac)
+        g2 = int(c2[1] + (c3[1] - c2[1]) * frac)
+        b2 = int(c2[2] + (c3[2] - c2[2]) * frac)
+        
+        # Animasyonlu gradient CSS oluştur (seek + volume)
+        rgb_style = f"""
+        QWidget#videoFsControls QSlider#_fs_seek_slider::sub-page:horizontal {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 rgba({r}, {g}, {b}, 220),
+                stop:0.5 rgba({r2}, {g2}, {b2}, 240),
+                stop:1 rgba({r}, {g}, {b}, 220));
+            border: none;
+        }}
+        QWidget#videoFsControls QSlider#_fs_volume_slider::sub-page:horizontal {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 rgba({r}, {g}, {b}, 210),
+                stop:0.5 rgba({r2}, {g2}, {b2}, 230),
+                stop:1 rgba({r}, {g}, {b}, 210));
+            border: none;
+        }}
+        """
+        
+        # Tema stilini al ve RGB stilini ekle
+        base_style = self._get_fs_controls_theme_style()
+        self._video_fs_controls.setStyleSheet(base_style + rgb_style)
+    
+    def _update_fs_controls_state(self):
+        """Tam ekran kontrollerini video durumuna göre güncelle."""
+        if not hasattr(self, '_video_fs_controls') or not self._video_fs_controls:
+            return
+        if not hasattr(self, 'videoPlayer'):
+            return
+        
+        # Play/Pause butonu
+        if hasattr(self, '_fs_play_btn'):
+            is_playing = self.videoPlayer.state() == QMediaPlayer.PlayingState
+            try:
+                icon_name = "media-playback-pause.png" if is_playing else "media-playback-start.png"
+                self._fs_play_btn.setIcon(QIcon(os.path.join("icons", icon_name)))
+                self._fs_play_btn.setText("")
+            except Exception:
+                self._fs_play_btn.setText("⏸" if is_playing else "▶")
+            self._fs_play_btn.setToolTip("Duraklat" if is_playing else "Oynat")
+        
+        # Progress ve zaman
+        if not getattr(self, '_fs_seeking', False):
+            position = self.videoPlayer.position()
+            duration = self.videoPlayer.duration()
+            
+            if hasattr(self, '_fs_seek_slider'):
+                self._fs_seek_slider.blockSignals(True)
+                self._fs_seek_slider.setMaximum(duration if duration > 0 else 0)
+                self._fs_seek_slider.setValue(position)
+                self._fs_seek_slider.blockSignals(False)
+            
+            # Tek label'da her iki zaman
+            if hasattr(self, '_fs_time_label'):
+                time_str = f"{self._format_time(position)} / {self._format_time(duration)}"
+                self._fs_time_label.setText(time_str)
+        
+        # Ses
+        if hasattr(self, '_fs_volume_slider') and hasattr(self, '_fs_volume_label'):
+            vol = self.videoPlayer.volume()
+            self._fs_volume_slider.blockSignals(True)
+            self._fs_volume_slider.setValue(vol)
+            self._fs_volume_slider.blockSignals(False)
+            self._fs_volume_label.setText(f"{vol}%")
+        
+        # Hız
+        if hasattr(self, '_fs_speed_btn'):
+            rate = getattr(self, '_current_playback_rate', 1.0)
+            self._fs_speed_btn.setText(f"{rate:.2f}x")
+        
+        # FPS
+        if hasattr(self, '_fs_fps_btn'):
+            fps = getattr(self, '_video_target_fps', 0)
+            self._fs_fps_btn.setText("Auto" if fps == 0 else str(fps))
+    
+    def _format_time(self, ms):
+        """Milisaniyeyi MM:SS formatına çevir."""
+        if ms < 0:
+            ms = 0
+        total_seconds = ms // 1000
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        return f"{minutes:02d}:{seconds:02d}"
+    
+    def _on_fs_volume_changed(self, value):
+        """Tam ekran ses slider değişikliği."""
+        if hasattr(self, 'videoPlayer'):
+            self.videoPlayer.setVolume(value)
+            self.videoPlayer.setMuted(False)
+        if hasattr(self, '_fs_volume_label'):
+            self._fs_volume_label.setText(f"{value}%")
+    
+    def _on_fs_speed_clicked(self):
+        """Tam ekran hız butonu - döngüsel değiştir."""
+        rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+        current = getattr(self, '_current_playback_rate', 1.0)
+        next_rate = rates[0]
+        for i, r in enumerate(rates):
+            if abs(r - current) < 0.01:
+                next_rate = rates[(i + 1) % len(rates)]
+                break
+        self._set_playback_rate(next_rate)
+        if hasattr(self, '_fs_speed_btn'):
+            self._fs_speed_btn.setText(f"{next_rate:.2f}x")
+    
+    def _on_fs_fps_clicked(self):
+        """Tam ekran FPS butonu - döngüsel değiştir."""
+        fps_options = [0, 24, 30, 60]  # 0 = Auto
+        current = getattr(self, '_video_target_fps', 0)
+        next_fps = fps_options[0]
+        for i, f in enumerate(fps_options):
+            if f == current:
+                next_fps = fps_options[(i + 1) % len(fps_options)]
+                break
+        self._set_video_target_fps(next_fps)
+        if hasattr(self, '_fs_fps_btn'):
+            self._fs_fps_btn.setText("Auto" if next_fps == 0 else str(next_fps))
+    
+    def _on_fs_settings_clicked(self):
+        """Tam ekran ayarlar butonu - video ayarlar panelini aç/kapat."""
+        try:
+            if not hasattr(self, '_video_settings_panel') or self._video_settings_panel is None:
+                self._create_video_settings_ui()
+        except Exception:
+            pass
+        try:
+            self._toggle_video_settings_panel()
+        except Exception:
+            pass
+    
+    def _reset_fs_speed(self):
+        """Hızı sıfırla."""
+        self._set_playback_rate(1.0)
+        if hasattr(self, '_fs_speed_btn'):
+            self._fs_speed_btn.setText("1.00x")
+    
+    def _init_fs_bar_auto_hide(self):
+        """Tam ekran bar otomatik gizleme sistemini başlat."""
+        # Auto-hide timer (3 saniye)
+        if not hasattr(self, '_fs_bar_hide_timer'):
+            self._fs_bar_hide_timer = QTimer(self)
+            self._fs_bar_hide_timer.setSingleShot(True)
+            self._fs_bar_hide_timer.timeout.connect(self._on_fs_bar_hide_timeout)
+        
+        # Animasyon durumu
+        self._fs_bars_visible = True
+        self._fs_bar_animating = False
+    
+    def _start_fs_bar_hide_timer(self):
+        """Bar gizleme zamanlayıcısını başlat/sıfırla."""
         if not getattr(self, '_in_video_fullscreen', False):
             return
-        if not (hasattr(self, 'video_hud') and hasattr(self, 'video_hud_volume')):
+        # Video ayar paneli açıkken alt bar asla kaybolmasın
+        try:
+            if hasattr(self, '_video_settings_panel') and self._video_settings_panel and self._video_settings_panel.isVisible():
+                return
+        except Exception:
+            pass
+        if hasattr(self, '_fs_bar_hide_timer'):
+            self._fs_bar_hide_timer.stop()
+            self._fs_bar_hide_timer.start(3000)  # 3 saniye
+    
+    def _stop_fs_bar_hide_timer(self):
+        """Bar gizleme zamanlayıcısını durdur."""
+        if hasattr(self, '_fs_bar_hide_timer'):
+            self._fs_bar_hide_timer.stop()
+    
+    def _is_mouse_over_fs_bars(self):
+        """Fare bar veya kontroller üzerinde mi kontrol et."""
+        cursor_pos = QCursor.pos()
+        
+        # Tek kontrol barı kontrolü
+        if hasattr(self, '_video_fs_controls') and self._video_fs_controls and self._video_fs_controls.isVisible():
+            fs_global = self._video_fs_controls.mapToGlobal(QPoint(0, 0))
+            fs_rect = QRect(fs_global, self._video_fs_controls.size())
+            if fs_rect.contains(cursor_pos):
+                return True
+        
+        return False
+    
+    def _on_fs_bar_hide_timeout(self):
+        """3 saniye sonra bar gizleme kontrolü."""
+        if not getattr(self, '_in_video_fullscreen', False):
             return
 
-        primary, _, bg = self._get_current_theme_colors()
-        # Slider'ların aura rengi tema ile senkron kalsın
+        # Video ayar paneli açıkken alt bar asla kaybolmasın
         try:
-            if hasattr(self, 'video_seek_slider') and hasattr(self.video_seek_slider, 'set_aura_base_color'):
-                self.video_seek_slider.set_aura_base_color(primary)
-            if hasattr(self, 'video_hud_progress') and hasattr(self.video_hud_progress, 'set_aura_base_color'):
-                self.video_hud_progress.set_aura_base_color(primary)
+            if hasattr(self, '_video_settings_panel') and self._video_settings_panel and self._video_settings_panel.isVisible():
+                return
         except Exception:
             pass
-
-        base_h, base_s, base_v, _ = primary.getHsv()
-        if base_h < 0:
-            base_h = 190
-        if base_s < 0:
-            base_s = 180
-        if base_v < 0:
-            base_v = 255
-
-        try:
-            self._video_hud_aura_phase = (self._video_hud_aura_phase + (3.0 * float(getattr(self, '_video_aura_speed', 1.0)))) % 360.0
-        except Exception:
-            self._video_hud_aura_phase = 0.0
-
-        hue = int((base_h + self._video_hud_aura_phase) % 360)
-        sat = int(max(110, min(255, base_s)))
-        val = int(max(200, min(255, base_v)))
-        c1 = QColor.fromHsv(hue, sat, val)
-        c2 = QColor.fromHsv((hue + 40) % 360, sat, val)
-
-        bg_val = bg.value()
-        border_alpha = 210 if bg_val < 140 else 160
-        groove_alpha = 130 if bg_val < 140 else 90
-        handle_alpha = 240 if bg_val < 140 else 200
-
-        # HUD (altbar) - tema arka planı + aura üst çizgi
-        try:
-            self.video_hud.setStyleSheet(
-                f"#videoHud {{ background-color: rgba({bg.red()},{bg.green()},{bg.blue()},210); "
-                f"border-top: 1px solid rgba({c1.red()},{c1.green()},{c1.blue()},{border_alpha}); }}"
-            )
-        except Exception:
-            pass
-
-        # Volume slider - tema arka planı + aura sub-page
-        try:
-            groove_bg = QColor(bg)
-            groove_bg = self._mix_qcolors(groove_bg, QColor(0, 0, 0), 0.25 if bg_val > 140 else 0.10)
-            handle_border = self._mix_qcolors(bg, c1, 0.55)
-
-            self.video_hud_volume.setStyleSheet(
-                "QSlider::groove:horizontal {"
-                "  height: 8px;"
-                f"  background: rgba({groove_bg.red()},{groove_bg.green()},{groove_bg.blue()},{groove_alpha});"
-                "  border-radius: 4px;"
-                "}"
-                "QSlider::sub-page:horizontal {"
-                "  border-radius: 4px;"
-                "  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, "
-                f"stop:0 rgba({c1.red()},{c1.green()},{c1.blue()},{handle_alpha}), "
-                f"stop:1 rgba({c2.red()},{c2.green()},{c2.blue()},{handle_alpha}));"
-                "}"
-                "QSlider::handle:horizontal {"
-                "  width: 14px;"
-                "  margin: -4px 0;"
-                "  border-radius: 7px;"
-                f"  background: rgba({c2.red()},{c2.green()},{c2.blue()},{handle_alpha});"
-                f"  border: 1px solid rgba({handle_border.red()},{handle_border.green()},{handle_border.blue()},200);"
-                "}"
-            )
-        except Exception:
-            pass
+        
+        # Fare bar üzerindeyse gizleme, timer'ı yeniden başlat
+        if self._is_mouse_over_fs_bars():
+            self._start_fs_bar_hide_timer()
+            return
+        
+        # Akıcı animasyonla barları gizle
+        self._animate_fs_bars_hide()
+    
+    def _animate_fs_bars_hide(self):
+        """Tek barı aşağı doğru akıcı animasyonla gizle."""
+        if getattr(self, '_fs_bar_animating', False):
+            return
+        if not getattr(self, '_fs_bars_visible', True):
+            return
+        
+        self._fs_bar_animating = True
+        self._fs_bars_visible = False
+        
+        # Tek kontrol barı animasyonu
+        if hasattr(self, '_video_fs_controls') and self._video_fs_controls and self._video_fs_controls.isVisible():
+            self._fs_controls_anim = QPropertyAnimation(self._video_fs_controls, b"pos")
+            self._fs_controls_anim.setDuration(300)
+            self._fs_controls_anim.setEasingCurve(QEasingCurve.OutCubic)
+            start_pos = self._video_fs_controls.pos()
+            end_pos = QPoint(start_pos.x(), self.height())  # Ekran dışına
+            self._fs_controls_anim.setStartValue(start_pos)
+            self._fs_controls_anim.setEndValue(end_pos)
+            self._fs_controls_anim.finished.connect(self._on_fs_bar_hide_finished)
+            self._fs_controls_anim.start()
+        
+        # İmleci gizle
+        self.setCursor(Qt.BlankCursor)
+        if hasattr(self, 'video_output_widget') and self.video_output_widget:
+            self.video_output_widget.setCursor(Qt.BlankCursor)
+    
+    def _on_fs_bar_hide_finished(self):
+        """Bar gizleme animasyonu tamamlandı."""
+        self._fs_bar_animating = False
+    
+    def _animate_fs_bars_show(self):
+        """Tek barı aşağıdan yukarı akıcı animasyonla göster."""
+        if getattr(self, '_fs_bar_animating', False):
+            return
+        if getattr(self, '_fs_bars_visible', True):
+            return
+        
+        self._fs_bar_animating = True
+        self._fs_bars_visible = True
+        
+        # İmleci göster
+        self.setCursor(Qt.ArrowCursor)
+        if hasattr(self, 'video_output_widget') and self.video_output_widget:
+            self.video_output_widget.setCursor(Qt.ArrowCursor)
+        
+        # Tek kontrol barı animasyonu - ekranın altına yakın konumlandır
+        if hasattr(self, '_video_fs_controls') and self._video_fs_controls:
+            target_y = self.height() - self._video_fs_controls.height()
+            
+            self._fs_controls_anim = QPropertyAnimation(self._video_fs_controls, b"pos")
+            self._fs_controls_anim.setDuration(250)
+            self._fs_controls_anim.setEasingCurve(QEasingCurve.OutCubic)
+            start_pos = self._video_fs_controls.pos()
+            end_pos = QPoint(0, target_y)
+            self._fs_controls_anim.setStartValue(start_pos)
+            self._fs_controls_anim.setEndValue(end_pos)
+            self._fs_controls_anim.finished.connect(self._on_fs_bar_show_finished)
+            self._fs_controls_anim.start()
+    
+    def _on_fs_bar_show_finished(self):
+        """Bar gösterme animasyonu tamamlandı."""
+        self._fs_bar_animating = False
+        # Timer'ı yeniden başlat
+        self._start_fs_bar_hide_timer()
+    
+    def _on_fs_mouse_move(self):
+        """Tam ekranda fare hareket etti - barları göster ve timer'ı sıfırla."""
+        if not getattr(self, '_in_video_fullscreen', False):
+            return
+        
+        # Barlar gizliyse göster
+        if not getattr(self, '_fs_bars_visible', True):
+            self._animate_fs_bars_show()
+        else:
+            # Timer'ı sıfırla
+            self._start_fs_bar_hide_timer()
+            # İmleci göster
+            self.setCursor(Qt.ArrowCursor)
+            if hasattr(self, 'video_output_widget') and self.video_output_widget:
+                self.video_output_widget.setCursor(Qt.ArrowCursor)
+    
+    def _show_video_fs_controls(self):
+        """Tam ekran kontrollerini göster ve konumlandır."""
+        if not hasattr(self, '_video_fs_controls') or not self._video_fs_controls:
+            self._create_video_fullscreen_controls()
+        
+        # Tema uyumlu stil uygula
+        if hasattr(self, '_video_fs_controls') and self._video_fs_controls:
+            self._video_fs_controls.setStyleSheet(self._get_fs_controls_theme_style())
+        
+        # Tüm kontrolleri güncelle
+        self._update_fs_controls_state()
+        
+        # Konumlandır (ekranın alt kısmında)
+        self._video_fs_controls.setParent(self)
+        self._video_fs_controls.setFixedWidth(self.width())
+        
+        # Ekran altına yakın konumlandır
+        y_pos = self.height() - self._video_fs_controls.height()
+        self._video_fs_controls.move(0, y_pos)
+        self._video_fs_controls.raise_()
+        self._video_fs_controls.show()
+        
+        # Auto-hide sistemini başlat
+        self._init_fs_bar_auto_hide()
+        self._fs_bars_visible = True
+        self._start_fs_bar_hide_timer()
+    
+    def _hide_video_fs_controls(self):
+        """Tam ekran kontrollerini gizle."""
+        # Timer'ı durdur
+        self._stop_fs_bar_hide_timer()
+        
+        if hasattr(self, '_video_fs_controls') and self._video_fs_controls:
+            self._video_fs_controls.hide()
 
     def _toggle_video_fullscreen(self):
         """Yerel video tam ekran toggle (HUD sadece tam ekranda görünür)."""
@@ -9782,12 +13987,12 @@ class AngollaPlayer(QMainWindow):
     def _enter_video_fullscreen(self):
         if getattr(self, '_in_video_fullscreen', False):
             return
-        # Sadece video sayfasında anlamlı
+        # Sadece video sayfasında anlamlı (otomatik sekme/panel değiştirme yok)
         try:
-            if hasattr(self, 'mainContentStack'):
-                self.mainContentStack.setCurrentIndex(1)
+            if hasattr(self, 'mainContentStack') and self.mainContentStack.currentIndex() != 1:
+                return
         except Exception:
-            pass
+            return
 
         self._video_fullscreen_state = {
             'was_maximized': self.isMaximized(),
@@ -9797,19 +14002,68 @@ class AngollaPlayer(QMainWindow):
             'split_sizes': self.main_splitter.sizes() if hasattr(self, 'main_splitter') else [],
         }
         self._in_video_fullscreen = True
+        
+        # Parlaklığı normal seviyeye sıfırla (her fullscreen girişinde)
+        self._video_brightness = 1.0
+        if hasattr(self, '_brightness_overlay') and self._brightness_overlay:
+            self._brightness_overlay.hide()
+        if hasattr(self, '_brighten_overlay') and self._brighten_overlay:
+            self._brighten_overlay.hide()
 
         try:
             if hasattr(self, 'side_panel'):
                 self.side_panel.hide()
+            
+            # TAMAMEN ANA BAR'I GİZLE - Tam ekranda kullanılmayacak
             if hasattr(self, 'bottom_widget'):
+                # Orijinal durum kaydet
+                if not hasattr(self, '_bottom_widget_original_visible'):
+                    self._bottom_widget_original_visible = self.bottom_widget.isVisible()
+                if not hasattr(self, '_bottom_widget_original_style'):
+                    self._bottom_widget_original_style = self.bottom_widget.styleSheet()
+                
+                # TAMAMEN GİZLE
                 self.bottom_widget.hide()
+            
+            # Hide ALL top bars (menu, status, toolbars)
+            if self.menuBar(): 
+                self.menuBar().hide()
+            if self.statusBar(): 
+                self.statusBar().hide()
+            if hasattr(self, 'fileLabel'): 
+                self.fileLabel.hide()
+            
+            # Force layout update to remove black gaps
+            if hasattr(self, 'centralWidget') and self.centralWidget():
+                self.centralWidget().layout().setContentsMargins(0, 0, 0, 0)
+                self.centralWidget().layout().setSpacing(0)
+                self.centralWidget().layout().activate()
+            
+            # Ensure all parent containers have zero margins
             if hasattr(self, 'main_splitter'):
-                w = self.main_splitter.size().width()
-                self.main_splitter.setSizes([0, w])
+                self.main_splitter.setHandleWidth(0)
+                self.main_splitter.setContentsMargins(0, 0, 0, 0)
+                # Force the second widget (video) to take all space
+                self.main_splitter.setSizes([0, self.width()])
+            if hasattr(self, 'mainContentStack'):
+                self.mainContentStack.setContentsMargins(0, 0, 0, 0)
+                if self.mainContentStack.layout():
+                    self.mainContentStack.layout().setContentsMargins(0, 0, 0, 0)
+            if hasattr(self, 'video_container'):
+                self.video_container.setContentsMargins(0, 0, 0, 0)
+                if self.video_container.layout():
+                    self.video_container.layout().setContentsMargins(0, 0, 0, 0)
+            
+            if hasattr(self, 'video_overlay_host') and self.video_overlay_host.layout():
+                self.video_overlay_host.layout().setContentsMargins(0, 0, 0, 0)
+            
+            # Hide all toolbars explicitly
+            for toolbar in self.findChildren(QToolBar):
+                toolbar.hide()
         except Exception:
             pass
 
-        # HUD görünür + normal slider gizli
+        # Normal slider gizli (tam ekranda kullanılmıyor)
         try:
             if hasattr(self, 'video_seek_row'):
                 self.video_seek_row.setVisible(False)
@@ -9817,78 +14071,217 @@ class AngollaPlayer(QMainWindow):
                 self.video_controls_row.setVisible(False)
             if hasattr(self, 'video_seek_slider'):
                 self.video_seek_slider.setVisible(False)
-            if hasattr(self, 'video_hud'):
-                self.video_hud.setVisible(True)
-            if hasattr(self, 'video_fs_button'):
+            
+            if hasattr(self, 'video_output_widget'):
+                self.video_output_widget._update_video_transform()
+
+            # Tam ekranda overlay ikonlarını kullanma (tek bar prensibi)
+            if hasattr(self, 'video_fs_button') and self.video_fs_button:
                 self.video_fs_button.setVisible(False)
-            if hasattr(self, '_video_hud_aura_timer') and self._video_hud_aura_timer:
-                self._video_hud_aura_timer.start()
-                self._update_video_hud_aura()
+            try:
+                if hasattr(self, 'video_settings_button') and self.video_settings_button:
+                    self.video_settings_button.setVisible(False)
+            except Exception:
+                pass
+
             if hasattr(self, '_video_fps_timer'):
                 self._video_fps_frames = 0
                 self._video_fps_timer.start()
+            
+            if hasattr(self, 'video_output_widget'):
+                self.video_output_widget.installEventFilter(self)
+                self.video_output_widget.setMouseTracking(True)
+                if self.video_output_widget.viewport():
+                     self.video_output_widget.viewport().installEventFilter(self)
+                     self.video_output_widget.viewport().setMouseTracking(True)
+            
             self.video_output_widget.setFocus(Qt.OtherFocusReason)
             self._update_video_fullscreen_icons()
+            
+            # Tam ekran ek kontrollerini göster
+            self._show_video_fs_controls()
         except Exception:
             pass
 
         try:
             self.showFullScreen()
+            # Ensure video output widget fills the entire screen by updating layout
+            if hasattr(self, 'video_output_widget'):
+                self.video_output_widget.updateGeometry()
+                if hasattr(self.video_output_widget, '_update_video_transform'):
+                    self.video_output_widget._update_video_transform()
+            
+            # Force layout and paint update
+            if self.centralWidget() and self.centralWidget().layout():
+                self.centralWidget().layout().activate()
+            self.update()
+            
+            # Start with cursor visible
+            self.setCursor(Qt.ArrowCursor)
+            
+            # Tam ekran kontrollerini yeniden konumlandır (showFullScreen sonrası)
+            QTimer.singleShot(100, self._reposition_fs_controls)
         except Exception:
             self.showMaximized()
+    
+    def _reposition_fs_controls(self):
+        """Tam ekran kontrollerini yeniden konumlandır."""
+        if not getattr(self, '_in_video_fullscreen', False):
+            return
+        if hasattr(self, '_video_fs_controls') and self._video_fs_controls:
+            self._video_fs_controls.setFixedWidth(self.width())
+            y_pos = self.height() - self._video_fs_controls.height()
+            self._video_fs_controls.move(0, y_pos)
+            self._video_fs_controls.raise_()
+
+        try:
+            self._reposition_video_settings_ui()
+        except Exception:
+            pass
 
     def _exit_video_fullscreen(self):
         if not getattr(self, '_in_video_fullscreen', False):
             return
         self._in_video_fullscreen = False
+        
+        # Tam ekran ek kontrollerini gizle
+        self._hide_video_fs_controls()
 
-        # HUD gizle + normal slider geri
+        # Video ayarlar panelini kapat
         try:
-            if hasattr(self, '_video_fps_timer'):
-                self._video_fps_timer.stop()
-            if hasattr(self, '_video_hud_aura_timer') and self._video_hud_aura_timer:
-                self._video_hud_aura_timer.stop()
-            if hasattr(self, 'video_hud'):
-                self.video_hud.setVisible(False)
-            if hasattr(self, 'video_seek_row'):
-                self.video_seek_row.setVisible(True)
-            if hasattr(self, 'video_controls_row'):
-                self.video_controls_row.setVisible(True)
-            if hasattr(self, 'video_seek_slider'):
-                self.video_seek_slider.setVisible(True)
-            if hasattr(self, 'video_fs_button'):
-                self.video_fs_button.setVisible(True)
-            self._update_video_fullscreen_icons()
+            self._hide_video_settings_panel(animate=False)
         except Exception:
             pass
+        
+        # Bar animasyon durumunu sıfırla
+        self._fs_bars_visible = True
+        self._fs_bar_animating = False
+        
+        # Ana barı geri göster
+        if hasattr(self, 'bottom_widget'):
+            if hasattr(self, '_bottom_widget_original_visible'):
+                self.bottom_widget.setVisible(self._bottom_widget_original_visible)
+            else:
+                self.bottom_widget.show()
+            if hasattr(self, '_bottom_widget_original_style'):
+                self.bottom_widget.setStyleSheet(self._bottom_widget_original_style)
+        
+        # Cursor'ı normal yap
+        self.setCursor(Qt.ArrowCursor)
+        if hasattr(self, 'video_output_widget') and self.video_output_widget:
+            self.video_output_widget.setCursor(Qt.ArrowCursor)
+            if self.video_output_widget.viewport():
+                self.video_output_widget.viewport().setCursor(Qt.ArrowCursor)
 
         state = getattr(self, '_video_fullscreen_state', {})
-        try:
-            # Spec: normal moda dönünce ana bar/sayaç/butonlar geri gelsin
-            if hasattr(self, 'side_panel'):
-                self.side_panel.show()
-            if hasattr(self, 'bottom_widget'):
-                self.bottom_widget.show()
-            if hasattr(self, 'main_splitter'):
-                sizes = state.get('split_sizes', [])
-                if sizes:
-                    self.main_splitter.setSizes(sizes)
-                else:
-                    self.main_splitter.setSizes([250, 950])
-        except Exception:
-            pass
-
+        
+        # ÖNCE pencereyi normal moda al
         try:
             if state.get('was_maximized'):
                 self.showMaximized()
             else:
-                self.setGeometry(state.get('geometry', self.geometry()))
                 self.showNormal()
+                geom = state.get('geometry')
+                if geom and not geom.isEmpty():
+                    self.setGeometry(geom)
         except Exception:
+            self.showNormal()
+
+        # UI RESTORE - Tüm elemanları geri getir
+        try:
+            # Show top bars
+            if self.menuBar(): 
+                self.menuBar().setVisible(True)
+            if hasattr(self, 'fileLabel'): 
+                self.fileLabel.setVisible(True)
+            if self.statusBar(): 
+                self.statusBar().show()
+            
+            # Show all toolbars
+            for toolbar in self.findChildren(QToolBar):
+                 toolbar.setVisible(True)
+            
+            # KRITIK: Sol panel ve splitter'ı düzgün geri yükle
+            if hasattr(self, 'side_panel'):
+                self.side_panel.setVisible(True)
+                self.side_panel.show()
+            
+            # bottom_widget orijinal stile geri dön
+            if hasattr(self, 'bottom_widget'):
+                if hasattr(self, '_bottom_widget_original_style'):
+                    self.bottom_widget.setStyleSheet(self._bottom_widget_original_style)
+                else:
+                    # Varsayılan stil
+                    self.bottom_widget.setStyleSheet("""
+                        QWidget#bottomWidget {
+                            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(42, 42, 42, 240),
+                                stop:1 rgba(20, 20, 20, 250));
+                            border-top: 1px solid rgba(80, 80, 80, 120);
+                            border-radius: 0px;
+                        }
+                    """)
+            
+            if hasattr(self, 'main_splitter'):
+                self.main_splitter.setHandleWidth(4)
+                # Splitter boyutlarını geri yükle
+                sizes = state.get('split_sizes', [250, 950])
+                if not sizes or len(sizes) < 2:
+                    sizes = [250, 950]
+                # Sol panel en az 200px olsun
+                if sizes[0] < 200:
+                    sizes[0] = 250
+                self.main_splitter.setSizes(sizes)
+            
+            # Video sekmesinde kal
+            if hasattr(self, 'mainContentStack'):
+                self.mainContentStack.setCurrentIndex(1)
+            
+            # Sidebar'da Video Arşivi seçili olsun
+            if hasattr(self, 'sidebarNav'):
+                self.sidebarNav.setCurrentRow(2)
+            
+            # Fullscreen butonu görünür olsun
+            if hasattr(self, 'video_fs_button'):
+                self.video_fs_button.setVisible(True)
+
+            # Video ayarlar butonu görünür olsun
             try:
-                self.showNormal()
+                if hasattr(self, 'video_settings_button') and self.video_settings_button:
+                    self.video_settings_button.setVisible(True)
             except Exception:
                 pass
+
+        except Exception:
+            pass
+            
+        # Cleanup timers and event filters
+        try:
+            if hasattr(self, '_video_fps_timer'):
+                self._video_fps_timer.stop()
+            if hasattr(self, 'video_output_widget'):
+                self.video_output_widget.removeEventFilter(self)
+            
+            self._update_video_fullscreen_icons()
+        except Exception:
+            pass
+
+        # Force UI refresh
+        try:
+            self.activateWindow()
+            QApplication.processEvents()
+            if self.centralWidget():
+                self.centralWidget().updateGeometry()
+                self.centralWidget().update()
+            if hasattr(self, 'main_splitter'):
+                self.main_splitter.update()
+        except Exception:
+            pass
+
+        try:
+            self._reposition_video_settings_ui()
+        except Exception:
+            pass
             
     def _set_video_position(self, position):
         """Slider hareket edince videoyu o konuma al"""
@@ -9933,6 +14326,61 @@ class AngollaPlayer(QMainWindow):
             print(f"🎬 Video Metadata Rotation Found: {rotation}° (Applied) -> Auto-fix.")
             self.video_output_widget.rotate_video(rotation, absolute=True)
             self.statusBar().showMessage(f"Video Otomatik Düzeltildi ({rotation}°)", 3000)
+
+    def _auto_resize_window_to_video(self):
+        """Video metadatasındaki çözünürlüğe göre pencere boyutunu ayarla."""
+        # Sadece normal modda ve video yüklenince çalışsın
+        if self.isFullScreen() or self.isMaximized() or getattr(self, '_in_miniplayer_mode', False):
+            return
+
+        # Kullanıcı ayarı kontrol edilebilir (Şimdilik varsayılan aktif)
+        try:
+            resolution = self.videoPlayer.metaData("Resolution")
+            if not resolution or not isinstance(resolution, QSize):
+                return
+                
+            vid_w = resolution.width()
+            vid_h = resolution.height()
+            
+            if vid_w <= 0 or vid_h <= 0:
+                return
+
+            # Ekran boyutunu al
+            screen = QApplication.primaryScreen().availableGeometry()
+            screen_w = screen.width()
+            screen_h = screen.height()
+            
+            # Hedef boyut (Video + UI payı)
+            # UI genişliği: SidePanel (250)
+            # UI yüksekliği: TitleBar + BottomBar (~120)
+            
+            target_w = vid_w + 250
+            target_h = vid_h + 120
+            
+            # Ekrana sığmıyorsa orantılı küçült
+            ratio = vid_w / vid_h
+            
+            if target_w > screen_w * 0.9:
+                target_w = int(screen_w * 0.9)
+                new_vid_w = target_w - 250
+                target_h = int(new_vid_w / ratio) + 120
+                
+            if target_h > screen_h * 0.9:
+                target_h = int(screen_h * 0.9)
+                new_vid_h = target_h - 120
+                target_w = int(new_vid_h * ratio) + 250
+                
+            # Minimum boyutları koru
+            target_w = max(target_w, 800)
+            target_h = max(target_h, 600)
+            
+            self.resize(target_w, target_h)
+            # Ortala
+            rect = self.frameGeometry()
+            rect.moveCenter(screen.center())
+            self.move(rect.topLeft())
+        except Exception as e:
+            print(f"Auto-resize error: {e}")
 
 
     # ==========================================================
@@ -10114,20 +14562,21 @@ class AngollaPlayer(QMainWindow):
         # Standart QFileSystemModel setNameFilters bazen dizinleri de gizleyebiliyor veya hantal kalabiliyor.
         # Basitce QFileSystemModel kullanalim ve nameFilterDisables(False) yapalim.
         self.video_model = QFileSystemModel()
-        self.video_model.setRootPath(QDir.homePath())
-        self.video_model.setFilter(QDir.AllDirs | QDir.NoDotAndDotDot | QDir.Files)
+        # Video Klasörü: sistemin varsayılan Videos/Videolar dizini (yoksa oluştur)
+        vid_path = self._get_default_video_folder()
         try:
-            self.video_model.setNameFilters(self._supported_video_globs())
+            os.makedirs(vid_path, exist_ok=True)
         except Exception:
-            self.video_model.setNameFilters([
-                "*.mp4", "*.m4v", "*.mkv", "*.webm", "*.avi", "*.mov", "*.flv", "*.wmv",
-                "*.mpg", "*.mpeg", "*.ts", "*.m2ts", "*.mts", "*.3gp", "*.3g2", "*.ogv",
-            ])
-        self.video_model.setNameFilterDisables(False) # Uymayanlari gizle
+            pass
+        self.video_model.setRootPath(vid_path)
+        self.video_model.setFilter(QDir.AllDirs | QDir.NoDotAndDotDot | QDir.Files)
+        # Kesin filtre: klasörler + yalnızca video uzantılı dosyalar
+        self.video_proxy = self._VideoOnlyProxyModel(self._supported_video_exts(), self)
+        self.video_proxy.setSourceModel(self.video_model)
         
         # 2. Tree View
         self.video_tree_widget = QTreeView()
-        self.video_tree_widget.setModel(self.video_model)
+        self.video_tree_widget.setModel(self.video_proxy)
         self.video_tree_widget.setFixedWidth(250) # Layout Lock
         self.video_tree_widget.setHeaderHidden(True)
         # Sadece Isim kolonu kalsin
@@ -10135,11 +14584,7 @@ class AngollaPlayer(QMainWindow):
             self.video_tree_widget.hideColumn(col)
         
         # Root Path ~/Videos (Varsa) yoksa Home
-        vid_path = os.path.expanduser("~/Videos")
-        if os.path.exists(vid_path):
-            self.video_tree_widget.setRootIndex(self.video_model.index(vid_path))
-        else:
-            self.video_tree_widget.setRootIndex(self.video_model.index(QDir.homePath()))
+        self.video_tree_widget.setRootIndex(self.video_proxy.mapFromSource(self.video_model.index(vid_path)))
             
         self.video_tree_widget.setStyleSheet("""
             QTreeView {
@@ -10159,7 +14604,7 @@ class AngollaPlayer(QMainWindow):
         video_layout = QVBoxLayout(video_page)
         video_layout.setContentsMargins(0,0,0,0)
         
-        video_header = QLabel("🎬 Video Arşivi")
+        video_header = QLabel(f"🎬 Video Arşivi ({os.path.basename(vid_path) or vid_path})")
         video_header.setStyleSheet("font-weight: bold; padding: 8px; background-color: #333;")
         video_layout.addWidget(video_header)
         video_layout.addWidget(self.video_tree_widget)
@@ -10253,6 +14698,8 @@ class AngollaPlayer(QMainWindow):
         self.albumArtLabel.setStyleSheet("background: transparent; border: none;")
         
         album_container = QWidget()
+        # Video modunda tamamen gizlemek için referans sakla
+        self.album_container = album_container
         album_container.setObjectName("albumContainer")
         # Çerçeve ve arka planı temizle (Saf Resim Modu)
         album_container.setStyleSheet("background: transparent; border: none;")
@@ -10375,6 +14822,27 @@ class AngollaPlayer(QMainWindow):
     # ==========================================================
     #  ANA İÇERİK (playlist + info panel + alt kontroller)
     # ==========================================================
+    def _on_video_audio_probed(self, buffer):
+        """Video ses verisini (QAudioBuffer) işleyip visualizer'a gönder."""
+        try:
+            byte_count = buffer.byteCount()
+            if byte_count == 0:
+                return
+            
+            # QAudioBuffer -> Raw Bytes
+            # PyQt5'te buffer.data() sip.voidptr döner, asstring() ile bytes alınır.
+            raw_data = buffer.data().asstring(byte_count)
+            
+            fmt = buffer.format()
+            sample_size = fmt.sampleSize()
+            channels = fmt.channelCount()
+            sample_rate = fmt.sampleRate()
+            
+            # Worker thread'e sinyal ile gönder
+            self.video_audio_ready.emit(raw_data, sample_size, channels, sample_rate)
+        except Exception:
+            pass
+
     def _create_main_content(self):
         """
         🎨 ANGOLLA LAYOUT + TOOLBAR
@@ -10583,6 +15051,8 @@ class AngollaPlayer(QMainWindow):
         vgrid.setContentsMargins(0, 0, 0, 0)
         vgrid.setSpacing(0)
         vgrid.addWidget(self.video_output_widget, 0, 0)
+        vgrid.setRowStretch(0, 1)
+        vgrid.setColumnStretch(0, 1)
 
         # Video hata/uyarı overlay (oynatılamazsa kullanıcıya kısa mesaj + fallback)
         self.video_error_overlay = QWidget(self.video_overlay_host)
@@ -10635,286 +15105,20 @@ class AngollaPlayer(QMainWindow):
                 border: 2px solid rgba(64, 196, 255, 255);
             }
         """)
-        vgrid.addWidget(self.video_fs_button, 0, 0, alignment=Qt.AlignTop | Qt.AlignRight)
+        # Sağ alt köşeye yerleştir (AlignBottom | AlignRight)
+        vgrid.addWidget(self.video_fs_button, 0, 0, alignment=Qt.AlignBottom | Qt.AlignRight)
 
-        # HUD (sadece tam ekranda görünür)
-        self.video_hud = QWidget(self.video_overlay_host)
-        self.video_hud.setVisible(False)
-        self.video_hud.setObjectName("videoHud")
-        self.video_hud.setStyleSheet(
-            "#videoHud { background-color: rgba(42,42,42,210); border-top: 1px solid rgba(68,68,68,200); }"
-        )
-
-        hud_layout = QVBoxLayout(self.video_hud)
-        hud_layout.setContentsMargins(12, 8, 12, 8)
-        hud_layout.setSpacing(8)
-
-        # HUD progress
-        self.video_hud_progress = GradientSlider(Qt.Horizontal)
-        self.video_hud_progress.setRange(0, 0)
-        self.video_hud_progress.sliderMoved.connect(self._set_video_position)
-        # GradientSlider zaten fixedHeight=20 olarak ayarlı
-
-        # HUD progress + zaman
-        hud_layout.addWidget(self.video_hud_progress)
-        self.video_hud_time_current = QLabel("00:00")
-        self.video_hud_time_total = QLabel("00:00")
-        for _lbl in (self.video_hud_time_current, self.video_hud_time_total):
-            _lbl.setStyleSheet("color: #e0e0e0; padding: 0 6px; font-size: 14px; font-weight: bold;")
-        time_row = QHBoxLayout()
-        time_row.setContentsMargins(0, 0, 0, 0)
-        time_row.addWidget(self.video_hud_time_current)
-        time_row.addStretch(1)
-        time_row.addWidget(self.video_hud_time_total)
-        hud_layout.addLayout(time_row)
-
-        # HUD controls row
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(10)
-
-        def _mk_btn(std_icon, tip, cb):
-            b = QToolButton()
-            b.setIcon(self.style().standardIcon(std_icon))
-            b.setAutoRaise(True)
-            b.setToolTip(tip)
-            b.clicked.connect(cb)
-            b.setFixedSize(36, 36)
-            b.setIconSize(QSize(20, 20))
-            b.setStyleSheet("""
-                QToolButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(60, 60, 60, 200),
-                        stop:1 rgba(40, 40, 40, 230));
-                    border: 1px solid rgba(100, 100, 100, 150);
-                    border-radius: 8px;
-                    padding: 2px;
-                }
-                QToolButton:hover {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(64, 196, 255, 220),
-                        stop:1 rgba(40, 160, 220, 240));
-                    border: 2px solid rgba(100, 220, 255, 255);
-                }
-                QToolButton:pressed {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(40, 160, 220, 240),
-                        stop:1 rgba(20, 120, 180, 255));
-                    border: 2px solid rgba(64, 196, 255, 255);
-                }
-            """)
-            return b
-
-        self.video_hud_prev = _mk_btn(QStyle.SP_MediaSeekBackward, "Geri (10 sn)", lambda: self._video_seek_relative(-10_000))
-        self.video_hud_play = _mk_btn(QStyle.SP_MediaPlay, "Oynat/Duraklat", self._video_toggle_play)
-        self.video_hud_next = _mk_btn(QStyle.SP_MediaSeekForward, "İleri (10 sn)", lambda: self._video_seek_relative(10_000))
-
-        row.addWidget(self.video_hud_prev)
-        row.addWidget(self.video_hud_play)
-        row.addWidget(self.video_hud_next)
-
-        row.addStretch(1)
-
-        # FPS göstergesi - Modern tasarım
-        self.video_hud_fps = QLabel("FPS: --")
-        self.video_hud_fps.setAlignment(Qt.AlignCenter)
-        self.video_hud_fps.setFixedWidth(70)
-        self.video_hud_fps.setStyleSheet("""
-            QLabel {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(50, 50, 50, 220),
-                    stop:1 rgba(30, 30, 30, 240));
-                border: 1px solid rgba(80, 80, 80, 180);
-                border-radius: 8px;
-                color: #4CAF50;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 4px 6px;
-            }
-        """)
-        row.addWidget(self.video_hud_fps)
-
-        # Tam ekran düğmesi (HUD içinde) - Modern tasarım
-        self.video_hud_fullscreen = QToolButton()
-        self.video_hud_fullscreen.setAutoRaise(True)
-        self.video_hud_fullscreen.setToolTip("Tam Ekran (F11)")
-        self.video_hud_fullscreen.clicked.connect(self._toggle_video_fullscreen)
-        self.video_hud_fullscreen.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
-        self.video_hud_fullscreen.setFixedSize(36, 36)
-        self.video_hud_fullscreen.setIconSize(QSize(20, 20))
-        self.video_hud_fullscreen.setStyleSheet("""
-            QToolButton {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(60, 60, 60, 200),
-                    stop:1 rgba(40, 40, 40, 230));
-                border: 1px solid rgba(100, 100, 100, 150);
-                border-radius: 8px;
-                padding: 2px;
-            }
-            QToolButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(64, 196, 255, 220),
-                    stop:1 rgba(40, 160, 220, 240));
-                border: 2px solid rgba(100, 220, 255, 255);
-            }
-            QToolButton:pressed {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(40, 160, 220, 240),
-                    stop:1 rgba(20, 120, 180, 255));
-                border: 2px solid rgba(64, 196, 255, 255);
-            }
-        """)
-        row.addWidget(self.video_hud_fullscreen)
-
-        # Ayar menüsü - Modern tasarım
-        self.video_hud_settings = QToolButton()
-        self.video_hud_settings.setAutoRaise(True)
-        self.video_hud_settings.setPopupMode(QToolButton.InstantPopup)
-        self.video_hud_settings.setToolTip("Video Ayarları")
-        self.video_hud_settings.setFixedSize(36, 36)
-        self.video_hud_settings.setIconSize(QSize(20, 20))
-        self.video_hud_settings.setStyleSheet("""
-            QToolButton {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(60, 60, 60, 200),
-                    stop:1 rgba(40, 40, 40, 230));
-                border: 1px solid rgba(100, 100, 100, 150);
-                border-radius: 8px;
-                padding: 2px;
-                color: #E0E0E0;
-                font-size: 18px;
-            }
-            QToolButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(80, 100, 120, 220),
-                    stop:1 rgba(55, 71, 79, 250));
-                border: 2px solid rgba(100, 220, 255, 200);
-            }
-            QToolButton:pressed {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(64, 196, 255, 240),
-                    stop:1 rgba(40, 160, 220, 255));
-                border: 2px solid rgba(100, 220, 255, 255);
-            }
-        """)
+        # Video (sadece) YouTube tarzı ayarlar paneli (overlay)
         try:
-            _pref_ico = QIcon.fromTheme("preferences-system")
-            if _pref_ico is not None and not _pref_ico.isNull():
-                self.video_hud_settings.setIcon(_pref_ico)
-            else:
-                self.video_hud_settings.setText("⚙")
+            self._create_video_settings_ui()
         except Exception:
-            self.video_hud_settings.setText("⚙")
-        
-        # Modern menü stili
-        m = QMenu(self)
-        m.setStyleSheet("""
-            QMenu {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(45, 45, 45, 250),
-                    stop:1 rgba(30, 30, 30, 255));
-                color: #E0E0E0;
-                border: 2px solid rgba(64, 196, 255, 180);
-                border-radius: 8px;
-                padding: 8px 4px;
-            }
-            QMenu::item {
-                padding: 8px 24px 8px 16px;
-                border-radius: 4px;
-                margin: 2px 4px;
-            }
-            QMenu::item:selected {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba(64, 196, 255, 200),
-                    stop:1 rgba(40, 160, 220, 220));
-                color: #FFFFFF;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: rgba(100, 100, 100, 150);
-                margin: 6px 8px;
-            }
-        """)
-        act_rot_l = QAction("↩️ Sola Çevir (90°)", self)
-        act_rot_r = QAction("↪️ Sağa Çevir (90°)", self)
-        act_rot_0 = QAction("⏹️ Sıfırla (Normal)", self)
-        act_exit = QAction("⛶ Tam ekrandan çık", self)
-        act_rot_l.triggered.connect(lambda: self.video_output_widget.rotate_video(-90))
-        act_rot_r.triggered.connect(lambda: self.video_output_widget.rotate_video(90))
-        act_rot_0.triggered.connect(lambda: self.video_output_widget.rotate_video(0, absolute=True))
-        act_exit.triggered.connect(self._exit_video_fullscreen)
-        m.addAction(act_rot_l)
-        m.addAction(act_rot_r)
-        m.addAction(act_rot_0)
-        m.addSeparator()
+            pass
 
-        # Hedef FPS (Auto/24/30/60)
-        fps_menu = m.addMenu("🎞️ Hedef FPS")
-        fps_group = QActionGroup(self)
-        fps_group.setExclusive(True)
-
-        act_fps_auto = QAction("Auto", self)
-        act_fps_auto.setCheckable(True)
-        act_fps_24 = QAction("24", self)
-        act_fps_24.setCheckable(True)
-        act_fps_30 = QAction("30", self)
-        act_fps_30.setCheckable(True)
-        act_fps_60 = QAction("60", self)
-        act_fps_60.setCheckable(True)
-
-        for _a in (act_fps_auto, act_fps_24, act_fps_30, act_fps_60):
-            fps_group.addAction(_a)
-            fps_menu.addAction(_a)
-
-        act_fps_auto.setChecked(True)
-        act_fps_auto.triggered.connect(lambda _=False: self._set_video_target_fps(0))
-        act_fps_24.triggered.connect(lambda _=False: self._set_video_target_fps(24))
-        act_fps_30.triggered.connect(lambda _=False: self._set_video_target_fps(30))
-        act_fps_60.triggered.connect(lambda _=False: self._set_video_target_fps(60))
-
-        # Kalite / Performans modu
-        quality_menu = m.addMenu("🖥️ Mod")
-        quality_group = QActionGroup(self)
-        quality_group.setExclusive(True)
-
-        act_quality = QAction("Kalite", self)
-        act_quality.setCheckable(True)
-        act_perf = QAction("Performans", self)
-        act_perf.setCheckable(True)
-
-        for _a in (act_quality, act_perf):
-            quality_group.addAction(_a)
-            quality_menu.addAction(_a)
-
-        act_quality.setChecked(True)
-        act_quality.triggered.connect(lambda _=False: self._set_video_quality_mode("KALİTE"))
-        act_perf.triggered.connect(lambda _=False: self._set_video_quality_mode("PERFORMANS"))
-
-        m.addSeparator()
-        m.addAction(act_exit)
-        self.video_hud_settings.setMenu(m)
-        row.addWidget(self.video_hud_settings)
-
-        # Ses alanı
-        self.video_hud_mute = _mk_btn(QStyle.SP_MediaVolume, "Sesi Aç/Kapat", self._video_toggle_mute)
-        self.video_hud_volume = QSlider(Qt.Horizontal)
-        self.video_hud_volume.setRange(0, 100)
-        self.video_hud_volume.setFixedWidth(160)
-        self.video_hud_volume.setValue(80)
-        self.video_hud_volume.valueChanged.connect(self._video_set_volume)
-        row.addWidget(self.video_hud_mute)
-        row.addWidget(self.video_hud_volume)
-
-        # Medya yokken HUD kontrolleri pasif
-        for w in (self.video_hud_prev, self.video_hud_play, self.video_hud_next, self.video_hud_progress, self.video_hud_mute, self.video_hud_volume):
-            try:
-                w.setEnabled(False)
-            except Exception:
-                pass
-
-        hud_layout.addLayout(row)
-
-        vgrid.addWidget(self.video_hud, 0, 0, alignment=Qt.AlignBottom)
+        # Video ekranı için parlaklık/ses overlay'leri (tam ekran modunda kullanılır)
+        self._video_brightness = 1.0  # 0.0-2.0 arası (0=karanlık, 1=normal, 2=parlak)
+        self._brightness_overlay = None
+        self._volume_indicator = None
+        self._brightness_indicator = None
 
         # Video Container (host + normal seek)
         self.video_container = QWidget()
@@ -10923,86 +15127,24 @@ class AngollaPlayer(QMainWindow):
         v_layout.setSpacing(0)
         v_layout.addWidget(self.video_overlay_host)
 
-        # Normal mod: zaman + scrubber (tek satır)
-        self.video_seek_row = QWidget()
-        seek_row_layout = QHBoxLayout(self.video_seek_row)
-        seek_row_layout.setContentsMargins(10, 6, 10, 6)
-        seek_row_layout.setSpacing(8)
-        seek_row_layout.addWidget(self.video_time_current)
-        seek_row_layout.addWidget(self.video_seek_slider, 1)
-        seek_row_layout.addWidget(self.video_time_total)
-        v_layout.addWidget(self.video_seek_row)
+        # Normal mod: zaman + scrubber (tek satır) - REMOVED: Main bar used instead
+        # self.video_seek_row = QWidget()
+        # seek_row_layout = QHBoxLayout(self.video_seek_row)
+        # seek_row_layout.setContentsMargins(10, 6, 10, 6)
+        # seek_row_layout.setSpacing(8)
+        # seek_row_layout.addWidget(self.video_time_current)
+        # seek_row_layout.addWidget(self.video_seek_slider, 1)
+        # seek_row_layout.addWidget(self.video_time_total)
+        # v_layout.addWidget(self.video_seek_row)
 
-        # Normal mod: YouTube tarzı kontrol satırı (izole)
-        self.video_controls_row = QWidget()
-        ctrl_layout = QHBoxLayout(self.video_controls_row)
-        ctrl_layout.setContentsMargins(10, 6, 10, 10)
-        ctrl_layout.setSpacing(10)
+        # Normal mod: YouTube tarzı kontrol satırı (izole) - REMOVED: Main bar used instead
+        # self.video_controls_row = QWidget()
+        # ctrl_layout = QHBoxLayout(self.video_controls_row)
+        # ctrl_layout.setContentsMargins(10, 6, 10, 10)
+        # ctrl_layout.setSpacing(10)
 
-        def _mk_ctl_btn(std_icon, tip, cb):
-            b = QToolButton()
-            b.setIcon(self.style().standardIcon(std_icon))
-            b.setAutoRaise(True)
-            b.setToolTip(tip)
-            b.clicked.connect(cb)
-            b.setFixedSize(36, 36)
-            b.setIconSize(QSize(20, 20))
-            b.setStyleSheet("""
-                QToolButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(60, 60, 60, 180),
-                        stop:1 rgba(40, 40, 40, 200));
-                    border: 1px solid rgba(100, 100, 100, 150);
-                    border-radius: 8px;
-                    padding: 2px;
-                }
-                QToolButton:hover {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(64, 196, 255, 200),
-                        stop:1 rgba(40, 160, 220, 230));
-                    border: 2px solid rgba(100, 220, 255, 255);
-                }
-                QToolButton:pressed {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 rgba(40, 160, 220, 240),
-                        stop:1 rgba(20, 120, 180, 255));
-                    border: 2px solid rgba(64, 196, 255, 255);
-                }
-            """)
-            return b
-
-        self.video_ctl_prev = _mk_ctl_btn(QStyle.SP_MediaSeekBackward, "Geri (10 sn)", lambda: self._video_seek_relative(-10_000))
-        self.video_ctl_play = _mk_ctl_btn(QStyle.SP_MediaPlay, "Oynat/Duraklat", self._video_toggle_play)
-        self.video_ctl_next = _mk_ctl_btn(QStyle.SP_MediaSeekForward, "İleri (10 sn)", lambda: self._video_seek_relative(10_000))
-        
-        # FPS göstergesi - Modern tasarım
-        self.video_ctl_fps = QLabel("FPS: --")
-        self.video_ctl_fps.setAlignment(Qt.AlignCenter)
-        self.video_ctl_fps.setFixedWidth(70)
-        self.video_ctl_fps.setStyleSheet("""
-            QLabel {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(50, 50, 50, 200),
-                    stop:1 rgba(30, 30, 30, 220));
-                border: 1px solid rgba(80, 80, 80, 150);
-                border-radius: 8px;
-                color: #4CAF50;
-                font-weight: bold;
-                font-size: 11px;
-                padding: 4px 6px;
-            }
-        """)
-        
-        self.video_ctl_fullscreen = _mk_ctl_btn(QStyle.SP_TitleBarMaxButton, "Tam Ekran (F11)", self._toggle_video_fullscreen)
-
-        ctrl_layout.addWidget(self.video_ctl_prev)
-        ctrl_layout.addWidget(self.video_ctl_play)
-        ctrl_layout.addWidget(self.video_ctl_next)
-        ctrl_layout.addStretch(1)
-        ctrl_layout.addWidget(self.video_ctl_fps)
-        ctrl_layout.addWidget(self.video_ctl_fullscreen)
-
-        v_layout.addWidget(self.video_controls_row)
+        # Video kontrolleri: Ana bar (bottom_widget) video için de kullanılır
+        # Sadece video_fs_button overlay olarak tutulur (tam ekran geçişi için)
         
         # Ayrı bir player instance kullan (ses çakışmasını yönetmek için)
         self.videoPlayer = QMediaPlayer(None, QMediaPlayer.VideoSurface)
@@ -11039,13 +15181,10 @@ class AngollaPlayer(QMainWindow):
         except Exception:
             pass
 
-        # Başlangıç ses seviyesi HUD ile senkron
+        # Başlangıç ses seviyesi
         try:
-            if hasattr(self, 'video_hud_volume'):
-                self.videoPlayer.setMuted(False)
-                self.videoPlayer.setVolume(int(self.video_hud_volume.value()))
-            if hasattr(self, 'video_hud_mute'):
-                self.video_hud_mute.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
+            self.videoPlayer.setMuted(False)
+            self.videoPlayer.setVolume(70)  # Varsayılan %70
         except Exception:
             pass
 
@@ -11057,16 +15196,18 @@ class AngollaPlayer(QMainWindow):
             pass
         # AUTO ROTATION: Metadata değişince yönü kontrol et
         self.videoPlayer.metaDataChanged.connect(self._on_video_metadata_changed)
+        # AUTO RESIZE: Metadata değişince pencere boyutunu videoya göre ayarla
+        self.videoPlayer.metaDataChanged.connect(self._auto_resize_window_to_video)
         
         # VISUALIZER ENTEGRASYONU (Video Sesi -> Barlar)
         self.videoProbe = QAudioProbe(self)
         self.videoProbe.setSource(self.videoPlayer)
-        # Note: self.process_audio_buffer was removed as it's obsolete.
-        # Video visualization can be restored by piping this probe to viz_worker if needed.
+        # Video ses verisini görselleştiriciye yönlendir
+        self.videoProbe.audioBufferProbed.connect(self._on_video_audio_probed)
 
         self.mainContentStack.addWidget(self.video_container) # Page 1
 
-        # FPS ölçümü (yalnızca HUD için)
+        # FPS ölçümü
         self._video_fps_frames = 0
         self._video_fps_timer = QTimer(self)
         self._video_fps_timer.setInterval(1000)
@@ -11076,20 +15217,14 @@ class AngollaPlayer(QMainWindow):
         except Exception:
             pass
 
-        # Video HUD Aura (altbar + volume + slider hız kontrolü)
+        # Video aura hızı (slider animasyonu için)
         self._video_aura_speed = 0.08
-        self._video_hud_aura_phase = 0.0
-        self._video_hud_aura_timer = QTimer(self)
-        self._video_hud_aura_timer.setInterval(50)
-        self._video_hud_aura_timer.timeout.connect(self._update_video_hud_aura)
 
         # Video slider'larını mevcut tema rengine yaklaştır
         try:
             primary, _, _ = self._get_current_theme_colors()
             if hasattr(self, 'video_seek_slider') and hasattr(self.video_seek_slider, 'set_aura_base_color'):
                 self.video_seek_slider.set_aura_base_color(primary)
-            if hasattr(self, 'video_hud_progress') and hasattr(self.video_hud_progress, 'set_aura_base_color'):
-                self.video_hud_progress.set_aura_base_color(primary)
             self._set_video_aura_speed(self._video_aura_speed)
         except Exception:
             pass
@@ -11127,7 +15262,7 @@ class AngollaPlayer(QMainWindow):
         seekLayout.addWidget(self.lblCurrentTime)
         seekLayout.addWidget(self.positionSlider)
         seekLayout.addWidget(self.lblTotalTime)
-        seekLayout.setContentsMargins(20, 5, 20, 0) # Add margins for better visibility
+        seekLayout.setContentsMargins(20, 2, 20, 0) # Reduced margins for thinner bar
         seekLayout.setSpacing(8)
         
         ctrlLayout = QHBoxLayout()
@@ -11163,22 +15298,22 @@ class AngollaPlayer(QMainWindow):
         self.eqButton.setToolTip("Ses Efektleri (DSP)")
         
         controlBar.addWidget(self.shuffleButton)
-        controlBar.addWidget(self.seekBackwardButton)  # 10sn geri
+        # controlBar.addWidget(self.seekBackwardButton)  # REMOVED: Moved to Video HUD
         controlBar.addWidget(self.prevButton)
         controlBar.addWidget(self.playButton)
         controlBar.addWidget(self.nextButton)
-        controlBar.addWidget(self.seekForwardButton)  # 10sn ileri
+        # controlBar.addWidget(self.seekForwardButton)  # REMOVED: Moved to Video HUD
         controlBar.addWidget(self.repeatButton)
         
         controlBar.addStretch(1)  # Sağ boşluk (1 kat)
         
-        # Playback Rate Controls (Video Hızlandırma)
-        controlBar.addWidget(QLabel("⏩ Hız:"))
-        controlBar.addWidget(self.playbackRateDecreaseBtn)
-        controlBar.addWidget(self.playbackRateLabel)
-        controlBar.addWidget(self.playbackRateIncreaseBtn)
-        controlBar.addWidget(self.playbackRateNormalBtn)
-        controlBar.addSpacing(15)
+        # Playback Rate Controls (Video Hızlandırma) - REMOVED: Moved to Video HUD
+        # controlBar.addWidget(QLabel("⏩ Hız:"))
+        # controlBar.addWidget(self.playbackRateDecreaseBtn)
+        # controlBar.addWidget(self.playbackRateLabel)
+        # controlBar.addWidget(self.playbackRateIncreaseBtn)
+        # controlBar.addWidget(self.playbackRateNormalBtn)
+        # controlBar.addSpacing(15)
         
         # Volume controls (aynı satırın sağ ucunda)
         controlBar.addWidget(self.eqButton) # EQ Button (Ses Efektleri) - FIXED VISIBILITY
@@ -11186,7 +15321,8 @@ class AngollaPlayer(QMainWindow):
         controlBar.addWidget(self.volumeSlider)
         controlBar.addWidget(self.volumeLabel)
         
-        controlBar.setSpacing(20)
+        controlBar.setSpacing(10)
+        controlBar.setContentsMargins(0, 0, 0, 4) # Reduced bottom margin
         
         # --- BOTTOM CONTAINER (Kontroller + Görselleştirme) ---
         bottomContainer = QVBoxLayout()
@@ -11194,7 +15330,12 @@ class AngollaPlayer(QMainWindow):
         bottomContainer.setContentsMargins(0, 0, 0, 0)
         bottomContainer.addLayout(seekLayout)
         bottomContainer.addLayout(controlBar)
-        bottomContainer.addWidget(self.vis_widget_main_window)  # Spektrum çubukları
+        # Spektrum alanı: Müzik ve Video için ayrı widget (video sekmesi ana spectrum'u etkilemesin)
+        self.bottom_vis_stack = QStackedWidget()
+        self.bottom_vis_stack.addWidget(self.vis_widget_main_window)
+        self.bottom_vis_stack.addWidget(self.vis_widget_video_window)
+        self.bottom_vis_stack.setCurrentIndex(0)
+        bottomContainer.addWidget(self.bottom_vis_stack)
         
         # Bottom widget wrapper
         bottomWidget = QWidget()
@@ -11206,7 +15347,7 @@ class AngollaPlayer(QMainWindow):
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 rgba(42, 42, 42, 240),
                     stop:1 rgba(20, 20, 20, 250));
-                border-top: 2px solid rgba(64, 196, 255, 180);
+                border-top: 1px solid rgba(80, 80, 80, 120);
                 border-radius: 0px;
             }
         """)
@@ -11341,6 +15482,10 @@ class AngollaPlayer(QMainWindow):
     def _connect_signals(self):
         self.playButton.clicked.connect(self.play_pause)
         self.nextButton.clicked.connect(self._next_track)
+        
+        # F2 Shortcut (Miniplayer)
+        self.shortcut_miniplayer = QShortcut(QKeySequence("F2"), self)
+        self.shortcut_miniplayer.activated.connect(self._toggle_miniplayer_mode)
         self.prevButton.clicked.connect(self._prev_track)
         
         # Hızlı ileri/geri butonları (10 saniye)
@@ -11360,7 +15505,7 @@ class AngollaPlayer(QMainWindow):
             self.show_library_context_menu
         )
 
-        self.volumeSlider.valueChanged.connect(self.audio_engine.media_player.setVolume)
+        self.volumeSlider.valueChanged.connect(self._on_master_volume_changed)
         self.volumeSlider.valueChanged.connect(self._update_volume_label)
         self.volumeSlider.valueChanged.connect(self.save_config)
         self.volumeSlider.valueChanged.connect(self._apply_web_volume)
@@ -11368,8 +15513,9 @@ class AngollaPlayer(QMainWindow):
         self.positionSlider.sliderMoved.connect(self._set_position_safely_moved)
         self.positionSlider.sliderReleased.connect(self._set_position_safely)
 
-        self.audio_engine.media_player.positionChanged.connect(self.position_changed)
-        self.audio_engine.media_player.durationChanged.connect(self.duration_changed)
+        # Audio Engine Signals
+        self.audio_engine.media_player.positionChanged.connect(self._on_audio_position_changed)
+        self.audio_engine.media_player.durationChanged.connect(self._on_audio_duration_changed)
         self.playlist.currentIndexChanged.connect(self.playlist_position_changed)
         self.audio_engine.media_player.stateChanged.connect(self._update_status_bar)
         self.audio_engine.media_player.mediaStatusChanged.connect(self._media_status_changed)
@@ -11502,13 +15648,13 @@ class AngollaPlayer(QMainWindow):
 
             self.playButton.setIcon(QIcon(os.path.join("icons", "media-playback-pause.png")))
 
-    def _next_track(self):
-        if self.mainContentStack.currentIndex() == 1: # Video Mode
-             if hasattr(self, 'videoPlayer'):
-                 pos = self.videoPlayer.position() + 10000 # +10 sn
-                 self.videoPlayer.setPosition(pos)
-                 self.statusBar().showMessage("Video: +10 saniye", 2000)
-             return
+    def _next_track(self, _reason: str = None):
+        if self.mainContentStack.currentIndex() == 1:  # Video Mode
+            try:
+                self._video_next_in_folder()
+            except Exception:
+                pass
+            return
 
         if self.search_mode == "web" and self.webView:
             self._web_next()
@@ -11520,16 +15666,18 @@ class AngollaPlayer(QMainWindow):
         if current < 0:
             current = 0
         next_index = (current + 1) % self.playlist.mediaCount()
+        self._set_next_track_change_reason(_reason or "manual_next")
         self._play_index(next_index)
 
-    def _prev_track(self):
-        if self.mainContentStack.currentIndex() == 1: # Video Mode
-             if hasattr(self, 'videoPlayer'):
-                 pos = self.videoPlayer.position() - 10000 # -10 sn
-                 if pos < 0: pos = 0
-                 self.videoPlayer.setPosition(pos)
-                 self.statusBar().showMessage("Video: -10 saniye", 2000)
-             return
+    def _prev_track(self, _reason: str = None):
+        if self.mainContentStack.currentIndex() == 1:  # Video Mode
+            try:
+                self._video_prev_in_folder()
+            except Exception:
+                pass
+            return
+
+        
 
         if self.search_mode == "web" and self.webView:
             self._web_prev()
@@ -11541,63 +15689,123 @@ class AngollaPlayer(QMainWindow):
         if current < 0:
             current = 0
         prev_index = (current - 1) % self.playlist.mediaCount()
+        self._set_next_track_change_reason(_reason or "manual_prev")
         self._play_index(prev_index)
 
-    def _fade_and_advance(self, next=True, fade_ms=600):
-        # Basit fade out, değiştir, fade in
+    def _set_next_track_change_reason(self, reason: str):
         try:
-            start_vol = self.volumeSlider.value()
-            steps = 12
-            interval = max(20, int(fade_ms / steps))
-            step_delta = max(1, int(start_vol / steps))
-
-            def do_fade_out():
-                nonlocal steps
-                v = self.mediaPlayer.volume()
-                v = max(0, v - step_delta)
-                self.mediaPlayer.setVolume(v)
-                if v <= 0:
-                    fade_timer.stop()
-                    # İleri/geri
-                    if next:
-                        self.playlist.next()
-                    else:
-                        self.playlist.previous()
-                    # Yeni parçayı oynat
-                    self.mediaPlayer.play()
-                    # Fade in
-                    self._fade_in_to(start_vol)
-
-            fade_timer = QTimer(self)
-            fade_timer.timeout.connect(do_fade_out)
-            fade_timer.start(interval)
+            self._track_change_reason = str(reason or "")
         except Exception:
-            # Fallback: normal davranış
-            if next:
-                self.playlist.next()
-            else:
-                self.playlist.previous()
-            self.mediaPlayer.play()
+            self._track_change_reason = None
 
-    def _fade_in_to(self, target_vol=70, fade_ms=600):
+    def _video_next_in_folder(self):
+        """Video modunda: aynı klasörde sıradaki videoyu aç."""
         try:
-            current = self.mediaPlayer.volume()
-            steps = 12
-            interval = max(20, int(fade_ms / steps))
-            step_delta = max(1, int((target_vol - current) / steps))
+            cur = str(getattr(self, '_video_current_path', '') or '')
+        except Exception:
+            cur = ''
+        if not cur or not os.path.isfile(cur):
+            try:
+                self.statusBar().showMessage("Video: sıradaki bulunamadı.", 2500)
+            except Exception:
+                pass
+            return
 
-            def do_fade_in():
-                v = self.mediaPlayer.volume()
-                v = min(target_vol, v + step_delta)
-                self.mediaPlayer.setVolume(v)
-                if v >= target_vol:
-                    tin.stop()
+        # Playlist yoksa/yanlışsa yeniden kur
+        try:
+            paths = getattr(self, '_video_playlist_paths', None)
+            folder = str(getattr(self, '_video_playlist_folder', '') or '')
+            if not isinstance(paths, list) or not paths or os.path.dirname(cur) != folder:
+                self._set_video_playlist_from_folder(cur)
+        except Exception:
+            try:
+                self._set_video_playlist_from_folder(cur)
+            except Exception:
+                pass
 
-            tin = QTimer(self)
-            tin.timeout.connect(do_fade_in)
-            tin.start(interval)
+        try:
+            paths = getattr(self, '_video_playlist_paths', []) or []
+            idx = int(getattr(self, '_video_playlist_index', -1))
+        except Exception:
+            paths, idx = [], -1
+
+        # Index yoksa current'a göre bul
+        if idx < 0 and cur and paths:
+            try:
+                idx = paths.index(cur)
+            except Exception:
+                idx = 0
+
+        if idx >= 0 and (idx + 1) < len(paths):
+            next_path = paths[idx + 1]
+            self._video_playlist_index = idx + 1
+            self._play_video_file(next_path, _build_playlist=False)
+            return
+
+        try:
+            self.statusBar().showMessage("Video: liste bitti.", 2500)
         except Exception:
             pass
+
+    def _video_prev_in_folder(self):
+        """Video modunda: aynı klasörde önceki videoyu aç."""
+        try:
+            cur = str(getattr(self, '_video_current_path', '') or '')
+        except Exception:
+            cur = ''
+        if not cur or not os.path.isfile(cur):
+            try:
+                self.statusBar().showMessage("Video: önceki bulunamadı.", 2500)
+            except Exception:
+                pass
+            return
+
+        # Playlist yoksa/yanlışsa yeniden kur
+        try:
+            paths = getattr(self, '_video_playlist_paths', None)
+            folder = str(getattr(self, '_video_playlist_folder', '') or '')
+            if not isinstance(paths, list) or not paths or os.path.dirname(cur) != folder:
+                self._set_video_playlist_from_folder(cur)
+        except Exception:
+            try:
+                self._set_video_playlist_from_folder(cur)
+            except Exception:
+                pass
+
+        try:
+            paths = getattr(self, '_video_playlist_paths', []) or []
+            idx = int(getattr(self, '_video_playlist_index', -1))
+        except Exception:
+            paths, idx = [], -1
+
+        # Index yoksa current'a göre bul
+        if idx < 0 and cur and paths:
+            try:
+                idx = paths.index(cur)
+            except Exception:
+                idx = 0
+
+        if idx > 0 and idx < len(paths):
+            prev_path = paths[idx - 1]
+            self._video_playlist_index = idx - 1
+            self._play_video_file(prev_path, _build_playlist=False)
+            return
+
+        try:
+            self.statusBar().showMessage("Video: listenin başı.", 2500)
+        except Exception:
+            pass
+
+    def _should_crossfade_for_reason(self, reason: str) -> bool:
+        ms = int(getattr(self, "_pb_crossfade_ms", 0) or 0)
+        if ms <= 0:
+            return False
+        r = (reason or "").strip().lower()
+        if r in ("manual_next", "manual_prev", "manual_select"):
+            return bool(getattr(self, "_pb_manual_crossfade_enabled", False))
+        if r == "auto_crossfade":
+            return bool(getattr(self, "_pb_auto_crossfade_enabled", False))
+        return False
 
     def toggle_shuffle(self):
         self.is_shuffling = self.shuffleButton.isChecked()
@@ -11621,6 +15829,16 @@ class AngollaPlayer(QMainWindow):
 
     def _toggle_mute(self):
         """Sesi aç/kapat (M tuşu)."""
+        # Context Aware Mute
+        if self.mainContentStack.currentIndex() == 1: # Video Tab
+            if self.videoPlayer.isMuted():
+                self.videoPlayer.setMuted(False)
+                self.statusBar().showMessage("🔊 Ses Açık", 1000)
+            else:
+                self.videoPlayer.setMuted(True)
+                self.statusBar().showMessage("🔇 Sessiz", 1000)
+            return
+
         if self.mediaPlayer.volume() > 0:
             self._muted_volume = self.mediaPlayer.volume()
             self.mediaPlayer.setVolume(0)
@@ -11679,6 +15897,80 @@ class AngollaPlayer(QMainWindow):
     # GENEL EVENT FILTER
     # --------------------------------------------------------------
     def eventFilter(self, obj, event):
+        # Video ayarlar paneli: dışarı tıklanınca kapat ve resize'da hizala
+        try:
+            if hasattr(self, '_video_settings_panel') and self._video_settings_panel and self._video_settings_panel.isVisible():
+                if event.type() == QEvent.MouseButtonPress:
+                    gp = None
+                    try:
+                        gp = event.globalPos()
+                    except Exception:
+                        gp = None
+                    if gp is not None:
+                        in_panel = self._video_settings_panel.rect().contains(self._video_settings_panel.mapFromGlobal(gp))
+                        in_btn = False
+                        try:
+                            if hasattr(self, 'video_settings_button') and self.video_settings_button:
+                                in_btn = self.video_settings_button.rect().contains(self.video_settings_button.mapFromGlobal(gp))
+                        except Exception:
+                            in_btn = False
+                        if not in_btn:
+                            try:
+                                if getattr(self, '_in_video_fullscreen', False) and hasattr(self, '_fs_settings_btn') and self._fs_settings_btn:
+                                    in_btn = self._fs_settings_btn.rect().contains(self._fs_settings_btn.mapFromGlobal(gp))
+                            except Exception:
+                                pass
+                        if (not in_panel) and (not in_btn):
+                            self._hide_video_settings_panel(animate=True)
+        except Exception:
+            pass
+
+        try:
+            if obj == getattr(self, 'video_overlay_host', None) and event.type() in (QEvent.Resize, QEvent.Show):
+                self._reposition_video_settings_ui()
+        except Exception:
+            pass
+
+        # Video Fullscreen Wheel Event (Sol=ses, Sağ=parlaklık)
+        is_video_fs = getattr(self, '_in_video_fullscreen', False)
+        if is_video_fs and event.type() == QEvent.Wheel:
+            video_widget = getattr(self, 'video_output_widget', None)
+            is_on_video = (obj == video_widget)
+            if video_widget and hasattr(video_widget, 'viewport'):
+                is_on_video = is_on_video or (obj == video_widget.viewport())
+            
+            if is_on_video:
+                delta = event.angleDelta().y()
+                pos = event.pos()
+                widget_width = video_widget.width()
+                
+                # Sol %30 = ses, Sağ %30 = parlaklık
+                if pos.x() < widget_width * 0.30:
+                    # SOL TARAF: Ses seviyesi
+                    self._adjust_video_volume_with_indicator(delta)
+                    event.accept()
+                    return True
+                elif pos.x() > widget_width * 0.70:
+                    # SAĞ TARAF: Parlaklık
+                    self._adjust_video_brightness_with_indicator(delta)
+                    event.accept()
+                    return True
+        
+        # Video Fullscreen Mouse Move
+        if is_video_fs:
+            # Check if event is from video_output_widget or its viewport
+            is_video_obj = (obj == getattr(self, 'video_output_widget', None))
+            if not is_video_obj and hasattr(self, 'video_output_widget') and self.video_output_widget:
+                is_video_obj = (obj == self.video_output_widget.viewport())
+            
+            if is_video_obj and event.type() in (QEvent.MouseMove, QEvent.HoverMove):
+                self._on_fullscreen_mouse_move()
+        
+        # Web Fullscreen Mouse Move
+        if getattr(self, '_in_web_fullscreen', False):
+            if event.type() == QEvent.MouseMove or event.type() == QEvent.HoverMove:
+                 self._on_fullscreen_mouse_move()
+
         # Arama kutusu: Enter/Return bastığında aramayı tetikle
         if obj == getattr(self, "searchBar", None) and event.type() in (QEvent.FocusIn, QEvent.FocusOut):
             self._set_volume_shortcuts_enabled(event.type() != QEvent.FocusIn)
@@ -12491,6 +16783,42 @@ class AngollaPlayer(QMainWindow):
             icon = QIcon(os.path.join("icons", icon_name))
         self.playButton.setIcon(icon)
 
+    def _on_video_state_changed(self, state):
+        """Video oynatma durumu değişince."""
+        # Main Play Button Update
+        if state == QMediaPlayer.PlayingState:
+            self.update_play_button_state(True, source="video")
+        elif state == QMediaPlayer.PausedState:
+            self.update_play_button_state(False, source="video")
+        elif state == QMediaPlayer.StoppedState:
+            self.update_play_button_state(False, source="video")
+
+        try:
+            # Aura hızını duruma göre ayarla
+            if state == QMediaPlayer.PlayingState:
+                self._set_video_aura_speed(1.0)
+                self._clear_video_error()
+            elif state == QMediaPlayer.PausedState:
+                self._set_video_aura_speed(0.20)
+            else:
+                self._set_video_aura_speed(0.08)
+                
+            # FPS Timer
+            self._apply_video_target_fps_timer()
+        except Exception:
+            pass
+        
+        # Tam ekran kontrollerini güncelle
+        if getattr(self, '_in_video_fullscreen', False):
+            self._update_fs_controls_state()
+
+        # Video durunca/pauselayınca ritim çubuklarını yumuşakça düşür
+        try:
+            if state in (QMediaPlayer.PausedState, QMediaPlayer.StoppedState):
+                self.send_video_visual_data(0.0, [0.0] * 96)
+        except Exception:
+            pass
+
     def _update_status_bar(self, state):
         if self.search_mode == "web":
             return
@@ -12502,7 +16830,6 @@ class AngollaPlayer(QMainWindow):
             )
             if self.search_mode != "web":
                 self._set_visualizer_paused(False, fade=False)
-            # Legacy probe check timer removed. Visualizer is now direct-linked and stable.
         
         elif state == QMediaPlayer.PausedState:
             self.update_play_button_state(False, source="local")
@@ -12590,31 +16917,103 @@ class AngollaPlayer(QMainWindow):
             except:
                 pass
 
+    def _on_master_volume_changed(self, volume):
+        """Ana ses değişince aktif player'a uygula."""
+        # Audio Engine
+        if hasattr(self, 'audio_engine'):
+            self.audio_engine.media_player.setVolume(volume)
+        
+        # Video Player
+        if hasattr(self, 'videoPlayer'):
+            self.videoPlayer.setVolume(volume)
+
+    def _on_audio_position_changed(self, position):
+        """Sadece ses sekmesi aktifse slider'ı güncelle."""
+        if self.mainContentStack.currentIndex() == 0: # Audio/Playlist Tab
+            self.position_changed(position)
+
+    def _on_audio_duration_changed(self, duration):
+        """Sadece ses sekmesi aktifse slider range'i güncelle."""
+        if self.mainContentStack.currentIndex() == 0:
+            self.duration_changed(duration)
+
+    def _on_video_position_changed(self, position):
+        """Video pozisyonu değişince (Video sekmesi aktifse) ana slider'ı güncelle."""
+        # Main slider update (if video tab active)
+        if self.mainContentStack.currentIndex() == 1: # Video Tab
+            if not self.positionSlider.isSliderDown():
+                self.positionSlider.setValue(position)
+            
+            # Update labels
+            total_duration = self.videoPlayer.duration()
+            if total_duration > 0:
+                current_time = self._format_time(position)
+                self.lblCurrentTime.setText(current_time)
+        
+        # Tam ekran kontrollerini güncelle
+        if getattr(self, '_in_video_fullscreen', False):
+            self._update_fs_controls_state()
+
+        # Video altyazı (overlay) güncelle
+        try:
+            st = getattr(self, '_video_settings_state', {})
+            if isinstance(st, dict) and st.get('subtitles_enabled'):
+                self._update_video_subtitle_overlay(int(position))
+        except Exception:
+            pass
+
+        # Ek açıklamalar (info overlay) güncelle
+        try:
+            st = getattr(self, '_video_settings_state', {})
+            if isinstance(st, dict) and st.get('annotations'):
+                self._update_video_info_overlay()
+        except Exception:
+            pass
+
+    def _on_video_duration_changed(self, duration):
+        """Video süresi değişince."""
+        # Main slider range (if video tab active)
+        if self.mainContentStack.currentIndex() == 1:
+            self.positionSlider.setRange(0, duration)
+            if duration > 0:
+                total_time = self._format_time(duration)
+                self.lblTotalTime.setText(total_time)
+
     def position_changed(self, position):
         if not self.positionSlider.isSliderDown():
             self.positionSlider.setValue(position)
 
         total_duration = self.audio_engine.media_player.duration()
         if total_duration > 0:
-            current_time = QTime(0, 0).addMSecs(position).toString("mm:ss")
-            total_time = QTime(0, 0).addMSecs(total_duration).toString("mm:ss")
+            current_time = self._format_time(position)
+            total_time = self._format_time(total_duration)
             self.lblCurrentTime.setText(current_time)
             self.lblTotalTime.setText(total_time)
 
-            # Auto Crossfade Trigger
-            cf_dur = self.config_data.get("crossfade_duration", 0)
-            if cf_dur > 0 and not getattr(self, "_crossfade_triggered", False):
+            # Auto Crossfade Trigger (yeni sistem)
+            cf_ms = int(getattr(self, "_pb_crossfade_ms", 0) or 0)
+            if bool(getattr(self, "_pb_auto_crossfade_enabled", False)) and cf_ms > 0 and not getattr(self, "_crossfade_triggered", False):
                 remaining = total_duration - position
-                if remaining <= cf_dur and self.audio_engine.media_player.state() == QMediaPlayer.PlayingState:
+                if remaining <= cf_ms and self.audio_engine.media_player.state() == QMediaPlayer.PlayingState:
                     if self.playlist.currentIndex() < self.playlist.mediaCount() - 1 or \
                        self.playlist.playbackMode() in (QMediaPlaylist.Loop, QMediaPlaylist.CurrentItemInLoop):
+                        # Auto-crossfade ile parça bitmeden ileri alındıktan sonra,
+                        # eski parçadan gelebilecek EndOfMedia durumunu bir kez yoksaymak için işaretle.
+                        try:
+                            self._auto_crossfade_guard = (time.monotonic(), int(self.playlist.currentIndex()))
+                        except Exception:
+                            self._auto_crossfade_guard = None
                         self._crossfade_triggered = True
-                        self._next_track()
+                        self._next_track(_reason="auto_crossfade")
 
     def duration_changed(self, duration):
+        # Yeni parça yüklendiğinde auto-crossfade tetikleyicisini yeniden etkinleştir.
+        # (Playlist index değişimi, özellikle gap-free/crossfade sırasında, gerçek oynatma
+        # hemen değişmeyebildiği için burada resetlemek zincirleme atlamayı engeller.)
+        self._crossfade_triggered = False
         self.positionSlider.setRange(0, duration)
         if duration > 0:
-            total_time = QTime(0, 0).addMSecs(duration).toString("mm:ss")
+            total_time = self._format_time(duration)
             self.lblTotalTime.setText(total_time)
         else:
             self.lblCurrentTime.setText("00:00")
@@ -12622,14 +17021,17 @@ class AngollaPlayer(QMainWindow):
 
 
     def _set_position_safely(self):
-        """Slider bırakılınca ilgili konuma git (Web/Local)."""
+        """Slider bırakılınca ilgili konuma git (Web/Local/Video)."""
         val = self.positionSlider.value()
         
         if self.search_mode == "web" and self.webView:
             if self.positionSlider.maximum() > 1000:
                 seconds = val / 1000.0
                 self._web_seek(seconds)
-        else:
+        elif self.mainContentStack.currentIndex() == 1: # Video Tab
+            if hasattr(self, 'videoPlayer'):
+                self.videoPlayer.setPosition(val)
+        else: # Audio Tab
             if self.audio_engine:
                 self.audio_engine.media_player.setPosition(val)
             
@@ -12639,18 +17041,39 @@ class AngollaPlayer(QMainWindow):
         if self.search_mode == "web" and self.web_duration_ms > 0:
             self.lblCurrentTime.setText(self._format_time(val))
             self.lblTotalTime.setText(self._format_time(self.web_duration_ms))
+        elif self.mainContentStack.currentIndex() == 1: # Video Tab
+             self.lblCurrentTime.setText(self._format_time(val))
         else:
             self.lblCurrentTime.setText(self._format_time(val))
             # Keep total as previous or ...
             self.lblTotalTime.setText("...")
 
+    def play_pause(self):
+        """Oynat/Duraklat (Context Aware)."""
+        if self.mainContentStack.currentIndex() == 1: # Video Tab
+            self._video_toggle_play()
+        else: # Audio Tab
+            if self.search_mode == "web":
+                self._web_toggle_play()
+            else:
+                if self.audio_engine.media_player.state() == QMediaPlayer.PlayingState:
+                    self.audio_engine.media_player.pause()
+                else:
+                    self.audio_engine.media_player.play()
+
     def _nudge_position(self, delta_ms: int):
-        """Pozisyonu ileri/geri kaydır (F3/F4)."""
-        if not self.audio_engine or not self.audio_engine.media_player.isSeekable():
-            return
-        new_pos = max(0, self.audio_engine.media_player.position() + delta_ms)
-        self.audio_engine.media_player.setPosition(new_pos)
-        self.positionSlider.setValue(new_pos)
+        """Pozisyonu ileri/geri kaydır (F3/F4) - Context Aware."""
+        if self.mainContentStack.currentIndex() == 1: # Video Tab
+            if hasattr(self, 'videoPlayer') and self.videoPlayer.isSeekable():
+                new_pos = max(0, self.videoPlayer.position() + delta_ms)
+                self.videoPlayer.setPosition(new_pos)
+                self.positionSlider.setValue(new_pos)
+        else: # Audio Tab
+            if not self.audio_engine or not self.audio_engine.media_player.isSeekable():
+                return
+            new_pos = max(0, self.audio_engine.media_player.position() + delta_ms)
+            self.audio_engine.media_player.setPosition(new_pos)
+            self.positionSlider.setValue(new_pos)
 
     def _play_selected_shortcut(self):
         """Enter tuşu ile mevcut seçimden çal/ekle."""
@@ -12803,7 +17226,6 @@ class AngollaPlayer(QMainWindow):
             effect.setOpacity(1.0 if active else 0.7)
 
     def playlist_position_changed(self, index):
-        self._crossfade_triggered = False
         # ═══════════════════════════════════════════════════════════════
         # YEREL MÜZİK: Web monitor yakalamayı durdur
         # ═══════════════════════════════════════════════════════════════
@@ -12842,12 +17264,23 @@ class AngollaPlayer(QMainWindow):
         if 0 <= index < self.playlistWidget.count():
             self.playlistWidget.setCurrentRow(index)
 
-        # Trigger Play in Engine
+        # Trigger Play in Engine (manual/auto crossfade kontrolü)
         if hasattr(self, 'audio_engine'):
-             # Emit signal to engine to load and play
-             # Using the play_file slot in GlobalAudioEngine
-             QTimer.singleShot(0, lambda: self.audio_engine.play_file(self.current_file_path))
-             self.playButton.setIcon(QIcon(os.path.join("icons", "media-playback-pause.png")))
+            reason = getattr(self, "_track_change_reason", None)
+            enable_cf = self._should_crossfade_for_reason(reason)
+            cf_ms = int(getattr(self, "_pb_crossfade_ms", 0) or 0)
+            try:
+                self.audio_engine.set_crossfade_duration(cf_ms if enable_cf else 0)
+            except Exception:
+                pass
+            try:
+                # Manuel geçişlerde (ileri/geri/seçim) "eski parça tekrarlandı" hissini azaltan profil
+                self.audio_engine.set_crossfade_context(reason or "")
+            except Exception:
+                pass
+            self._track_change_reason = None
+            QTimer.singleShot(0, lambda: self.audio_engine.play_file(self.current_file_path))
+            self.playButton.setIcon(QIcon(os.path.join("icons", "media-playback-pause.png")))
 
     def _play_index(self, index):
         count = self.playlist.mediaCount()
@@ -12859,6 +17292,11 @@ class AngollaPlayer(QMainWindow):
             url = media.request().url() if media.isNull() is False else QUrl()
             path = url.toLocalFile()
             if path and hasattr(self, "audio_engine"):
+                try:
+                    # Aynı parçayı yeniden başlatırken crossfade istemiyoruz
+                    self.audio_engine.set_crossfade_duration(0)
+                except Exception:
+                    pass
                 QTimer.singleShot(0, lambda: self.audio_engine.play_file(path))
                 self.playButton.setIcon(QIcon(os.path.join("icons", "media-playback-pause.png")))
             return
@@ -12881,21 +17319,38 @@ class AngollaPlayer(QMainWindow):
                 self._play_index(next_index)
             return
         if status == QMediaPlayer.EndOfMedia:
+            # Auto-crossfade ile parça bitmeden değiştirildiyse, eski parçanın EndOfMedia
+            # bildirimi kısa süre sonra gelip bir kez daha ilerletme yapabilir.
+            # Bunu, yakın zamanda auto-crossfade yapıldıysa ve playlist index'i değiştiyse yoksay.
+            try:
+                guard = getattr(self, "_auto_crossfade_guard", None)
+                if isinstance(guard, tuple) and len(guard) == 2:
+                    t0, from_idx = guard
+                    cf_ms = int(getattr(self, "_pb_crossfade_ms", 0) or 0)
+                    window_s = max(2.0, (cf_ms / 1000.0) + 1.0)
+                    if (time.monotonic() - float(t0)) <= window_s and int(self.playlist.currentIndex()) != int(from_idx):
+                        self._auto_crossfade_guard = None
+                        return
+            except Exception:
+                pass
             count = self.playlist.mediaCount()
             if count <= 0:
                 return
             current = self.playlist.currentIndex()
             if self.is_repeating:
+                self._set_next_track_change_reason("auto_end")
                 self._play_index(current)
                 return
             if self.is_shuffling and count > 1:
                 next_index = current
                 while next_index == current:
                     next_index = random.randint(0, count - 1)
+                self._set_next_track_change_reason("auto_end")
                 self._play_index(next_index)
                 return
 
             next_index = (current + 1) % count
+            self._set_next_track_change_reason("auto_end")
             self._play_index(next_index)
     # Obsolete offline DSP logic removed.
     # DSP is now handled in real-time by the thread-isolated GlobalAudioEngine.
@@ -13223,8 +17678,11 @@ class AngollaPlayer(QMainWindow):
             self.file_tree.setRootIndex(index)
         else:
             self._add_files_to_playlist([path])
-            self.playlist.setCurrentIndex(self.playlist.mediaCount() - 1)
-            self.mediaPlayer.play()
+            try:
+                self._set_next_track_change_reason("manual_select")
+            except Exception:
+                pass
+            self._play_index(self.playlist.mediaCount() - 1)
 
     def _go_up_directory(self):
         current_index = self.file_tree.rootIndex()
@@ -13683,6 +18141,57 @@ class AngollaPlayer(QMainWindow):
             print(traceback.format_exc())
             QMessageBox.critical(self, "Hata", f"İndirme başlatılamadı:\n{e}")
     
+    def _toggle_miniplayer_mode(self):
+        """Normal mode ve Miniplayer modu arasında geçiş yap."""
+        if getattr(self, '_in_miniplayer_mode', False):
+            # Exit Miniplayer
+            self._in_miniplayer_mode = False
+            self.setWindowFlags(Qt.Window) # Reset flags
+            self.show()
+            
+            # Restore UI elements
+            if hasattr(self, 'side_panel'): self.side_panel.show()
+            if hasattr(self, 'fileLabel'): self.fileLabel.show()
+            if hasattr(self, 'menuBar'): self.menuBar().setVisible(True)
+            if hasattr(self, 'toolbar'): self.toolbar.setVisible(True)
+            if hasattr(self, 'bottom_widget'): self.bottom_widget.show() # Show regular bottom bar
+            
+            # Resize back to reasonable size if too small
+            if self.width() < 800:
+                self.resize(1000, 700)
+                
+            # If we were in video page, ensure video output is corrected
+            if self.mainContentStack.currentWidget() == self.video_container:
+                 self.video_output_widget.set_scale_mode(self.video_output_widget.scale_mode)
+
+        else:
+            # Enter Miniplayer
+            # Only allow if in Video Page
+            if self.mainContentStack.currentWidget() != self.video_container:
+                # Switch to video page if video is loaded, else maybe ignore?
+                # User specifically asked for this for video.
+                self.mainContentStack.setCurrentWidget(self.video_container)
+
+            self._in_miniplayer_mode = True
+            
+            # Hide surrounding UI to just show video
+            if hasattr(self, 'side_panel'): self.side_panel.hide()
+            if hasattr(self, 'fileLabel'): self.fileLabel.hide()
+            if hasattr(self, 'menuBar'): self.menuBar().setVisible(False)
+            if hasattr(self, 'toolbar'): self.toolbar.setVisible(False)
+            if hasattr(self, 'bottom_widget'): self.bottom_widget.hide() # Hide bottom bar, use HUD
+            
+            # Set Always on Top and frameless/compact
+            self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowTitleHint | Qt.WindowStaysOnTopHint)
+            self.show()
+            
+            # Resize to small size
+            self.resize(480, 270)
+            
+            # Ensure layout is tight
+            if hasattr(self, 'centralWidget') and self.centralWidget():
+                self.centralWidget().layout().setContentsMargins(0, 0, 0, 0)
+
     def _start_download(self, url, fmt, output_folder):
         """İndirme işlemini başlat."""
         print(f"🚀 _start_download çağrıldı:")
@@ -13889,6 +18398,14 @@ class AngollaPlayer(QMainWindow):
                     window.__angollaSetMuteWebAudio({mval});
                 }} else {{
                     window.__angollaMuteWebAudio = {mval};
+
+            elif mode == 'web':
+                # Web modunda görselleştirme ana widget üzerinden çalışır
+                try:
+                    if hasattr(self, 'bottom_vis_stack') and self.bottom_vis_stack:
+                        self.bottom_vis_stack.setCurrentIndex(0)
+                except Exception:
+                    pass
                     if (window.__angollaOutputGain) {{
                         window.__angollaOutputGain.gain.value = {0.0 if muted else 1.0};
                     }}
@@ -14019,12 +18536,19 @@ class AngollaPlayer(QMainWindow):
             self.webView.page().runJavaScript(js)
 
     def _format_time(self, ms):
-        """Milisaniyeyi 'mm:ss' formatına çevirir."""
-        # 3600000ms = 1 saat. Eğer 1 saatten uzunsa H:mm:ss, değilse mm:ss
-        if ms < 0: ms = 0
-        if ms >= 3600000:
-             return QTime(0, 0).addMSecs(int(ms)).toString("H:mm:ss")
-        return QTime(0, 0).addMSecs(int(ms)).toString("mm:ss")
+        """Milisaniyeyi 'mm:ss' veya 'H:mm:ss' formatına çevirir."""
+        try:
+            total_seconds = max(0, int(ms) // 1000)
+        except Exception:
+            total_seconds = 0
+
+        h = total_seconds // 3600
+        m = (total_seconds % 3600) // 60
+        s = total_seconds % 60
+
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
     def _poll_web_status(self):
         """Web sayfasındaki medya durumunu (süre, pozisyon) sorgula."""
@@ -14304,8 +18828,11 @@ class AngollaPlayer(QMainWindow):
         return
 
     def playlist_double_clicked(self, index):
-        self.playlist.setCurrentIndex(index.row())
-        self.mediaPlayer.play()
+        try:
+            self._set_next_track_change_reason("manual_select")
+        except Exception:
+            pass
+        self._play_index(index.row())
 
     def library_double_clicked(self, index: QModelIndex):
         row = index.row()
@@ -14313,12 +18840,18 @@ class AngollaPlayer(QMainWindow):
         if path:
             for i in range(self.playlistWidget.count()):
                 if self.playlistWidget.item(i).data(Qt.UserRole) == path:
-                    self.playlist.setCurrentIndex(i)
-                    self.mediaPlayer.play()
+                    try:
+                        self._set_next_track_change_reason("manual_select")
+                    except Exception:
+                        pass
+                    self._play_index(i)
                     return
             self._add_media(path, add_to_library=False)
-            self.playlist.setCurrentIndex(self.playlist.mediaCount() - 1)
-            self.mediaPlayer.play()
+            try:
+                self._set_next_track_change_reason("manual_select")
+            except Exception:
+                pass
+            self._play_index(self.playlist.mediaCount() - 1)
 
     # --------------------------------------------------------------
     #  TERCIHLER PENCERESINI AÇ
@@ -14525,6 +19058,41 @@ class AngollaPlayer(QMainWindow):
         # Temel renkleri al
         primary_color, default_text, default_bg = self.themes[name]
         
+        # Stil oluştur (Modular)
+        style = self._get_theme_stylesheet(mode, primary_color, default_text, default_bg)
+        
+        # Tüm uygulamaya uygula (Global)
+        self.setStyleSheet(style)
+        # QApplication.instance().setStyleSheet(style) # Bazen çakışma yapabilir, self tercih edilir
+
+        # Altbar gradient ve transparan arka planını tema rengine göre güncelle
+        if hasattr(self, 'bottom_widget') and self.bottom_widget:
+            # Tema rengi için gradient oluştur
+            primary_rgb = QColor(primary_color)
+            bg_rgb = QColor(default_bg)
+            
+            # Gradient için renk geçişi hesapla (koyu/açık tema uyumlu)
+            if mode == "Koyu":  # Koyu tema
+                grad_start = f"rgba({bg_rgb.red()}, {bg_rgb.green()}, {bg_rgb.blue()}, 240)"
+                grad_end = f"rgba({max(0, bg_rgb.red()-20)}, {max(0, bg_rgb.green()-20)}, {max(0, bg_rgb.blue()-20)}, 250)"
+                border_col_rgba = f"rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 180)"
+            else:  # Açık tema
+                grad_start = f"rgba(255, 255, 255, 240)"
+                grad_end = f"rgba(240, 240, 240, 250)"
+                border_col_rgba = f"rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 100)"
+            
+            self.bottom_widget.setStyleSheet(f"""
+                QWidget#bottomWidget {{
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 {grad_start},
+                        stop:1 {grad_end});
+                    border-top: 2px solid {border_col_rgba};
+                    border-radius: 0px;
+                }}
+            """)
+
+    def _get_theme_stylesheet(self, mode, primary_color, default_text, default_bg):
+        """Generates the QSS stylesheet based on theme mode and colors."""
         if mode == "Açık":
             # Açık Tema Renkleri
             bg_color = "#F5F5F5"
@@ -14560,7 +19128,7 @@ class AngollaPlayer(QMainWindow):
             btn_pressed = QColor(primary_color).darker(200).name()
             selected_text_color = "black"
 
-        style = f"""
+        return f"""
         QMainWindow, QWidget, QDialog {{
             background-color: {bg_color};
             color: {text_color};
@@ -14627,34 +19195,6 @@ class AngollaPlayer(QMainWindow):
             color: {selected_text_color};
         }}
         """
-
-        QApplication.instance().setStyleSheet(style)
-
-        # Altbar gradient ve transparan arka planını tema rengine göre güncelle
-        if hasattr(self, 'bottom_widget') and self.bottom_widget:
-            # Tema rengi için gradient oluştur
-            primary_rgb = QColor(primary_color)
-            bg_rgb = QColor(bg_color)
-            
-            # Gradient için renk geçişi hesapla (koyu/açık tema uyumlu)
-            if mode == "Koyu":  # Koyu tema
-                grad_start = f"rgba({bg_rgb.red()}, {bg_rgb.green()}, {bg_rgb.blue()}, 240)"
-                grad_end = f"rgba({max(0, bg_rgb.red()-20)}, {max(0, bg_rgb.green()-20)}, {max(0, bg_rgb.blue()-20)}, 250)"
-                border_col_rgba = f"rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 180)"
-            else:  # Açık tema
-                grad_start = f"rgba(255, 255, 255, 240)"
-                grad_end = f"rgba(240, 240, 240, 250)"
-                border_col_rgba = f"rgba({primary_rgb.red()}, {primary_rgb.green()}, {primary_rgb.blue()}, 100)"
-            
-            self.bottom_widget.setStyleSheet(f"""
-                QWidget#bottomWidget {{
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 {grad_start},
-                        stop:1 {grad_end});
-                    border-top: 2px solid {border_col_rgba};
-                    border-radius: 0px;
-                }}
-            """)
         
         # Butonları tema rengine göre güncelle
         if hasattr(self, 'prevButton'):
@@ -14797,8 +19337,6 @@ class AngollaPlayer(QMainWindow):
         self.config_data["repeat_mode"] = self.is_repeating
         self.config_data["theme"] = self.theme
         self.config_data["show_album_art"] = self.infoDisplayWidget._album_art_visible
-        self.config_data["crossfade_duration"] = \
-            self.config_data.get("crossfade_duration", 1000)
         self.config_data["vis_mode"] = self.vis_mode
         self.config_data["use_projectm"] = self.use_projectm
         self.config_data["vis_favorites"] = self.vis_favorites
@@ -14882,11 +19420,13 @@ class AngollaPlayer(QMainWindow):
 
         self.vis_mode = self.config_data.get("vis_mode", "Çizgiler")
         self.use_projectm = self.config_data.get("use_projectm", False)
-        
-        # Crossfade
-        cf_dur = self.config_data.get("crossfade_duration", 1000)
-        if hasattr(self, 'audio_engine'):
-            self.audio_engine.set_crossfade_duration(cf_dur)
+
+        # Playback: Yumuşak Geçiş (Clementine benzeri)
+        try:
+            pb = self._get_playback_soft_transition_settings_from_config()
+            self.apply_playback_soft_transition_settings(pb, preview=False)
+        except Exception:
+            pass
         
         # Playback rate'i yükle
         saved_rate = self.config_data.get("playback_rate", 1.0)
@@ -14897,6 +19437,66 @@ class AngollaPlayer(QMainWindow):
         except Exception:
             self._current_playback_rate = 1.0
         self.lang = self.config_data.get("lang", self.lang)
+
+    def _get_playback_soft_transition_settings_from_config(self) -> Dict[str, Any]:
+        """Config'ten playback fade/crossfade ayarlarını okur (gerekirse migrate eder)."""
+        pb = self.config_data.get("playback_soft_transitions")
+        if isinstance(pb, dict):
+            out = {
+                "stop_fade_enabled": bool(pb.get("stop_fade_enabled", False)),
+                "manual_crossfade_enabled": bool(pb.get("manual_crossfade_enabled", False)),
+                "auto_crossfade_enabled": bool(pb.get("auto_crossfade_enabled", False)),
+                "fade_out_on_pause": bool(pb.get("fade_out_on_pause", False)),
+                "fade_in_on_resume": bool(pb.get("fade_in_on_resume", False)),
+                "crossfade_ms": int(pb.get("crossfade_ms", 1000) or 0),
+                "fade_ms": int(pb.get("fade_ms", 400) or 0),
+            }
+            return out
+
+        # Geriye dönük migrate: eski crossfade_duration slider'ı
+        old_cf = self.config_data.get("crossfade_duration")
+        try:
+            old_cf = int(old_cf)
+        except Exception:
+            old_cf = 0
+
+        enabled = bool(old_cf > 0)
+        return {
+            "stop_fade_enabled": False,
+            "manual_crossfade_enabled": enabled,
+            "auto_crossfade_enabled": enabled,
+            "fade_out_on_pause": False,
+            "fade_in_on_resume": False,
+            "crossfade_ms": int(old_cf) if old_cf > 0 else 1000,
+            "fade_ms": 400,
+        }
+
+    def apply_playback_soft_transition_settings(self, settings: Dict[str, Any], preview: bool = True):
+        """Ayarları anında uygular. preview=True ise sadece runtime etkiler, config yazmaz."""
+        if not isinstance(settings, dict):
+            return
+
+        self._pb_stop_fade_enabled = bool(settings.get("stop_fade_enabled", False))
+        self._pb_manual_crossfade_enabled = bool(settings.get("manual_crossfade_enabled", False))
+        self._pb_auto_crossfade_enabled = bool(settings.get("auto_crossfade_enabled", False))
+        self._pb_fade_out_on_pause = bool(settings.get("fade_out_on_pause", False))
+        self._pb_fade_in_on_resume = bool(settings.get("fade_in_on_resume", False))
+        self._pb_crossfade_ms = max(0, int(settings.get("crossfade_ms", 1000) or 0))
+        self._pb_fade_ms = max(0, int(settings.get("fade_ms", 400) or 0))
+
+        # Engine: transport fade ayarları (sadece müzik)
+        try:
+            if getattr(self, "audio_engine", None):
+                self.audio_engine.configure_transport_fades(
+                    fade_ms=self._pb_fade_ms,
+                    stop_fade_enabled=self._pb_stop_fade_enabled,
+                    fade_out_on_pause=self._pb_fade_out_on_pause,
+                    fade_in_on_resume=self._pb_fade_in_on_resume,
+                )
+                # Crossfade'i sürekli açık bırakma: sadece parça geçişi anında aktive edeceğiz.
+                self.audio_engine.set_crossfade_duration(0)
+        except Exception:
+            pass
 
         # Çubuk rengi ve stili yükle (Eski AnimatedVisualizationWidget için)
         bar_color = self.config_data.get("bar_color")
@@ -15053,10 +19653,75 @@ class PreferencesDialog(QDialog):
         self.setWindowTitle("Angolla Ayarları")
         self.parent = parent
         self.setFixedSize(900, 650)
+        self._preview_dirty = False
+        self._original_playback_preview = {}
+        try:
+            self._original_playback_preview = self.parent._get_playback_soft_transition_settings_from_config()
+        except Exception:
+            self._original_playback_preview = {}
         self._create_category_list()
         self._create_widgets()
         self._layout_widgets()
         self._connect_signals()
+
+    def _reset_playback_soft_transitions_to_defaults(self):
+        """Oynatma/Yumuşak Geçiş ayarlarını varsayılanlara döndürür (anında preview)."""
+        try:
+            widgets = [
+                getattr(self, "currentTrackGlowCheck", None),
+                getattr(self, "softStopCheck", None),
+                getattr(self, "manualCrossfadeCheck", None),
+                getattr(self, "autoCrossfadeCheck", None),
+                getattr(self, "fadeOutOnPauseCheck", None),
+                getattr(self, "fadeInOnResumeCheck", None),
+                getattr(self, "crossfadeMsSpin", None),
+                getattr(self, "fadeMsSpin", None),
+            ]
+            for w in widgets:
+                if w is not None:
+                    try:
+                        w.blockSignals(True)
+                    except Exception:
+                        pass
+
+            # Varsayılanlar: Akıcı oynatma (yumuşak geçiş + çapraz geçiş açık)
+            self.currentTrackGlowCheck.setChecked(True)
+            self.softStopCheck.setChecked(True)
+            self.manualCrossfadeCheck.setChecked(True)
+            self.autoCrossfadeCheck.setChecked(True)
+            # Pause/Resume fade kullanıcı tercihine daha bağlı; varsayılanda kapalı tut
+            self.fadeOutOnPauseCheck.setChecked(False)
+            self.fadeInOnResumeCheck.setChecked(False)
+            # Süreler: hızlı ama hissedilir geçiş
+            self.crossfadeMsSpin.setValue(2000)
+            self.fadeMsSpin.setValue(400)
+        except Exception:
+            pass
+        finally:
+            try:
+                for w in (
+                    getattr(self, "currentTrackGlowCheck", None),
+                    getattr(self, "softStopCheck", None),
+                    getattr(self, "manualCrossfadeCheck", None),
+                    getattr(self, "autoCrossfadeCheck", None),
+                    getattr(self, "fadeOutOnPauseCheck", None),
+                    getattr(self, "fadeInOnResumeCheck", None),
+                    getattr(self, "crossfadeMsSpin", None),
+                    getattr(self, "fadeMsSpin", None),
+                ):
+                    if w is not None:
+                        try:
+                            w.blockSignals(False)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # Tek seferde preview uygula
+        try:
+            self._preview_playback_soft_transitions()
+        except Exception:
+            pass
 
     def _get_icon(self, name: str) -> QIcon:
         icon_path = os.path.join(os.path.dirname(__file__), "icons", name)
@@ -15133,7 +19798,61 @@ class PreferencesDialog(QDialog):
         self.shareLabel = QLabel("Paylaşım Seçeneği:")
         self.shareButton = QPushButton("Şarkıyı Paylaş (Simülasyon)")
 
-        # Oynatma
+        # Oynatma (Clementine benzeri)
+        self.currentTrackGlowCheck = QCheckBox("Mevcut parçada parlayan bir animasyon göster")
+        self.currentTrackGlowCheck.setChecked(bool(self.parent.config_data.get("playback_current_track_glow", True)))
+
+        pb = {}
+        try:
+            pb = self.parent._get_playback_soft_transition_settings_from_config()
+        except Exception:
+            pb = {}
+
+        self.softStopCheck = QCheckBox("Bir parça durdurulurken yumuşak geç")
+        self.softStopCheck.setChecked(bool(pb.get("stop_fade_enabled", False)))
+
+        self.manualCrossfadeCheck = QCheckBox("Parça değiştirirken elle çapraz geçiş yap")
+        self.manualCrossfadeCheck.setChecked(bool(pb.get("manual_crossfade_enabled", False)))
+
+        self.autoCrossfadeCheck = QCheckBox("Parça değiştirirken otomatik olarak çapraz geçiş yap")
+        self.autoCrossfadeCheck.setChecked(bool(pb.get("auto_crossfade_enabled", False)))
+
+        self.fadeOutOnPauseCheck = QCheckBox("Duraklatırken yumuşakça ses azalt (fade out)")
+        self.fadeOutOnPauseCheck.setChecked(bool(pb.get("fade_out_on_pause", False)))
+
+        self.fadeInOnResumeCheck = QCheckBox("Devam ettirirken yumuşakça ses artır (fade in)")
+        self.fadeInOnResumeCheck.setChecked(bool(pb.get("fade_in_on_resume", False)))
+
+        self.crossfadeMsLabel = QLabel("Çapraz geçiş süresi (ms):")
+        self.crossfadeMsSpin = QSpinBox()
+        self.crossfadeMsSpin.setRange(0, 10000)
+        self.crossfadeMsSpin.setSingleStep(100)
+        self.crossfadeMsSpin.setValue(int(pb.get("crossfade_ms", 2000)))
+
+        self.fadeMsLabel = QLabel("Yumuşak geçiş süresi (ms):")
+        self.fadeMsSpin = QSpinBox()
+        self.fadeMsSpin.setRange(0, 5000)
+        self.fadeMsSpin.setSingleStep(100)
+        self.fadeMsSpin.setValue(int(pb.get("fade_ms", 400)))
+
+        self.softTransitionGroup = QGroupBox("Yumuşak Geçiş")
+        self.playbackDefaultsButton = QPushButton("Varsayılan Ayarlar")
+        g = QGridLayout(self.softTransitionGroup)
+        g.setColumnStretch(0, 1)
+        row = 0
+        g.addWidget(self.softStopCheck, row, 0, 1, 2); row += 1
+        g.addWidget(self.manualCrossfadeCheck, row, 0, 1, 2); row += 1
+        g.addWidget(self.autoCrossfadeCheck, row, 0, 1, 2); row += 1
+        g.addWidget(self.fadeOutOnPauseCheck, row, 0, 1, 2); row += 1
+        g.addWidget(self.fadeInOnResumeCheck, row, 0, 1, 2); row += 1
+        g.addWidget(self.crossfadeMsLabel, row, 0)
+        g.addWidget(self.crossfadeMsSpin, row, 1); row += 1
+        g.addWidget(self.fadeMsLabel, row, 0)
+        g.addWidget(self.fadeMsSpin, row, 1); row += 1
+        g.addWidget(self.playbackDefaultsButton, row, 0, 1, 2); row += 1
+        g.setRowStretch(row, 1)
+
+        # Görselleştirme ayarları (Playback sayfasından taşındı)
         self.visModeLabel = QLabel("Görselleştirme Modu:")
         self.visModeCombo = QComboBox(); self.visModeCombo.addItems([
             "Çubuklar", "Çizgiler", "Daireler", "Spektrum Çubukları",
@@ -15143,22 +19862,17 @@ class PreferencesDialog(QDialog):
             "Pulsar", "Spiral", "Volcano", "Energy Ring", "Circular Waveform", "3D Swirl", "Pulse Explosion", "Tunnel Mode"
         ])
         current_mode = self.parent.config_data.get("vis_mode", "bars")
-        # normalize gösterim
-        if current_mode == "bars": current_mode = "Çubuklar"
-        elif current_mode == "lines": current_mode = "Çizgiler"
+        if current_mode == "bars":
+            current_mode = "Çubuklar"
+        elif current_mode == "lines":
+            current_mode = "Çizgiler"
         self.visModeCombo.setCurrentText(current_mode)
 
-        # ProjectM seçeneği
         self.projectmCheck = QCheckBox("✨ ProjectM Görselleştirme Kullan (100+ MilkDrop Preset)")
         self.projectmCheck.setChecked(self.parent.config_data.get("use_projectm", False))
         if not HAS_PROJECTM:
             self.projectmCheck.setEnabled(False)
             self.projectmCheck.setToolTip("ProjectM yüklenmedi - viz_engine modülü gerekli")
-
-        self.crossfadeLabel = QLabel("Crossfade Süresi (ms):")
-        self.crossfadeSlider = QSlider(Qt.Horizontal); self.crossfadeSlider.setRange(0, 10000); self.crossfadeSlider.setSingleStep(100)
-        self.crossfadeSlider.setValue(self.parent.config_data.get("crossfade_duration", 1000))
-        self.crossfadeValueLabel = QLabel(f"{self.crossfadeSlider.value()} ms")
 
         # Görselleştirme Config
         self.visConfigLabel = QLabel("🎆 Görselleştirme Yapılandırması:"); self.visConfigLabel.setStyleSheet("font-weight: bold;")
@@ -15190,23 +19904,23 @@ class PreferencesDialog(QDialog):
     def _create_playback_page(self):
         widget = QWidget(); layout = QGridLayout(widget); layout.setColumnStretch(1, 1)
         row = 0
-        layout.addWidget(self.visModeLabel, row, 0); layout.addWidget(self.visModeCombo, row, 1); row += 1
-        layout.addWidget(self.projectmCheck, row, 0, 1, 2); row += 1
-        layout.addWidget(self.crossfadeLabel, row, 0)
-        h_cf = QHBoxLayout(); h_cf.addWidget(self.crossfadeSlider); h_cf.addWidget(self.crossfadeValueLabel); layout.addLayout(h_cf, row, 1); row += 1
+        layout.addWidget(self.currentTrackGlowCheck, row, 0, 1, 2); row += 1
+        layout.addWidget(self.softTransitionGroup, row, 0, 1, 2); row += 1
         layout.setRowStretch(row, 1)
         return widget
 
     def _create_visualization_page(self):
         widget = QWidget(); layout = QGridLayout(widget); layout.setColumnStretch(1, 1)
-        layout.addWidget(self.visConfigLabel, 0, 0, 1, 2)
-        layout.addWidget(self.sensitivityLabel, 1, 0)
-        h_sens = QHBoxLayout(); h_sens.addWidget(self.sensitivitySlider); h_sens.addWidget(self.sensitivityValueLabel); layout.addLayout(h_sens, 1, 1)
-        layout.addWidget(self.colorLabel, 2, 0)
-        h_color = QHBoxLayout(); h_color.addWidget(self.colorSlider); h_color.addWidget(self.colorValueLabel); layout.addLayout(h_color, 2, 1)
-        layout.addWidget(self.densityLabel, 3, 0)
-        h_den = QHBoxLayout(); h_den.addWidget(self.densitySlider); h_den.addWidget(self.densityValueLabel); layout.addLayout(h_den, 3, 1)
-        layout.setRowStretch(4, 1)
+        layout.addWidget(self.visModeLabel, 0, 0); layout.addWidget(self.visModeCombo, 0, 1)
+        layout.addWidget(self.projectmCheck, 1, 0, 1, 2)
+        layout.addWidget(self.visConfigLabel, 2, 0, 1, 2)
+        layout.addWidget(self.sensitivityLabel, 3, 0)
+        h_sens = QHBoxLayout(); h_sens.addWidget(self.sensitivitySlider); h_sens.addWidget(self.sensitivityValueLabel); layout.addLayout(h_sens, 3, 1)
+        layout.addWidget(self.colorLabel, 4, 0)
+        h_color = QHBoxLayout(); h_color.addWidget(self.colorSlider); h_color.addWidget(self.colorValueLabel); layout.addLayout(h_color, 4, 1)
+        layout.addWidget(self.densityLabel, 5, 0)
+        h_den = QHBoxLayout(); h_den.addWidget(self.densitySlider); h_den.addWidget(self.densityValueLabel); layout.addLayout(h_den, 5, 1)
+        layout.setRowStretch(6, 1)
         return widget
 
     def _create_shortcuts_page(self):
@@ -15274,15 +19988,40 @@ class PreferencesDialog(QDialog):
         self.themeModeCombo.currentTextChanged.connect(self._on_value_changed)
         self.themeCombo.currentTextChanged.connect(self._on_value_changed)
         self.langCombo.currentIndexChanged.connect(self._on_value_changed)
-        self.crossfadeSlider.valueChanged.connect(self._update_crossfade_label)
-        self.crossfadeSlider.sliderReleased.connect(self._on_value_changed)
         self.visModeCombo.currentTextChanged.connect(self._on_value_changed)
         self.projectmCheck.stateChanged.connect(self._on_value_changed)
         self.shareButton.clicked.connect(self._share_clicked)
         self.sensitivitySlider.valueChanged.connect(self._update_sensitivity_label); self.sensitivitySlider.sliderReleased.connect(self._on_value_changed)
         self.colorSlider.valueChanged.connect(self._update_color_label); self.colorSlider.sliderReleased.connect(self._on_value_changed)
         self.densitySlider.valueChanged.connect(self._update_density_label); self.densitySlider.sliderReleased.connect(self._on_value_changed)
-        self.okButton.clicked.connect(self._on_ok); self.applyButton.clicked.connect(self._on_apply); self.cancelButton.clicked.connect(self.reject)
+        # Playback soft transition preview (anında etki)
+        for w in (
+            self.currentTrackGlowCheck,
+            self.softStopCheck,
+            self.manualCrossfadeCheck,
+            self.autoCrossfadeCheck,
+            self.fadeOutOnPauseCheck,
+            self.fadeInOnResumeCheck,
+        ):
+            try:
+                w.stateChanged.connect(self._preview_playback_soft_transitions)
+            except Exception:
+                pass
+        try:
+            self.crossfadeMsSpin.valueChanged.connect(self._preview_playback_soft_transitions)
+        except Exception:
+            pass
+        try:
+            self.fadeMsSpin.valueChanged.connect(self._preview_playback_soft_transitions)
+        except Exception:
+            pass
+
+        try:
+            self.playbackDefaultsButton.clicked.connect(self._reset_playback_soft_transitions_to_defaults)
+        except Exception:
+            pass
+
+        self.okButton.clicked.connect(self._on_ok); self.applyButton.clicked.connect(self._on_apply); self.cancelButton.clicked.connect(self._on_cancel)
 
     def _on_category_selected(self, item):
         if item.text() in self.category_map:
@@ -15297,8 +20036,14 @@ class PreferencesDialog(QDialog):
     def _on_apply(self):
         self._apply_settings()
 
-    def _update_crossfade_label(self, value):
-        self.crossfadeValueLabel.setText(f"{value} ms")
+    def _on_cancel(self):
+        # Preview uygulanmışsa geri al
+        try:
+            if self._preview_dirty:
+                self.parent.apply_playback_soft_transition_settings(self._original_playback_preview, preview=True)
+        except Exception:
+            pass
+        self.reject()
 
     def _update_sensitivity_label(self, value):
         self.sensitivityValueLabel.setText(f"{value}%")
@@ -15311,10 +20056,27 @@ class PreferencesDialog(QDialog):
 
     def _apply_settings(self):
         self.parent.config_data["show_album_art"] = self.albumArtCheck.isChecked()
-        cf_val = self.crossfadeSlider.value()
-        self.parent.config_data["crossfade_duration"] = cf_val
-        if hasattr(self.parent, 'audio_engine'):
-            self.parent.audio_engine.set_crossfade_duration(cf_val)
+        # Eski ayar (deprecated): artık kullanılmıyor
+        try:
+            self.parent.config_data.pop("crossfade_duration", None)
+        except Exception:
+            pass
+        # Playback soft transition ayarlarını kaydet
+        self.parent.config_data["playback_current_track_glow"] = bool(self.currentTrackGlowCheck.isChecked())
+        pb_settings = {
+            "stop_fade_enabled": bool(self.softStopCheck.isChecked()),
+            "manual_crossfade_enabled": bool(self.manualCrossfadeCheck.isChecked()),
+            "auto_crossfade_enabled": bool(self.autoCrossfadeCheck.isChecked()),
+            "fade_out_on_pause": bool(self.fadeOutOnPauseCheck.isChecked()),
+            "fade_in_on_resume": bool(self.fadeInOnResumeCheck.isChecked()),
+            "crossfade_ms": int(self.crossfadeMsSpin.value()),
+            "fade_ms": int(self.fadeMsSpin.value()),
+        }
+        self.parent.config_data["playback_soft_transitions"] = pb_settings
+        try:
+            self.parent.apply_playback_soft_transition_settings(pb_settings, preview=False)
+        except Exception:
+            pass
         
         # ProjectM ayarı
         use_projectm = self.projectmCheck.isChecked()
@@ -15381,6 +20143,23 @@ class PreferencesDialog(QDialog):
         except Exception:
             pass
         self.parent.save_config()
+
+    def _preview_playback_soft_transitions(self, *_args):
+        """Ayarlar uygulanmadan önce (Apply/OK) anlık önizleme uygular."""
+        try:
+            pb_settings = {
+                "stop_fade_enabled": bool(self.softStopCheck.isChecked()),
+                "manual_crossfade_enabled": bool(self.manualCrossfadeCheck.isChecked()),
+                "auto_crossfade_enabled": bool(self.autoCrossfadeCheck.isChecked()),
+                "fade_out_on_pause": bool(self.fadeOutOnPauseCheck.isChecked()),
+                "fade_in_on_resume": bool(self.fadeInOnResumeCheck.isChecked()),
+                "crossfade_ms": int(self.crossfadeMsSpin.value()),
+                "fade_ms": int(self.fadeMsSpin.value()),
+            }
+            self.parent.apply_playback_soft_transition_settings(pb_settings, preview=True)
+            self._preview_dirty = True
+        except Exception:
+            pass
 
     def _share_clicked(self):
         current_file = self.parent.current_file_path
