@@ -12571,28 +12571,69 @@ class AngollaPlayer(QMainWindow):
                 self.video_path = video_path
                 
             def run(self):
+                wav_path = None
                 try:
                     # 1. Video'dan ses çıkar (WAV)
                     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
                         wav_path = tmp_wav.name
                     
                     try:
-                        subprocess.run([
+                        result_ffmpeg = subprocess.run([
                             'ffmpeg', '-i', self.video_path,
                             '-vn', '-acodec', 'pcm_s16le',
                             '-ar', '16000', '-ac', '1',
                             '-y', wav_path
-                        ], check=True, capture_output=True)
+                        ], check=True, capture_output=True, text=True)
+                    except subprocess.CalledProcessError as e:
+                        if wav_path and os.path.exists(wav_path):
+                            os.unlink(wav_path)
+                        self.finished_signal.emit('', f'Ses çıkarma hatası: Video dosyasında ses bulunamadı veya codec hatası.\n\nFFmpeg: {e.stderr[:200]}')
+                        return
                     except Exception as e:
+                        if wav_path and os.path.exists(wav_path):
+                            os.unlink(wav_path)
                         self.finished_signal.emit('', f'Ses çıkarma hatası: {e}')
                         return
                     
-                    # 2. Whisper ile transkripsiyon
+                    # Ses dosyası boyut kontrolü (çok küçükse sessiz video)
+                    if wav_path and os.path.exists(wav_path):
+                        if os.path.getsize(wav_path) < 1024:  # 1KB'den küçük
+                            os.unlink(wav_path)
+                            self.finished_signal.emit('', 'Video sessiz veya çok kısa. Transkripsiyon yapılamıyor.')
+                            return
+                    
+                    # 2. Whisper ile transkripsiyon (CPU fallback ile)
                     try:
-                        model = whisper.load_model('small')
-                        result = model.transcribe(wav_path, language='tr', task='transcribe')
+                        # İlk CUDA ile dene, başarısız olursa CPU
+                        import torch
+                        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                        
+                        model = whisper.load_model('small', device=device)
+                        result = model.transcribe(
+                            wav_path, 
+                            language='tr', 
+                            task='transcribe',
+                            fp16=False  # NaN hatalarını önlemek için FP16 kapalı
+                        )
+                    except RuntimeError as e:
+                        # CUDA hatası - CPU ile tekrar dene
+                        if 'cuda' in str(e).lower() or 'nan' in str(e).lower():
+                            try:
+                                model = whisper.load_model('small', device='cpu')
+                                result = model.transcribe(wav_path, language='tr', task='transcribe', fp16=False)
+                            except Exception as e2:
+                                if wav_path and os.path.exists(wav_path):
+                                    os.unlink(wav_path)
+                                self.finished_signal.emit('', f'Whisper CPU hatası: {e2}')
+                                return
+                        else:
+                            if wav_path and os.path.exists(wav_path):
+                                os.unlink(wav_path)
+                            self.finished_signal.emit('', f'Whisper hatası: {e}')
+                            return
                     except Exception as e:
-                        os.unlink(wav_path)
+                        if wav_path and os.path.exists(wav_path):
+                            os.unlink(wav_path)
                         self.finished_signal.emit('', f'Whisper hatası: {e}')
                         return
                     
@@ -12601,6 +12642,13 @@ class AngollaPlayer(QMainWindow):
                     video_base = os.path.splitext(os.path.basename(self.video_path))[0]
                     subtitle_path = os.path.join(video_dir, f'{video_base}.whisper.vtt')
                     
+                    # Sonuç boş mu kontrol et
+                    if not result.get('segments'):
+                        if wav_path and os.path.exists(wav_path):
+                            os.unlink(wav_path)
+                        self.finished_signal.emit('', 'Whisper hiçbir metin bulamadı. Video sessiz veya anlaşılmaz olabilir.')
+                        return
+                    
                     try:
                         with open(subtitle_path, 'w', encoding='utf-8') as f:
                             f.write('WEBVTT\n\n')
@@ -12608,21 +12656,30 @@ class AngollaPlayer(QMainWindow):
                                 start_time = self._format_vtt_time(segment['start'])
                                 end_time = self._format_vtt_time(segment['end'])
                                 text = segment['text'].strip()
-                                f.write(f'{start_time} --> {end_time}\n{text}\n\n')
+                                if text:  # Boş metinleri atla
+                                    f.write(f'{start_time} --> {end_time}\n{text}\n\n')
                     except Exception as e:
-                        os.unlink(wav_path)
+                        if wav_path and os.path.exists(wav_path):
+                            os.unlink(wav_path)
                         self.finished_signal.emit('', f'VTT yazma hatası: {e}')
                         return
                     
                     # Temizlik
-                    try:
-                        os.unlink(wav_path)
-                    except:
-                        pass
+                    if wav_path and os.path.exists(wav_path):
+                        try:
+                            os.unlink(wav_path)
+                        except:
+                            pass
                     
                     self.finished_signal.emit(subtitle_path, '')
                     
                 except Exception as e:
+                    # Temizlik
+                    if wav_path and os.path.exists(wav_path):
+                        try:
+                            os.unlink(wav_path)
+                        except:
+                            pass
                     self.finished_signal.emit('', f'Beklenmeyen hata: {e}')
             
             @staticmethod
