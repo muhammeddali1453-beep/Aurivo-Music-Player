@@ -11594,30 +11594,6 @@ class AngollaPlayer(QMainWindow):
             hint.setWordWrap(True)
             sl.addWidget(hint)
 
-        # Whisper Otomatik Altyazı Oluşturma
-        try:
-            import whisper
-            whisper_available = True
-        except ImportError:
-            whisper_available = False
-
-        if whisper_available:
-            sl.addSpacing(8)
-            sep = QFrame()
-            sep.setFrameShape(QFrame.HLine)
-            sep.setStyleSheet('background: rgba(255,255,255,30); border: none; max-height: 1px;')
-            sl.addWidget(sep)
-            sl.addSpacing(4)
-            
-            b_whisper = QToolButton()
-            b_whisper.setObjectName('videoSettingsOption')
-            b_whisper.setText('🎙️ Whisper ile Otomatik Altyazı Oluştur')
-            b_whisper.setCursor(Qt.PointingHandCursor)
-            b_whisper.setAutoRaise(True)
-            b_whisper.setToolTip('Video sesinden otomatik altyazı oluşturur (ilk kullanımda model indirilir)')
-            b_whisper.clicked.connect(self._start_whisper_transcription)
-            sl.addWidget(b_whisper)
-
         sl.addStretch(1)
 
     def _toggle_video_settings_panel(self):
@@ -12365,8 +12341,8 @@ class AngollaPlayer(QMainWindow):
     def _video_select_subtitle_language(self, lang_key: str):
         """Menüden Türkçe/İngilizce/Arapça seçilince:
         - varsa dosyayı seç
-        - yoksa gizli temp şablon oluşturmayı dene
-        - o da olmazsa in-memory şablona düş
+        - Türkçe seçilirse ve gerçek dosya yoksa Whisper ile otomatik oluştur
+        - diğer diller için gizli temp şablon oluştur
         """
         try:
             lang_key = str(lang_key or '').strip().lower()
@@ -12396,10 +12372,29 @@ class AngollaPlayer(QMainWindow):
 
         if picked is not None:
             lbl, p = picked
+            # Eğer Türkçe template dosyasıysa (.angolla_sub_) Whisper çalıştır
+            if lang_key == 'turkce' and '.angolla_sub_' in os.path.basename(p):
+                try:
+                    import whisper
+                    # Whisper varsa otomatik transkripsiyon başlat
+                    self._start_whisper_transcription()
+                    return
+                except ImportError:
+                    pass  # Whisper yoksa normal template kullan
             self._set_video_subtitle_source_from_menu(p, lbl)
             return
 
-        # Gizli temp şablon dosyası oluşturmayı dene
+        # Türkçe için Whisper ile otomatik altyazı oluştur
+        if lang_key == 'turkce':
+            try:
+                import whisper
+                # Whisper varsa direkt transkripsiyon başlat
+                self._start_whisper_transcription()
+                return
+            except ImportError:
+                pass  # Whisper yoksa normal template devam et
+        
+        # Diğer diller için gizli temp şablon dosyası oluşturmayı dene
         try:
             self._maybe_create_default_video_subtitle_templates(base_no_ext)
         except Exception:
