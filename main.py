@@ -11556,9 +11556,9 @@ class AngollaPlayer(QMainWindow):
         b_off.clicked.connect(lambda: self._set_video_subtitles_enabled(False))
         sl.addWidget(b_off)
 
-        # Hızlı dil seçenekleri (kullanıcının beklediği Türkçe/İngilizce/Arapça)
-        # Not: Dosya yoksa gizli temp şablon oluşturur; klasör yazılamazsa in-memory şablona düşer.
-        for _k in ('turkce', 'ingilizce', 'arapca'):
+        # Hızlı dil seçenekleri (Whisper ile otomatik altyazı)
+        # Not: Dosya yoksa Whisper ile otomatik transkripsiyon başlar
+        for _k in ('turkce', 'ingilizce', 'fransizca', 'ispanyolca', 'arapca'):
             _lbl = self._subtitle_label_from_key(_k)
             b_lang = QToolButton()
             b_lang.setObjectName('videoSettingsOption')
@@ -12339,16 +12339,25 @@ class AngollaPlayer(QMainWindow):
             pass
 
     def _video_select_subtitle_language(self, lang_key: str):
-        """Menüden Türkçe/İngilizce/Arapça seçilince:
-        - varsa dosyayı seç
-        - Türkçe seçilirse ve gerçek dosya yoksa Whisper ile otomatik oluştur
-        - diğer diller için gizli temp şablon oluştur
+        """Menüden dil seçilince:
+        - varsa gerçek dosyayı seç
+        - yoksa Whisper ile otomatik oluştur (tüm diller için)
         """
         try:
             lang_key = str(lang_key or '').strip().lower()
         except Exception:
             lang_key = ''
-        if lang_key not in ('turkce', 'ingilizce', 'arapca'):
+        
+        # Desteklenen diller ve Whisper kodları
+        lang_to_whisper = {
+            'turkce': 'tr',
+            'ingilizce': 'en', 
+            'fransizca': 'fr',
+            'ispanyolca': 'es',
+            'arapca': 'ar'
+        }
+        
+        if lang_key not in lang_to_whisper:
             return
 
         video_path = str(getattr(self, '_video_current_path', '') or '')
@@ -12364,7 +12373,7 @@ class AngollaPlayer(QMainWindow):
         picked = None
         for k, lbl, p in (sources or []):
             try:
-                if str(k or '').strip().lower() in (lang_key, {'turkce': 'tr', 'ingilizce': 'en', 'arapca': 'ar'}.get(lang_key, '')):
+                if str(k or '').strip().lower() in (lang_key, lang_to_whisper.get(lang_key, '')):
                     picked = (lbl, p)
                     break
             except Exception:
@@ -12372,29 +12381,30 @@ class AngollaPlayer(QMainWindow):
 
         if picked is not None:
             lbl, p = picked
-            # Eğer Türkçe template dosyasıysa (.angolla_sub_) Whisper çalıştır
-            if lang_key == 'turkce' and '.angolla_sub_' in os.path.basename(p):
+            # Eğer template dosyasıysa (.angolla_sub_) Whisper çalıştır
+            if '.angolla_sub_' in os.path.basename(p):
                 try:
                     import whisper
                     # Whisper varsa otomatik transkripsiyon başlat
-                    self._start_whisper_transcription()
+                    whisper_lang = lang_to_whisper.get(lang_key, 'tr')
+                    self._start_whisper_transcription(whisper_lang)
                     return
                 except ImportError:
                     pass  # Whisper yoksa normal template kullan
             self._set_video_subtitle_source_from_menu(p, lbl)
             return
 
-        # Türkçe için Whisper ile otomatik altyazı oluştur
-        if lang_key == 'turkce':
-            try:
-                import whisper
-                # Whisper varsa direkt transkripsiyon başlat
-                self._start_whisper_transcription()
-                return
-            except ImportError:
-                pass  # Whisper yoksa normal template devam et
+        # Dosya bulunamadı - Whisper ile otomatik altyazı oluştur (tüm diller için)
+        try:
+            import whisper
+            # Whisper varsa direkt transkripsiyon başlat
+            whisper_lang = lang_to_whisper.get(lang_key, 'tr')
+            self._start_whisper_transcription(whisper_lang)
+            return
+        except ImportError:
+            pass  # Whisper yoksa template'e devam
         
-        # Diğer diller için gizli temp şablon dosyası oluşturmayı dene
+        # Whisper yoksa gizli temp şablon dosyası oluşturmayı dene
         try:
             self._maybe_create_default_video_subtitle_templates(base_no_ext)
         except Exception:
@@ -12434,7 +12444,7 @@ class AngollaPlayer(QMainWindow):
         if not folder or not base_name:
             return []
         out = []
-        for key in ('turkce', 'ingilizce', 'arapca'):
+        for key in ('turkce', 'ingilizce', 'fransizca', 'ispanyolca', 'arapca'):
             fn = f".angolla_sub_{base_name}.{key}.vtt"
             out.append((key, os.path.join(folder, fn)))
         return out
@@ -12504,14 +12514,22 @@ class AngollaPlayer(QMainWindow):
             return 'Türkçe'
         if k in ('ingilizce', 'en', 'english'):
             return 'İngilizce'
+        if k in ('fransizca', 'fr', 'french'):
+            return 'Fransızca'
+        if k in ('ispanyolca', 'es', 'spanish'):
+            return 'İspanyolca'
         if k in ('arapca', 'ar', 'arabic'):
             return 'Arapça'
         if not k:
             return 'Altyazı'
         return k.replace('_', ' ').replace('-', ' ').title()
 
-    def _start_whisper_transcription(self):
-        """Whisper ile video sesinden otomatik altyazı oluştur"""
+    def _start_whisper_transcription(self, language_code='tr'):
+        """Whisper ile video sesinden otomatik altyazı oluştur
+        
+        Args:
+            language_code: Whisper dil kodu (tr, en, fr, es, ar vb.)
+        """
         try:
             from PyQt5.QtCore import QThread, pyqtSignal
             import whisper
@@ -12526,12 +12544,16 @@ class AngollaPlayer(QMainWindow):
         if not current_video or not os.path.exists(current_video):
             QMessageBox.information(self, 'Bilgi', 'Önce bir video açmalısınız!')
             return
+        
+        # Dil adını kullanıcı için güzelleştir
+        language_names = {'tr': 'Türkçe', 'en': 'İngilizce', 'fr': 'Fransızca', 'es': 'İspanyolca', 'ar': 'Arapça'}
+        lang_display = language_names.get(language_code, language_code.upper())
 
         # Duraklatma önerisi
         reply = QMessageBox.question(
             self, 
-            'Whisper Altyazı Oluştur',
-            'Video sesinden otomatik altyazı oluşturulacak.\n\n'
+            f'Whisper Altyazı Oluştur ({lang_display})',
+            f'Video sesinden otomatik {lang_display} altyazı oluşturulacak.\n\n'
             'İlk kullanımda ~150MB model indirilecek.\n'
             'İşlem birkaç dakika sürebilir.\n\n'
             'Devam edilsin mi?',
@@ -12561,9 +12583,10 @@ class AngollaPlayer(QMainWindow):
         class WhisperWorker(QThread):
             finished_signal = pyqtSignal(str, str)  # subtitle_path, error_msg
             
-            def __init__(self, video_path):
+            def __init__(self, video_path, language_code='tr'):
                 super().__init__()
                 self.video_path = video_path
+                self.language_code = language_code
                 
             def run(self):
                 wav_path = None
@@ -12606,7 +12629,7 @@ class AngollaPlayer(QMainWindow):
                         model = whisper.load_model('small', device=device)
                         result = model.transcribe(
                             wav_path, 
-                            language='tr', 
+                            language=self.language_code, 
                             task='transcribe',
                             fp16=False  # NaN hatalarını önlemek için FP16 kapalı
                         )
@@ -12615,7 +12638,7 @@ class AngollaPlayer(QMainWindow):
                         if 'cuda' in str(e).lower() or 'nan' in str(e).lower():
                             try:
                                 model = whisper.load_model('small', device='cpu')
-                                result = model.transcribe(wav_path, language='tr', task='transcribe', fp16=False)
+                                result = model.transcribe(wav_path, language=self.language_code, task='transcribe', fp16=False)
                             except Exception as e2:
                                 if wav_path and os.path.exists(wav_path):
                                     os.unlink(wav_path)
@@ -12707,7 +12730,7 @@ class AngollaPlayer(QMainWindow):
             else:
                 QMessageBox.warning(self, 'Hata', 'Altyazı dosyası oluşturulamadı!')
 
-        worker = WhisperWorker(current_video)
+        worker = WhisperWorker(current_video, language_code)
         worker.finished_signal.connect(on_whisper_finished)
         worker.start()
         
@@ -12752,6 +12775,18 @@ class AngollaPlayer(QMainWindow):
                 '00:00:00.000 --> 00:10:00.000\n'
                 'Hello. This is an English subtitle template.\n'
                 'Edit this file or put a .srt/.vtt next to the video.\n\n'
+            ),
+            'fransizca': (
+                'WEBVTT\n\n'
+                '00:00:00.000 --> 00:10:00.000\n'
+                'Bonjour. Ceci est un modèle de sous-titre français.\n'
+                'Modifiez ce fichier ou placez un .srt/.vtt à côté de la vidéo.\n\n'
+            ),
+            'ispanyolca': (
+                'WEBVTT\n\n'
+                '00:00:00.000 --> 00:10:00.000\n'
+                'Hola. Esta es una plantilla de subtítulos en español.\n'
+                'Edite este archivo o coloque un .srt/.vtt junto al video.\n\n'
             ),
             'arapca': (
                 'WEBVTT\n\n'
