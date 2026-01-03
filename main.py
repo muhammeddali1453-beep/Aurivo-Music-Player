@@ -12555,13 +12555,71 @@ class AngollaPlayer(QMainWindow):
         except:
             pass
 
-        # Progress dialog (minimal, iptal yok)
-        progress = QProgressDialog(f'{lang_display} altyazı oluşturuluyor...', None, 0, 0, self)
-        progress.setWindowTitle('🎙️ Otomatik Altyazı')
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setCancelButton(None)  # İptal butonu yok
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
+        # Özel Aura Progress Dialog
+        progress = QDialog(self)
+        progress.setWindowTitle('🎙️ Angolla Otomatik Altyazı')
+        progress.setModal(True)
+        progress.setFixedSize(460, 140)  # Sabit boyut
+        progress.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        
+        # Ana layout
+        layout = QVBoxLayout(progress)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Metin label
+        label = QLabel(f'{lang_display} altyazı oluşturuluyor...')
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet('color: white; font-size: 14px; font-weight: bold;')
+        layout.addWidget(label)
+        
+        # Progress bar (sonsuz animasyon)
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 0)  # Sonsuz animasyon
+        progress_bar.setTextVisible(False)
+        progress_bar.setFixedHeight(8)
+        layout.addWidget(progress_bar)
+        
+        # Aura gradient animasyonu için timer
+        self._whisper_progress_hue = 0
+        def update_aura_style():
+            self._whisper_progress_hue = (self._whisper_progress_hue + 2) % 360
+            h = self._whisper_progress_hue
+            
+            # RGB gökkuşağı renkleri (HSV'den RGB'ye)
+            import colorsys
+            r1, g1, b1 = [int(x * 255) for x in colorsys.hsv_to_rgb(h / 360, 0.8, 0.9)]
+            r2, g2, b2 = [int(x * 255) for x in colorsys.hsv_to_rgb((h + 60) / 360, 0.8, 0.9)]
+            r3, g3, b3 = [int(x * 255) for x in colorsys.hsv_to_rgb((h + 120) / 360, 0.8, 0.9)]
+            
+            style = f"""
+                QDialog {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 rgba({r1}, {g1}, {b1}, 180),
+                        stop:0.5 rgba({r2}, {g2}, {b2}, 180),
+                        stop:1 rgba({r3}, {g3}, {b3}, 180));
+                    border: 2px solid rgba({r1}, {g1}, {b1}, 255);
+                    border-radius: 12px;
+                }}
+                QProgressBar {{
+                    background: rgba(0, 0, 0, 100);
+                    border: none;
+                    border-radius: 4px;
+                }}
+                QProgressBar::chunk {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 rgba({r1}, {g1}, {b1}, 255),
+                        stop:1 rgba({r2}, {g2}, {b2}, 255));
+                    border-radius: 4px;
+                }}
+            """
+            progress.setStyleSheet(style)
+        
+        # Animasyon timer
+        aura_timer = QTimer(progress)
+        aura_timer.timeout.connect(update_aura_style)
+        aura_timer.start(50)  # 50ms = yumuşak animasyon
+        update_aura_style()  # İlk render
+        
         progress.show()
         QApplication.processEvents()
 
@@ -12708,6 +12766,15 @@ class AngollaPlayer(QMainWindow):
                     self._set_video_subtitle_source_from_menu(subtitle_path, f'Whisper ({lang_label})')
                 except Exception as e:
                     print(f'[Whisper] Altyazı yükleme hatası: {e}')
+                
+                # Videoyu baştan başlat
+                try:
+                    if hasattr(self, 'videoPlayer'):
+                        self.videoPlayer.setPosition(0)
+                        self.videoPlayer.play()
+                except Exception as e:
+                    print(f'[Whisper] Video başlatma hatası: {e}')
+                
                 # Ayarlar sayfasını sessizce yenile
                 try:
                     self._build_video_settings_pages()
