@@ -12542,36 +12542,22 @@ class AngollaPlayer(QMainWindow):
         # Video yolu kontrolü
         current_video = getattr(self, '_video_current_path', None)
         if not current_video or not os.path.exists(current_video):
-            QMessageBox.information(self, 'Bilgi', 'Önce bir video açmalısınız!')
             return
         
         # Dil adını kullanıcı için güzelleştir
         language_names = {'tr': 'Türkçe', 'en': 'İngilizce', 'fr': 'Fransızca', 'es': 'İspanyolca', 'ar': 'Arapça'}
         lang_display = language_names.get(language_code, language_code.upper())
 
-        # Duraklatma önerisi
-        reply = QMessageBox.question(
-            self, 
-            f'Whisper Altyazı Oluştur ({lang_display})',
-            f'Video sesinden otomatik {lang_display} altyazı oluşturulacak.\n\n'
-            'İlk kullanımda ~150MB model indirilecek.\n'
-            'İşlem birkaç dakika sürebilir.\n\n'
-            'Devam edilsin mi?',
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        # Video'yu duraklat
+        # Video'yu otomatik duraklat
         try:
             if hasattr(self, 'videoPlayer'):
                 self.videoPlayer.pause()
         except:
             pass
 
-        # Progress dialog
-        progress = QProgressDialog('Whisper ile altyazı oluşturuluyor...', 'İptal', 0, 0, self)
-        progress.setWindowTitle('Otomatik Altyazı')
+        # Progress dialog (minimal, iptal yok)
+        progress = QProgressDialog(f'{lang_display} altyazı oluşturuluyor...', None, 0, 0, self)
+        progress.setWindowTitle('🎙️ Otomatik Altyazı')
         progress.setWindowModality(Qt.WindowModal)
         progress.setCancelButton(None)  # İptal butonu yok
         progress.setMinimumDuration(0)
@@ -12712,23 +12698,23 @@ class AngollaPlayer(QMainWindow):
             progress.close()
             
             if error_msg:
-                QMessageBox.warning(self, 'Hata', f'Altyazı oluşturulamadı:\n\n{error_msg}')
+                # Hata sadece konsola yazdır, kullanıcıyı rahatsız etme
+                print(f'[Whisper] Hata: {error_msg}')
             elif subtitle_path and os.path.exists(subtitle_path):
-                QMessageBox.information(self, 'Başarılı', 
-                    f'Altyazı oluşturuldu:\n{os.path.basename(subtitle_path)}\n\n'
-                    'Altyazılar menüsünden seçebilirsiniz.')
-                # Altyazıyı otomatik yükle
+                # Sessizce altyazıyı yükle
                 try:
-                    self._set_video_subtitle_source_from_menu(subtitle_path, 'Whisper (Türkçe)')
-                except:
-                    pass
-                # Ayarlar sayfasını yenile
+                    # Dil label'ı oluştur
+                    lang_label = language_names.get(language_code, 'Whisper')
+                    self._set_video_subtitle_source_from_menu(subtitle_path, f'Whisper ({lang_label})')
+                except Exception as e:
+                    print(f'[Whisper] Altyazı yükleme hatası: {e}')
+                # Ayarlar sayfasını sessizce yenile
                 try:
                     self._build_video_settings_pages()
                 except:
                     pass
             else:
-                QMessageBox.warning(self, 'Hata', 'Altyazı dosyası oluşturulamadı!')
+                print('[Whisper] Altyazı dosyası oluşturulamadı')
 
         worker = WhisperWorker(current_video, language_code)
         worker.finished_signal.connect(on_whisper_finished)
