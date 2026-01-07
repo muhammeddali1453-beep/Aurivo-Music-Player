@@ -1,48 +1,15 @@
 @echo off
-REM Aurivo Music Player - Windows Build Script
+REM Aurivo Music Player - Windows Build Script (STANDARD VERSION)
 REM Python 3.10+ ve PyInstaller gerekli
+REM Whisper DAHIL DEGIL - Kucuk boyut (~150-200MB)
 
 echo ================================================
-echo Aurivo Music Player - Windows Build
+echo Aurivo Music Player - Windows Build (STANDARD)
 echo ================================================
 echo.
-echo Hangi versiyonu olusturmak istiyorsunuz?
+echo Bu standard surumu olustururmusunuz (Whisper HARIC)
+echo Boyut: ~150-200MB
 echo.
-echo 1. STANDARD (Oner ilen) - ~150-200MB
-echo    - Whisper HARIC
-echo    - Manuel altyazi destegi
-echo    - Tum diger ozellikler
-echo.
-echo 2. PRO - ~2.5GB
-echo    - Whisper DAHIL
-echo    - Otomatik video altyazi
-echo    - Tum ozellikler
-echo.
-set /p choice="Seciminiz (1 veya 2): "
-
-if "%choice%"=="1" (
-    echo.
-    echo Standard versiyonu olustuyorsunuz...
-    call build_windows_standard.bat
-    exit /b %ERRORLEVEL%
-)
-
-if "%choice%"=="2" (
-    echo.
-    echo Pro versiyonu olusturuyorsunuz...
-    call build_windows_pro.bat
-    exit /b %ERRORLEVEL%
-)
-
-echo.
-echo Hatali secim! Lutfen 1 veya 2 girin.
-pause
-exit /b 1
-
-REM =======================================================================
-REM ESKI BUILD KODU - KULLANILMIYOR (Referans icin tutuldu)
-REM =======================================================================
-goto :eof
 
 REM Sanal ortam varsa aktive et
 if exist "venv\Scripts\activate.bat" (
@@ -79,7 +46,7 @@ if errorlevel 1 (
 )
 
 echo [3/5] Eski build dosyalari temizleniyor...
-if exist "dist\Aurivo.exe" del /Q "dist\Aurivo.exe"
+if exist "dist\Aurivo-Standard.exe" del /Q "dist\Aurivo-Standard.exe"
 if exist "build" rmdir /S /Q "build"
 
 echo [4/6] Native moduller derleniyor...
@@ -126,9 +93,9 @@ if errorlevel 1 (
     echo UYARI: viz_engine build basarisiz (opsiyonel). Devam ediliyor...
 )
 
-echo [5/6] Windows executable olusturuluyor...
-echo NOT: Whisper DAHIL DEGIL (kullanici istege bagli kuracak)
-pyinstaller --clean aurivo_windows.spec
+echo [5/6] Windows executable olusturuluyor (STANDARD)...
+echo NOT: Whisper DAHIL DEGIL - kullanici istege bagli kuracak
+pyinstaller --clean aurivo_windows_standard.spec
 
 if errorlevel 1 (
     echo.
@@ -140,11 +107,20 @@ if errorlevel 1 (
 echo [6/6] Build tamamlandi!
 echo.
 echo ================================================
-echo Cikti: dist\Aurivo.exe
+echo Cikti: dist\Aurivo-Standard.exe
 echo Boyut: ~150-200MB (Whisper haric)
 echo ================================================
 echo.
-echo NOT: Kullanicilar ilk kez "Otomatik Altyazi" kullandiginda
-echo       Whisper otomatik indirilecek (~2.2GB)
+echo OZELLIKLER:
+echo   + Muzik calma (tum formatlar)
+echo   + Video oynatma
+echo   + Manuel altyazi (.srt, .vtt)
+echo   + 11 gorsellestirme modu
+echo   + 10 bantli ekoulayzer
+echo   + DSP efektleri
+echo   - Otomatik video altyazi (Whisper yok)
+echo.
+echo NOT: Kullanicilar "Otomatik Altyazi" secenegini kullanamazlar.
+echo      Pro versiyonu gerektigi konusunda bilgilendirilecekler.
 echo.
 pause

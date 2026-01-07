@@ -1,47 +1,17 @@
 #!/bin/bash
-# Aurivo Music Player - Linux Build Script
+# Aurivo Music Player - Linux Build Script (STANDARD VERSION)
 # Python 3.10+ ve PyInstaller gerekli
+# Whisper DAHIL DEGIL - Kucuk boyut (~150-200MB)
+
+set -e
 
 echo "================================================"
-echo "Aurivo Music Player - Linux Build"
+echo "Aurivo Music Player - Linux Build (STANDARD)"
 echo "================================================"
 echo ""
-echo "Hangi versiyonu oluşturmak istiyorsunuz?"
+echo "Bu standard sürümü oluşturuyorsunuz (Whisper HARİÇ)"
+echo "Boyut: ~150-200MB"
 echo ""
-echo "1. STANDARD (Önerilen) - ~150-200MB"
-echo "   - Whisper HARİÇ"
-echo "   - Manuel altyazı desteği"
-echo "   - Tüm diğer özellikler"
-echo ""
-echo "2. PRO - ~2.5GB"
-echo "   - Whisper DAHİL"
-echo "   - Otomatik video altyazı"
-echo "   - Tüm özellikler"
-echo ""
-read -p "Seçiminiz (1 veya 2): " choice
-
-if [ "$choice" == "1" ]; then
-    echo ""
-    echo "Standard versiyonu oluşturuyorsunuz..."
-    bash build_linux_standard.sh
-    exit $?
-fi
-
-if [ "$choice" == "2" ]; then
-    echo ""
-    echo "Pro versiyonu oluşturuyorsunuz..."
-    bash build_linux_pro.sh
-    exit $?
-fi
-
-echo ""
-echo "Hatalı seçim! Lütfen 1 veya 2 girin."
-exit 1
-
-# =======================================================================
-# ESKİ BUILD KODU - KULLANILMIYOR (Referans için tutuldu)
-# =======================================================================
-exit 0
 
 # Sanal ortam varsa aktive et
 if [ -d "pyqt_venv" ]; then
@@ -76,7 +46,7 @@ if ! pip show PyQt5 &> /dev/null; then
 fi
 
 echo "[3/6] Eski build dosyaları temizleniyor..."
-rm -rf dist/aurivo build/
+rm -rf dist/aurivo-standard build/
 
 echo "[4/6] Native modüller derleniyor..."
 
@@ -111,9 +81,9 @@ if [ -f "setup.py" ]; then
     fi
 fi
 
-echo "[5/6] Linux executable oluşturuluyor..."
-echo "NOT: Whisper DAHİL DEĞİL (kullanıcı isteğe bağlı kuracak)"
-pyinstaller --clean aurivo_linux.spec
+echo "[5/6] Linux executable oluşturuluyor (STANDARD)..."
+echo "NOT: Whisper DAHİL DEĞİL - kullanıcı isteğe bağlı kuracak"
+pyinstaller --clean aurivo_linux_standard.spec
 
 if [ $? -ne 0 ]; then
     echo ""
@@ -126,7 +96,7 @@ echo ""
 
 # Icon symlink oluştur (PyInstaller packed binary için)
 echo "[+] Icon ve wrapper oluşturuluyor..."
-cd dist/aurivo
+cd dist/aurivo-standard
 if [ ! -L "icons" ] && [ -d "_internal/icons" ]; then
     ln -sf _internal/icons icons
     echo "✓ icons -> _internal/icons"
@@ -156,7 +126,7 @@ if [ -f "aurivo" ]; then
     mv aurivo aurivo.bin
     cat > aurivo << 'WRAPPER_EOF'
 #!/bin/bash
-# Aurivo Music Player - Launcher Script
+# Aurivo Music Player - Launcher Script (Standard)
 # GStreamer ve Qt çevre değişkenlerini ayarla
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -190,51 +160,20 @@ cd ../..
 
 echo ""
 echo "================================================"
-echo "Çıktı: dist/aurivo/"
-echo "Çalıştır: ./dist/aurivo/aurivo"
+echo "Çıktı: dist/aurivo-standard/"
+echo "Çalıştır: ./dist/aurivo-standard/aurivo"
 echo "Boyut: ~150-200MB (Whisper hariç)"
 echo "================================================"
 echo ""
-echo "NOT: Kullanıcılar ilk kez 'Otomatik Altyazı' kullandığında"
-echo "     Whisper otomatik indirilecek (~2.2GB)"
+echo "ÖZELLİKLER:"
+echo "  + Müzik çalma (tüm formatlar)"
+echo "  + Video oynatma"
+echo "  + Manuel altyazı (.srt, .vtt)"
+echo "  + 11 görselleştirme modu"
+echo "  + 10 bantlı ekolayzır"
+echo "  + DSP efektleri"
+echo "  - Otomatik video altyazı (Whisper yok)"
 echo ""
-
-# AppImage oluşturma (opsiyonel)
-read -p "AppImage oluşturmak ister misiniz? (y/n) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    if command -v appimagetool &> /dev/null; then
-        echo "AppImage oluşturuluyor..."
-        # AppDir yapısı oluştur
-        mkdir -p AppDir/usr/bin
-        mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-        mkdir -p AppDir/usr/share/applications
-        
-        cp -r dist/aurivo/* AppDir/usr/bin/
-        
-        # Desktop dosyası oluştur
-        cat > AppDir/usr/share/applications/aurivo.desktop << EOF
-[Desktop Entry]
-Type=Application
-Name=Aurivo Music Player
-Exec=aurivo
-Icon=aurivo
-Categories=Audio;Player;
-EOF
-        
-        # AppRun oluştur
-        cat > AppDir/AppRun << 'EOF'
-#!/bin/bash
-SELF=$(readlink -f "$0")
-HERE=${SELF%/*}
-export PATH="${HERE}/usr/bin/:${PATH}"
-exec "${HERE}/usr/bin/aurivo" "$@"
-EOF
-        chmod +x AppDir/AppRun
-        
-        appimagetool AppDir Aurivo-x86_64.AppImage
-        echo "✓ AppImage oluşturuldu: Aurivo-x86_64.AppImage"
-    else
-        echo "appimagetool bulunamadı. Manuel kurulum: https://github.com/AppImage/AppImageKit"
-    fi
-fi
+echo "NOT: Kullanıcılar 'Otomatik Altyazı' seçeneğini kullanamazlar."
+echo "     Pro versiyonu gerektigi konusunda bilgilendirilecekler."
+echo ""

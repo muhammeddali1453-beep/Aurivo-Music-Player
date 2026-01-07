@@ -1,60 +1,30 @@
 #!/bin/bash
-# Aurivo Music Player - Linux Build Script
+# Aurivo Music Player - Linux Build Script (PRO VERSION)
 # Python 3.10+ ve PyInstaller gerekli
+# Whisper DAHIL - Buyuk boyut (~2.5GB)
+
+set -e
 
 echo "================================================"
-echo "Aurivo Music Player - Linux Build"
+echo "Aurivo Music Player - Linux Build (PRO)"
 echo "================================================"
 echo ""
-echo "Hangi versiyonu oluşturmak istiyorsunuz?"
+echo "Bu PRO sürümü oluşturuyorsunuz (Whisper DAHİL)"
+echo "Boyut: ~2.5GB"
 echo ""
-echo "1. STANDARD (Önerilen) - ~150-200MB"
-echo "   - Whisper HARİÇ"
-echo "   - Manuel altyazı desteği"
-echo "   - Tüm diğer özellikler"
-echo ""
-echo "2. PRO - ~2.5GB"
-echo "   - Whisper DAHİL"
-echo "   - Otomatik video altyazı"
-echo "   - Tüm özellikler"
-echo ""
-read -p "Seçiminiz (1 veya 2): " choice
-
-if [ "$choice" == "1" ]; then
-    echo ""
-    echo "Standard versiyonu oluşturuyorsunuz..."
-    bash build_linux_standard.sh
-    exit $?
-fi
-
-if [ "$choice" == "2" ]; then
-    echo ""
-    echo "Pro versiyonu oluşturuyorsunuz..."
-    bash build_linux_pro.sh
-    exit $?
-fi
-
-echo ""
-echo "Hatalı seçim! Lütfen 1 veya 2 girin."
-exit 1
-
-# =======================================================================
-# ESKİ BUILD KODU - KULLANILMIYOR (Referans için tutuldu)
-# =======================================================================
-exit 0
 
 # Sanal ortam varsa aktive et
 if [ -d "pyqt_venv" ]; then
-    echo "[1/5] Sanal ortam aktive ediliyor..."
+    echo "[1/6] Sanal ortam aktive ediliyor..."
     source pyqt_venv/bin/activate
 elif [ -d "venv" ]; then
-    echo "[1/5] Sanal ortam aktive ediliyor..."
+    echo "[1/6] Sanal ortam aktive ediliyor..."
     source venv/bin/activate
 else
-    echo "[1/5] Sanal ortam bulunamadı, sistem Python kullanılacak"
+    echo "[1/6] Sanal ortam bulunamadı, sistem Python kullanılacak"
 fi
 
-echo "[2/5] Temel bağımlılıklar kontrol ediliyor..."
+echo "[2/6] Temel bağımlılıklar kontrol ediliyor..."
 if ! pip show pyinstaller &> /dev/null; then
     echo "PyInstaller kurulu değil, kuruluyor..."
     pip install pyinstaller
@@ -75,10 +45,21 @@ if ! pip show PyQt5 &> /dev/null; then
     exit 1
 fi
 
-echo "[3/6] Eski build dosyaları temizleniyor..."
-rm -rf dist/aurivo build/
+echo "[3/6] Whisper ve PyTorch kurulumu kontrol ediliyor..."
+if ! pip show openai-whisper &> /dev/null; then
+    echo "Whisper kurulu değil, kuruluyor... (Bu biraz zaman alabilir)"
+    pip install openai-whisper
+fi
 
-echo "[4/6] Native modüller derleniyor..."
+if ! pip show torch &> /dev/null; then
+    echo "PyTorch kurulu değil, kuruluyor... (Bu çok zaman alabilir, ~2GB)"
+    pip install torch torchaudio
+fi
+
+echo "[4/6] Eski build dosyaları temizleniyor..."
+rm -rf dist/aurivo-pro build/
+
+echo "[5/6] Native modüller derleniyor..."
 
 # 1) ctypes DSP kütüphanesi (zorunlu)
 if [ -f "aurivo_dsp.cpp" ]; then
@@ -111,9 +92,9 @@ if [ -f "setup.py" ]; then
     fi
 fi
 
-echo "[5/6] Linux executable oluşturuluyor..."
-echo "NOT: Whisper DAHİL DEĞİL (kullanıcı isteğe bağlı kuracak)"
-pyinstaller --clean aurivo_linux.spec
+echo "[6/6] Linux executable oluşturuluyor (PRO)..."
+echo "NOT: Whisper DAHİL - otomatik altyazı özelliği aktif"
+pyinstaller --clean aurivo_linux_pro.spec
 
 if [ $? -ne 0 ]; then
     echo ""
@@ -121,12 +102,12 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "[6/6] Build tamamlandı!"
+echo "[7/6] Build tamamlandı!"
 echo ""
 
 # Icon symlink oluştur (PyInstaller packed binary için)
 echo "[+] Icon ve wrapper oluşturuluyor..."
-cd dist/aurivo
+cd dist/aurivo-pro
 if [ ! -L "icons" ] && [ -d "_internal/icons" ]; then
     ln -sf _internal/icons icons
     echo "✓ icons -> _internal/icons"
@@ -156,7 +137,7 @@ if [ -f "aurivo" ]; then
     mv aurivo aurivo.bin
     cat > aurivo << 'WRAPPER_EOF'
 #!/bin/bash
-# Aurivo Music Player - Launcher Script
+# Aurivo Music Player - Launcher Script (Pro)
 # GStreamer ve Qt çevre değişkenlerini ayarla
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -190,51 +171,20 @@ cd ../..
 
 echo ""
 echo "================================================"
-echo "Çıktı: dist/aurivo/"
-echo "Çalıştır: ./dist/aurivo/aurivo"
-echo "Boyut: ~150-200MB (Whisper hariç)"
+echo "Çıktı: dist/aurivo-pro/"
+echo "Çalıştır: ./dist/aurivo-pro/aurivo"
+echo "Boyut: ~2.5GB (Whisper dahil)"
 echo "================================================"
 echo ""
-echo "NOT: Kullanıcılar ilk kez 'Otomatik Altyazı' kullandığında"
-echo "     Whisper otomatik indirilecek (~2.2GB)"
+echo "ÖZELLİKLER:"
+echo "  + Müzik çalma (tüm formatlar)"
+echo "  + Video oynatma"
+echo "  + Manuel altyazı (.srt, .vtt)"
+echo "  + Otomatik video altyazı (Whisper AI)"
+echo "  + Çoklu dil otomatik altyazı"
+echo "  + 11 görselleştirme modu"
+echo "  + 10 bantlı ekolayzır"
+echo "  + DSP efektleri"
 echo ""
-
-# AppImage oluşturma (opsiyonel)
-read -p "AppImage oluşturmak ister misiniz? (y/n) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    if command -v appimagetool &> /dev/null; then
-        echo "AppImage oluşturuluyor..."
-        # AppDir yapısı oluştur
-        mkdir -p AppDir/usr/bin
-        mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-        mkdir -p AppDir/usr/share/applications
-        
-        cp -r dist/aurivo/* AppDir/usr/bin/
-        
-        # Desktop dosyası oluştur
-        cat > AppDir/usr/share/applications/aurivo.desktop << EOF
-[Desktop Entry]
-Type=Application
-Name=Aurivo Music Player
-Exec=aurivo
-Icon=aurivo
-Categories=Audio;Player;
-EOF
-        
-        # AppRun oluştur
-        cat > AppDir/AppRun << 'EOF'
-#!/bin/bash
-SELF=$(readlink -f "$0")
-HERE=${SELF%/*}
-export PATH="${HERE}/usr/bin/:${PATH}"
-exec "${HERE}/usr/bin/aurivo" "$@"
-EOF
-        chmod +x AppDir/AppRun
-        
-        appimagetool AppDir Aurivo-x86_64.AppImage
-        echo "✓ AppImage oluşturuldu: Aurivo-x86_64.AppImage"
-    else
-        echo "appimagetool bulunamadı. Manuel kurulum: https://github.com/AppImage/AppImageKit"
-    fi
-fi
+echo "NOT: Kullanıcılar direkt otomatik altyazı oluşturabilir."
+echo ""

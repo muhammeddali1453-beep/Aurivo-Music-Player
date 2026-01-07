@@ -1,58 +1,25 @@
 @echo off
-REM Aurivo Music Player - Windows Build Script
+REM Aurivo Music Player - Windows Build Script (PRO VERSION)
 REM Python 3.10+ ve PyInstaller gerekli
+REM Whisper DAHIL - Buyuk boyut (~2.5GB)
 
 echo ================================================
-echo Aurivo Music Player - Windows Build
+echo Aurivo Music Player - Windows Build (PRO)
 echo ================================================
 echo.
-echo Hangi versiyonu olusturmak istiyorsunuz?
+echo Bu PRO surumu olustururmusunuz (Whisper DAHIL)
+echo Boyut: ~2.5GB
 echo.
-echo 1. STANDARD (Oner ilen) - ~150-200MB
-echo    - Whisper HARIC
-echo    - Manuel altyazi destegi
-echo    - Tum diger ozellikler
-echo.
-echo 2. PRO - ~2.5GB
-echo    - Whisper DAHIL
-echo    - Otomatik video altyazi
-echo    - Tum ozellikler
-echo.
-set /p choice="Seciminiz (1 veya 2): "
-
-if "%choice%"=="1" (
-    echo.
-    echo Standard versiyonu olustuyorsunuz...
-    call build_windows_standard.bat
-    exit /b %ERRORLEVEL%
-)
-
-if "%choice%"=="2" (
-    echo.
-    echo Pro versiyonu olusturuyorsunuz...
-    call build_windows_pro.bat
-    exit /b %ERRORLEVEL%
-)
-
-echo.
-echo Hatali secim! Lutfen 1 veya 2 girin.
-pause
-exit /b 1
-
-REM =======================================================================
-REM ESKI BUILD KODU - KULLANILMIYOR (Referans icin tutuldu)
-REM =======================================================================
-goto :eof
 
 REM Sanal ortam varsa aktive et
 if exist "venv\Scripts\activate.bat" (
-    echo [1/5] Sanal ortam aktive ediliyor...
+    echo [1/6] Sanal ortam aktive ediliyor...
     call venv\Scripts\activate.bat
 ) else (
-    echo [1/5] Sanal ortam bulunamadi, sistem Python kullanilacak
+    echo [1/6] Sanal ortam bulunamadi, sistem Python kullanilacak
 )
 
-echo [2/5] Temel bağımlılıklar kontrol ediliyor...
+echo [2/6] Temel bağımlılıklar kontrol ediliyor...
 pip show pyinstaller >nul 2>&1
 if errorlevel 1 (
     echo PyInstaller kurulu degil, kuruluyor...
@@ -78,11 +45,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [3/5] Eski build dosyalari temizleniyor...
-if exist "dist\Aurivo.exe" del /Q "dist\Aurivo.exe"
+echo [3/6] Whisper ve PyTorch kurulumu kontrol ediliyor...
+pip show openai-whisper >nul 2>&1
+if errorlevel 1 (
+    echo Whisper kurulu degil, kuruluyor... (Bu biraz zaman alabilir)
+    pip install openai-whisper
+)
+
+pip show torch >nul 2>&1
+if errorlevel 1 (
+    echo PyTorch kurulu degil, kuruluyor... (Bu cok zaman alabilir, ~2GB)
+    pip install torch torchaudio
+)
+
+echo [4/6] Eski build dosyalari temizleniyor...
+if exist "dist\Aurivo-Pro.exe" del /Q "dist\Aurivo-Pro.exe"
 if exist "build" rmdir /S /Q "build"
 
-echo [4/6] Native moduller derleniyor...
+echo [5/6] Native moduller derleniyor...
 
 REM --- C++ DSP (ctypes) ---
 if exist "aurivo_dsp.dll" del /Q "aurivo_dsp.dll"
@@ -126,9 +106,9 @@ if errorlevel 1 (
     echo UYARI: viz_engine build basarisiz (opsiyonel). Devam ediliyor...
 )
 
-echo [5/6] Windows executable olusturuluyor...
-echo NOT: Whisper DAHIL DEGIL (kullanici istege bagli kuracak)
-pyinstaller --clean aurivo_windows.spec
+echo [6/6] Windows executable olusturuluyor (PRO)...
+echo NOT: Whisper DAHIL - otomatik altyazi ozelligi aktif
+pyinstaller --clean aurivo_windows_pro.spec
 
 if errorlevel 1 (
     echo.
@@ -137,14 +117,23 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [6/6] Build tamamlandi!
+echo [7/6] Build tamamlandi!
 echo.
 echo ================================================
-echo Cikti: dist\Aurivo.exe
-echo Boyut: ~150-200MB (Whisper haric)
+echo Cikti: dist\Aurivo-Pro.exe
+echo Boyut: ~2.5GB (Whisper dahil)
 echo ================================================
 echo.
-echo NOT: Kullanicilar ilk kez "Otomatik Altyazi" kullandiginda
-echo       Whisper otomatik indirilecek (~2.2GB)
+echo OZELLIKLER:
+echo   + Muzik calma (tum formatlar)
+echo   + Video oynatma
+echo   + Manuel altyazi (.srt, .vtt)
+echo   + Otomatik video altyazi (Whisper AI)
+echo   + Coklu dil otomatik altyazi
+echo   + 11 gorsellestirme modu
+echo   + 10 bantli ekoulayzer
+echo   + DSP efektleri
+echo.
+echo NOT: Kullanicilar direkt otomatik altyazi olusturabilir.
 echo.
 pause
