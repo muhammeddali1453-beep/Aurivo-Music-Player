@@ -15,16 +15,16 @@ echo ""
 
 # Sanal ortam varsa aktive et
 if [ -d "pyqt_venv" ]; then
-    echo "[1/6] Sanal ortam aktive ediliyor..."
+    echo "[1/7] Sanal ortam aktive ediliyor..."
     source pyqt_venv/bin/activate
 elif [ -d "venv" ]; then
-    echo "[1/6] Sanal ortam aktive ediliyor..."
+    echo "[1/7] Sanal ortam aktive ediliyor..."
     source venv/bin/activate
 else
-    echo "[1/6] Sanal ortam bulunamadı, sistem Python kullanılacak"
+    echo "[1/7] Sanal ortam bulunamadı, sistem Python kullanılacak"
 fi
 
-echo "[2/6] Temel bağımlılıklar kontrol ediliyor..."
+echo "[2/7] Temel bağımlılıklar kontrol ediliyor..."
 if ! pip show pyinstaller &> /dev/null; then
     echo "PyInstaller kurulu değil, kuruluyor..."
     pip install pyinstaller
@@ -45,7 +45,7 @@ if ! pip show PyQt5 &> /dev/null; then
     exit 1
 fi
 
-echo "[3/6] Whisper ve PyTorch kurulumu kontrol ediliyor..."
+echo "[3/7] Whisper ve PyTorch kurulumu kontrol ediliyor..."
 if ! pip show openai-whisper &> /dev/null; then
     echo "Whisper kurulu değil, kuruluyor... (Bu biraz zaman alabilir)"
     pip install openai-whisper
@@ -56,10 +56,10 @@ if ! pip show torch &> /dev/null; then
     pip install torch torchaudio
 fi
 
-echo "[4/6] Eski build dosyaları temizleniyor..."
+echo "[4/7] Eski build dosyaları temizleniyor..."
 rm -rf dist/aurivo-pro build/
 
-echo "[5/6] Native modüller derleniyor..."
+echo "[5/7] Native modüller derleniyor..."
 
 # 1) ctypes DSP kütüphanesi (zorunlu)
 if [ -f "aurivo_dsp.cpp" ]; then
@@ -92,7 +92,7 @@ if [ -f "setup.py" ]; then
     fi
 fi
 
-echo "[6/6] Linux executable oluşturuluyor (PRO)..."
+echo "[6/7] Linux executable oluşturuluyor (PRO)..."
 echo "NOT: Whisper DAHİL - otomatik altyazı özelliği aktif"
 pyinstaller --clean aurivo_linux_pro.spec
 
@@ -102,7 +102,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "[7/6] Build tamamlandı!"
+echo "[7/7] Build tamamlandı!"
 echo ""
 
 # Icon symlink oluştur (PyInstaller packed binary için)

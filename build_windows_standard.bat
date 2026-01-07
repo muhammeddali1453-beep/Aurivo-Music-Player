@@ -49,7 +49,7 @@ echo [3/5] Eski build dosyalari temizleniyor...
 if exist "dist\Aurivo-Standard.exe" del /Q "dist\Aurivo-Standard.exe"
 if exist "build" rmdir /S /Q "build"
 
-echo [4/6] Native moduller derleniyor...
+echo [4/5] Native moduller derleniyor...
 
 REM --- C++ DSP (ctypes) ---
 if exist "aurivo_dsp.dll" del /Q "aurivo_dsp.dll"
@@ -93,7 +93,7 @@ if errorlevel 1 (
     echo UYARI: viz_engine build basarisiz (opsiyonel). Devam ediliyor...
 )
 
-echo [5/6] Windows executable olusturuluyor (STANDARD)...
+echo [5/5] Windows executable olusturuluyor (STANDARD)...
 echo NOT: Whisper DAHIL DEGIL - kullanici istege bagli kuracak
 pyinstaller --clean aurivo_windows_standard.spec
 
@@ -104,7 +104,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [6/6] Build tamamlandi!
+echo [6/5] Build tamamlandi!
 echo.
 echo ================================================
 echo Cikti: dist\Aurivo-Standard.exe

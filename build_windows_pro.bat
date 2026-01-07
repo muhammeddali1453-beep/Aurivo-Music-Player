@@ -13,13 +13,13 @@ echo.
 
 REM Sanal ortam varsa aktive et
 if exist "venv\Scripts\activate.bat" (
-    echo [1/6] Sanal ortam aktive ediliyor...
+    echo [1/7] Sanal ortam aktive ediliyor...
     call venv\Scripts\activate.bat
 ) else (
-    echo [1/6] Sanal ortam bulunamadi, sistem Python kullanilacak
+    echo [1/7] Sanal ortam bulunamadi, sistem Python kullanilacak
 )
 
-echo [2/6] Temel bağımlılıklar kontrol ediliyor...
+echo [2/7] Temel bağımlılıklar kontrol ediliyor...
 pip show pyinstaller >nul 2>&1
 if errorlevel 1 (
     echo PyInstaller kurulu degil, kuruluyor...
@@ -45,7 +45,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [3/6] Whisper ve PyTorch kurulumu kontrol ediliyor...
+echo [3/7] Whisper ve PyTorch kurulumu kontrol ediliyor...
 pip show openai-whisper >nul 2>&1
 if errorlevel 1 (
     echo Whisper kurulu degil, kuruluyor... (Bu biraz zaman alabilir)
@@ -58,11 +58,11 @@ if errorlevel 1 (
     pip install torch torchaudio
 )
 
-echo [4/6] Eski build dosyalari temizleniyor...
+echo [4/7] Eski build dosyalari temizleniyor...
 if exist "dist\Aurivo-Pro.exe" del /Q "dist\Aurivo-Pro.exe"
 if exist "build" rmdir /S /Q "build"
 
-echo [5/6] Native moduller derleniyor...
+echo [5/7] Native moduller derleniyor...
 
 REM --- C++ DSP (ctypes) ---
 if exist "aurivo_dsp.dll" del /Q "aurivo_dsp.dll"
@@ -106,7 +106,7 @@ if errorlevel 1 (
     echo UYARI: viz_engine build basarisiz (opsiyonel). Devam ediliyor...
 )
 
-echo [6/6] Windows executable olusturuluyor (PRO)...
+echo [6/7] Windows executable olusturuluyor (PRO)...
 echo NOT: Whisper DAHIL - otomatik altyazi ozelligi aktif
 pyinstaller --clean aurivo_windows_pro.spec
 
@@ -117,7 +117,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [7/6] Build tamamlandi!
+echo [7/7] Build tamamlandi!
 echo.
 echo ================================================
 echo Cikti: dist\Aurivo-Pro.exe
