@@ -1405,7 +1405,14 @@ if DBUS_AVAILABLE:
 
                 # Position (microseconds)
                 try:
-                    props['Position'] = dbus.Int64(self.player.mediaPlayer.position() * 1000)
+                    # Track değişiminde bazı DE'ler ilk sorguda eski pozisyonu alabiliyor.
+                    # Kısa süreli override ile çubuğun ortadan başlamasını engelle.
+                    override_us = getattr(self.player, '_mpris_position_override_us', None)
+                    override_until = float(getattr(self.player, '_mpris_position_override_until', 0.0) or 0.0)
+                    if override_us is not None and time.time() < override_until:
+                        props['Position'] = dbus.Int64(int(override_us))
+                    else:
+                        props['Position'] = dbus.Int64(self.player.mediaPlayer.position() * 1000)
                 except Exception:
                     props['Position'] = dbus.Int64(0)
 
@@ -1480,10 +1487,43 @@ if DBUS_AVAILABLE:
         def update_metadata(self):
             """Metadata değiştiğinde sinyal gönder"""
             try:
+                # Track değişince Position'ı 0 kabul et (DE slider ortadan başlamasın)
+                try:
+                    self.player._mpris_position_override_us = 0
+                    self.player._mpris_position_override_until = time.time() + 1.5
+                except Exception:
+                    pass
+
                 self.PropertiesChanged('org.mpris.MediaPlayer2.Player',
-                                     {'Metadata': self._get_metadata()}, [])
+                                     {'Metadata': self._get_metadata(), 'Position': dbus.Int64(0)}, [])
+                # MPRIS spec: seek sonrası Seeked sinyali
+                try:
+                    self.Seeked(dbus.Int64(0))
+                except Exception:
+                    pass
             except:
                 pass
+
+        def notify_seeked(self, position_us: int):
+            """Seek/SetPosition sonrası DE sliderını stabilize et."""
+            try:
+                pos_us = int(position_us)
+            except Exception:
+                pos_us = 0
+            try:
+                self.player._mpris_position_override_us = pos_us
+                self.player._mpris_position_override_until = time.time() + 0.8
+            except Exception:
+                pass
+            try:
+                self.Seeked(dbus.Int64(pos_us))
+            except Exception:
+                pass
+
+        @dbus.service.signal('org.mpris.MediaPlayer2.Player', signature='x')
+        def Seeked(self, position):
+            """Seeked(position_us)"""
+            pass
 
         def update_playback_status(self):
             """Oynatma durumu değiştiğinde DE'ye bildir."""
@@ -22388,6 +22428,13 @@ class AurivoPlayer(QMainWindow):
             if self.audio_engine:
                 self.audio_engine.media_player.setPosition(val)
 
+        # MPRIS: kullanıcı sarınca ortam oynatıcı sliderını da güncelle
+        try:
+            if hasattr(self, 'mpris') and self.mpris and self.search_mode != 'web':
+                self.mpris.notify_seeked(int(val) * 1000)
+        except Exception:
+            pass
+
         # Bırakınca: sağ label'ı tekrar toplam süreye döndür
         try:
             self._seek_preview_active = False
@@ -22604,6 +22651,15 @@ class AurivoPlayer(QMainWindow):
         try:
             delta_ms = int(offset_us // 1000)
             self._nudge_position(delta_ms)
+            try:
+                if hasattr(self, 'mpris') and self.mpris:
+                    # Yeni pozisyonu engine'den alıp Seeked yayınla
+                    pos_ms = 0
+                    if hasattr(self, 'audio_engine') and self.audio_engine:
+                        pos_ms = int(self.audio_engine.media_player.position() or 0)
+                    self.mpris.notify_seeked(pos_ms * 1000)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -22629,6 +22685,11 @@ class AurivoPlayer(QMainWindow):
                     self.positionSlider.setValue(pos_ms)
                 except Exception:
                     pass
+            try:
+                if hasattr(self, 'mpris') and self.mpris:
+                    self.mpris.notify_seeked(int(pos_ms) * 1000)
+            except Exception:
+                pass
         except Exception:
             pass
 
