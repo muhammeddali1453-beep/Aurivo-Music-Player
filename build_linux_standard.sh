@@ -15,16 +15,16 @@ echo ""
 
 # Sanal ortam varsa aktive et
 if [ -d "pyqt_venv" ]; then
-    echo "[1/5] Sanal ortam aktive ediliyor..."
+    echo "[1/6] Sanal ortam aktive ediliyor..."
     source pyqt_venv/bin/activate
 elif [ -d "venv" ]; then
-    echo "[1/5] Sanal ortam aktive ediliyor..."
+    echo "[1/6] Sanal ortam aktive ediliyor..."
     source venv/bin/activate
 else
-    echo "[1/5] Sanal ortam bulunamadı, sistem Python kullanılacak"
+    echo "[1/6] Sanal ortam bulunamadı, sistem Python kullanılacak"
 fi
 
-echo "[2/5] Temel bağımlılıklar kontrol ediliyor..."
+echo "[2/6] Temel bağımlılıklar kontrol ediliyor..."
 if ! pip show pyinstaller &> /dev/null; then
     echo "PyInstaller kurulu değil, kuruluyor..."
     pip install pyinstaller

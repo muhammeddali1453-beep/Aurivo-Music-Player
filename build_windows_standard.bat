@@ -104,7 +104,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [6/5] Build tamamlandi!
+echo [5/5] Build tamamlandi!
 echo.
 echo ================================================
 echo Cikti: dist\Aurivo-Standard.exe
