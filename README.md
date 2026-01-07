@@ -149,6 +149,12 @@ In this release, the app has been rebranded from **Angolla → Aurivo**.
 - **Bar Renk Modları**: Normal, RGB spektrum, Gradyan
 - **Dinamik Renkler**: Tema değişimi ile otomatik uyum
 
+### 🖥️ Sistem Entegrasyonu
+- **Linux Medya Kontrolü**: MPRIS2 ile sistem tepsisi entegrasyonu
+- **Arka Planda Çalışma**: Sistem tray ikonu ile minimum pencere modu
+- **Klavye Kısayolları**: Özelleştirilebilir global kısayollar
+- **Desktop Bildirimler**: Parça değişikliği bildirimleri
+
 ## 📦 İndirme Seçenekleri
 
 ### 🎵 Aurivo Standard (Önerilen)

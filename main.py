@@ -1233,6 +1233,190 @@ class MockMediaPlayer(QObject):
     def isSeekable(self): return True
     def isAudioAvailable(self): return True
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MPRIS2 - Linux Sistem Medya Entegrasyonu
+# ═══════════════════════════════════════════════════════════════════════════
+try:
+    import dbus
+    import dbus.service
+    from dbus.mainloop.glib import DBusGMainLoop
+    DBUS_AVAILABLE = True
+except ImportError:
+    DBUS_AVAILABLE = False
+    dbus = None
+
+if DBUS_AVAILABLE:
+    class MPRISInterface(dbus.service.Object):
+        """MPRIS2 arayüzü - Linux sistem medya kontrolü"""
+        
+        def __init__(self, player):
+            try:
+                DBusGMainLoop(set_as_default=True)
+                bus_name = dbus.service.BusName('org.mpris.MediaPlayer2.aurivo',
+                                                bus=dbus.SessionBus())
+                dbus.service.Object.__init__(self, bus_name, '/org/mpris/MediaPlayer2')
+                self.player = player
+            except Exception as e:
+                print(f"⚠️ MPRIS başlatma hatası: {e}")
+        
+        # org.mpris.MediaPlayer2 interface
+        @dbus.service.method('org.mpris.MediaPlayer2')
+        def Raise(self):
+            """Pencereyi öne getir"""
+            self.player.show()
+            self.player.raise_()
+            self.player.activateWindow()
+        
+        @dbus.service.method('org.mpris.MediaPlayer2')
+        def Quit(self):
+            """Uygulamadan çık"""
+            self.player._allow_quit = True
+            self.player.close()
+        
+        @dbus.service.method('org.mpris.MediaPlayer2.Player')
+        def PlayPause(self):
+            """Oynat/Duraklat"""
+            self.player._play_pause()
+        
+        @dbus.service.method('org.mpris.MediaPlayer2.Player')
+        def Play(self):
+            """Oynat"""
+            self.player.mediaPlayer.play()
+        
+        @dbus.service.method('org.mpris.MediaPlayer2.Player')
+        def Pause(self):
+            """Duraklat"""
+            self.player.mediaPlayer.pause()
+        
+        @dbus.service.method('org.mpris.MediaPlayer2.Player')
+        def Stop(self):
+            """Durdur"""
+            self.player.mediaPlayer.stop()
+        
+        @dbus.service.method('org.mpris.MediaPlayer2.Player')
+        def Next(self):
+            """Sonraki parça"""
+            self.player._play_next()
+        
+        @dbus.service.method('org.mpris.MediaPlayer2.Player')
+        def Previous(self):
+            """Önceki parça"""
+            self.player._play_previous()
+        
+        @dbus.service.method('org.mpris.MediaPlayer2.Player', in_signature='x')
+        def Seek(self, offset):
+            """İleri/geri sar (mikrosaniye)"""
+            current_ms = self.player.mediaPlayer.position()
+            new_ms = current_ms + (offset // 1000)
+            self.player.mediaPlayer.setPosition(max(0, new_ms))
+        
+        @dbus.service.method('org.mpris.MediaPlayer2.Player', in_signature='ox')
+        def SetPosition(self, track_id, position):
+            """Pozisyon ayarla (mikrosaniye)"""
+            self.player.mediaPlayer.setPosition(position // 1000)
+        
+        # Properties
+        @dbus.service.method('org.freedesktop.DBus.Properties',
+                           in_signature='ss', out_signature='v')
+        def Get(self, interface, prop):
+            """Property getter"""
+            if prop == 'Identity':
+                return 'Aurivo Music Player'
+            elif prop == 'CanQuit':
+                return True
+            elif prop == 'CanRaise':
+                return True
+            elif prop == 'HasTrackList':
+                return False
+            elif prop == 'DesktopEntry':
+                return 'aurivo'
+            elif prop == 'PlaybackStatus':
+                state = self.player.mediaPlayer.state()
+                if state == QMediaPlayer.PlayingState:
+                    return 'Playing'
+                elif state == QMediaPlayer.PausedState:
+                    return 'Paused'
+                return 'Stopped'
+            elif prop == 'Metadata':
+                return self._get_metadata()
+            elif prop == 'Volume':
+                return self.player.mediaPlayer.volume() / 100.0
+            elif prop == 'Position':
+                return dbus.Int64(self.player.mediaPlayer.position() * 1000)
+            elif prop == 'CanGoNext':
+                return self.player.playlistWidget.count() > 1
+            elif prop == 'CanGoPrevious':
+                return self.player.playlistWidget.count() > 1
+            elif prop == 'CanPlay':
+                return True
+            elif prop == 'CanPause':
+                return True
+            elif prop == 'CanSeek':
+                return True
+            elif prop == 'CanControl':
+                return True
+            return dbus.String('')
+        
+        @dbus.service.method('org.freedesktop.DBus.Properties',
+                           in_signature='ssv')
+        def Set(self, interface, prop, value):
+            """Property setter"""
+            if prop == 'Volume':
+                self.player.mediaPlayer.setVolume(int(value * 100))
+        
+        def _get_metadata(self):
+            """Metadata dictionary oluştur"""
+            metadata = dbus.Dictionary({}, signature='sv')
+            
+            # Şu anki parça bilgisi
+            current_item = self.player.playlistWidget.currentItem()
+            if current_item:
+                text = current_item.text()
+                # "Sanatçı - Başlık" formatında ayrıştır
+                if ' - ' in text:
+                    artist, title = text.split(' - ', 1)
+                else:
+                    artist = 'Unknown'
+                    title = text
+                
+                metadata['xesam:title'] = dbus.String(title)
+                metadata['xesam:artist'] = dbus.Array([dbus.String(artist)], signature='s')
+                
+                # Parça ID
+                path = current_item.data(Qt.UserRole)
+                if path:
+                    metadata['mpris:trackid'] = dbus.ObjectPath(f'/org/mpris/MediaPlayer2/track/{abs(hash(path))}')
+                    
+                    # Albüm kapağı varsa
+                    try:
+                        from mutagen import File
+                        audio = File(path)
+                        if audio and hasattr(audio, 'pictures') and audio.pictures:
+                            # Kapak var ama dosya yolu vermek zahmetli, şimdilik pas
+                            pass
+                    except:
+                        pass
+                
+                # Süre (mikrosaniye)
+                duration_ms = self.player.mediaPlayer.duration()
+                if duration_ms > 0:
+                    metadata['mpris:length'] = dbus.Int64(duration_ms * 1000)
+            
+            return metadata
+        
+        def update_metadata(self):
+            """Metadata değiştiğinde sinyal gönder"""
+            try:
+                self.PropertiesChanged('org.mpris.MediaPlayer2.Player',
+                                     {'Metadata': self._get_metadata()}, [])
+            except:
+                pass
+        
+        @dbus.service.signal('org.freedesktop.DBus.Properties',
+                           signature='sa{sv}as')
+        def PropertiesChanged(self, interface, changed, invalidated):
+            pass
+
 class GlobalAudioEngine(QThread):
     """
     Professional Thread-Isolated Engine using sounddevice + C++ DSP.
@@ -12862,6 +13046,15 @@ class AurivoPlayer(QMainWindow):
         self._tray_notice_shown = False
         self._tray_enabled = False
         self._init_system_tray()
+        
+        # --- MPRIS2 - Linux sistem medya kontrolü ---
+        self.mpris = None
+        if DBUS_AVAILABLE:
+            try:
+                self.mpris = MPRISInterface(self)
+                print("✓ MPRIS2 sistem entegrasyonu aktif")
+            except Exception as e:
+                print(f"⚠️ MPRIS başlatma hatası: {e}")
 
     def _get_tray_icon(self) -> QIcon:
         """Tray için ikon döndür (tema -> dosya fallback)."""
@@ -22351,6 +22544,13 @@ class AurivoPlayer(QMainWindow):
         self.infoDisplayWidget.update_info(title, artist, album, self.current_file_path)
         self._update_info_panels(title, artist, album, self.current_file_path)
         self._apply_album_color_theme(self.current_file_path)
+        
+        # MPRIS metadata güncelle
+        if hasattr(self, 'mpris') and self.mpris:
+            try:
+                self.mpris.update_metadata()
+            except:
+                pass
 
         # Clementine tarzı: oynayan satırı ayrı bir işaret ile göster;
         # kullanıcı seçimini zorla değiştirme.
