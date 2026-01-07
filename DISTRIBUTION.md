@@ -24,6 +24,9 @@
 - Python 3.10+
 - PyQt5: `pip install PyQt5`
 - PyInstaller: `pip install pyinstaller`
+- Native build için (en az biri):
+   - Visual Studio Build Tools (MSVC `cl`)
+   - veya MinGW-w64 (`g++`)
 
 ### Build Adımları
 ```cmd
@@ -32,7 +35,7 @@ python -m venv venv
 venv\Scripts\activate
 
 # 2. Bağımlılıkları kur
-pip install PyQt5 mutagen numpy pyinstaller
+pip install PyQt5 mutagen numpy pyinstaller pybind11
 
 # 3. Build çalıştır
 build_windows.bat
@@ -85,7 +88,7 @@ pip install PyQt5 mutagen numpy pyinstaller
 
 ### Windows
 ```
-Aurivo-Windows-v1.0.zip
+Aurivo-Windows-v2.0.0.zip
 ├── Aurivo.exe          # Ana executable
 ├── README.txt           # Kullanım kılavuzu
 └── LICENSE.txt
@@ -93,7 +96,7 @@ Aurivo-Windows-v1.0.zip
 
 ### Linux
 ```
-Aurivo-Linux-v1.0.tar.gz
+Aurivo-Linux-v2.0.0.tar.gz
 ├── aurivo/             # Klasör yapısı
 │   ├── aurivo          # Executable
 │   └── ...

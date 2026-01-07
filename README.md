@@ -143,8 +143,8 @@ Detaylı kurulum talimatları için [INSTALL.md](INSTALL.md) dosyasına bakın.
 - **Tek Dosya Yapısı**: ~3000+ satır monolitik Python kodu
 - **PyQt5 GUI**: QMainWindow, QMediaPlayer, QAudioProbe
 - **C++ Bileşenler**:
-  - `aurivo_dsp.so`: Ses efektleri motoru
-  - `subtitle_engine.so`: Altyazı işleme (pybind11)
+  - `aurivo_dsp` (Linux: `.so`, Windows: `.dll`): Ses efektleri motoru
+  - `subtitle_engine` (Linux: `.so`, Windows: `.pyd`): Altyazı işleme (pybind11)
 - **FFT Pipeline**: QAudioProbe → NumPy → 96-band spektrum → Görselleştirme
 
 ### Ses Veri Akışı

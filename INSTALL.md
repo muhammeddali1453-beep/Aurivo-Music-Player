@@ -117,6 +117,8 @@ Dahili C++ DSP motoru ile:
 
 Efektler otomatik olarak yüklenir (aurivo_dsp.so).
 
+Windows'ta DSP motoru dosyası `aurivo_dsp.dll` olarak gelir.
+
 ## ⚙️ Ayarlar ve Yapılandırma
 
 Ayarlar otomatik olarak şurada saklanır:

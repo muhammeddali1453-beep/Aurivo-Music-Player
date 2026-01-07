@@ -130,7 +130,7 @@ git push -u origin main
 sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
 
 # 2. Paketi indirip çıkartın
-tar -xzf Aurivo-Linux-v1.0.tar.gz
+tar -xzf Aurivo-Linux-v2.0.0.tar.gz
 cd aurivo
 
 # 3. Çalıştırın
@@ -145,8 +145,8 @@ Detaylı talimatlar için [INSTALL.md](INSTALL.md) dosyasına bakın.
 - **PyQt5**: 5.15.11
 - **Dahil Bileşenler**:
   - Ana uygulama (aurivo.bin)
-  - DSP motoru (aurivo_dsp.so)
-  - Subtitle engine (subtitle_engine.so)
+  - DSP motoru (Linux: aurivo_dsp.so / Windows: aurivo_dsp.dll)
+  - Subtitle engine (Linux: subtitle_engine*.so / Windows: subtitle_engine*.pyd)
   - 11 görselleştirme modu
   - Icon set (SVG)
   - Desktop integration
@@ -169,7 +169,7 @@ Clementine, PyQt5, NumPy, GStreamer ve tüm açık kaynak topluluğuna teşekkü
 ```
 
 6. **Assets Yükleme**:
-   - `Aurivo-Linux-v1.0.tar.gz` dosyasını sürükle-bırak (dist/ klasöründen)
+  - `Aurivo-Linux-v2.0.0.tar.gz` dosyasını sürükle-bırak (dist/ klasöründen)
    - Dosya yüklenene kadar bekle
 
 7. **Set as latest release** işaretle
