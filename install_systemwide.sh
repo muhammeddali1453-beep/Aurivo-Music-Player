@@ -85,6 +85,15 @@ if [[ -z "$BIN_SRC" || ! -e "$BIN_SRC" ]]; then
   exit 1
 fi
 
+# Eğer BIN_SRC bir "bundle" içindeyse (örn: dist/aurivo/aurivo), tek dosya kopyalamak yetmez.
+# Bu durumda tüm klasörü kurup, ~/.local/bin/aurivo için wrapper üretiriz.
+BIN_SRC_ABS="$(cd -- "$(dirname -- "$BIN_SRC")" && pwd)/$(basename -- "$BIN_SRC")"
+BIN_SRC_DIR="$(cd -- "$(dirname -- "$BIN_SRC_ABS")" && pwd)"
+IS_BUNDLE=0
+if [[ -f "$BIN_SRC_DIR/aurivo.bin" || -d "$BIN_SRC_DIR/_internal" ]]; then
+  IS_BUNDLE=1
+fi
+
 ICON_SRC=""
 for candidate in \
   "$ROOT_DIR/icons/aurivo.png" \
@@ -109,11 +118,13 @@ if [[ "$USER_MODE" -eq 1 ]]; then
   DESKTOP_DST_DIR="$HOME/.local/share/applications"
   ICON_DST_DIR="$HOME/.local/share/icons/hicolor/48x48/apps"
   PIXMAPS_DIR="$HOME/.local/share/pixmaps"
+  APP_DST_DIR="$HOME/.local/share/aurivo"
 else
   BIN_DST="/usr/local/bin/aurivo"
   DESKTOP_DST_DIR="/usr/local/share/applications"
   ICON_DST_DIR="/usr/local/share/icons/hicolor/48x48/apps"
   PIXMAPS_DIR="/usr/local/share/pixmaps"
+  APP_DST_DIR="/usr/local/share/aurivo"
 fi
 
 install -d "$DESKTOP_DST_DIR" "$ICON_DST_DIR" "$PIXMAPS_DIR"
@@ -122,7 +133,28 @@ if [[ "$USER_MODE" -eq 1 ]]; then
   install -d "$HOME/.local/bin"
 fi
 
-install -m 0755 "$BIN_SRC" "$BIN_DST"
+if [[ "$IS_BUNDLE" -eq 1 ]]; then
+  # Bundle klasörünü komple kur
+  install -d "$APP_DST_DIR"
+  rm -rf "$APP_DST_DIR/app"
+  mkdir -p "$APP_DST_DIR/app"
+  cp -a "$BIN_SRC_DIR/." "$APP_DST_DIR/app/"
+
+  # PATH'e konacak wrapper: kurulu bundle içinden çalıştır
+  cat >"$BIN_DST" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="__AURIVO_APP_DIR__"
+cd "$APP_DIR"
+exec ./aurivo "\$@"
+EOF
+  sed -i "s|__AURIVO_APP_DIR__|$APP_DST_DIR/app|g" "$BIN_DST"
+  chmod 0755 "$BIN_DST"
+else
+  install -m 0755 "$BIN_SRC" "$BIN_DST"
+fi
+
 install -m 0644 "$DESKTOP_SRC" "$DESKTOP_DST_DIR/aurivo.desktop"
 install -m 0644 "$ICON_SRC" "$ICON_DST_DIR/aurivo.png"
 install -m 0644 "$ICON_SRC" "$PIXMAPS_DIR/aurivo.png"
@@ -141,6 +173,9 @@ fi
 
 echo "OK: Kurulum tamamlandı"
 echo " - Binary : $BIN_DST"
+if [[ "$IS_BUNDLE" -eq 1 ]]; then
+  echo " - AppDir : $APP_DST_DIR/app"
+fi
 echo " - Desktop: $DESKTOP_DST_DIR/aurivo.desktop"
 echo " - Icon   : $ICON_DST_DIR/aurivo.png"
 
