@@ -226,7 +226,7 @@ from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5.QtCore import (
     QUrl, Qt, QTime, QDir, QModelIndex, QTimer, QByteArray,
     QSettings, QPointF, QPoint, QRectF, QRect, pyqtSignal, pyqtSlot, QEvent, QObject, QSize, QLocale,
-    QStandardPaths, QStringListModel, QThread, QPropertyAnimation, QEasingCurve, QSortFilterProxyModel
+    QStandardPaths, QStringListModel, QThread, QPropertyAnimation, QEasingCurve, QSortFilterProxyModel, QMetaObject, Q_ARG
 )
 import threading
 from PyQt5.QtGui import QPolygonF
@@ -1276,47 +1276,41 @@ if DBUS_AVAILABLE:
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def PlayPause(self):
             """Oynat/Duraklat"""
-            # Aurivo'da public metot: play_pause()
             try:
-                if hasattr(self.player, 'play_pause'):
-                    self.player.play_pause()
-                    return
-            except Exception:
-                pass
-            # Fallback (varsa)
-            try:
-                if hasattr(self.player, '_play_pause'):
-                    self.player._play_pause()
+                # DBus callback thread'inden Qt objelerine direkt dokunmayalım.
+                QMetaObject.invokeMethod(self.player, '_mpris_play_pause', Qt.QueuedConnection)
             except Exception:
                 pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def Play(self):
             """Oynat"""
-            self.player.mediaPlayer.play()
+            try:
+                QMetaObject.invokeMethod(self.player, '_mpris_play', Qt.QueuedConnection)
+            except Exception:
+                pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def Pause(self):
             """Duraklat"""
-            self.player.mediaPlayer.pause()
+            try:
+                QMetaObject.invokeMethod(self.player, '_mpris_pause', Qt.QueuedConnection)
+            except Exception:
+                pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def Stop(self):
             """Durdur"""
-            self.player.mediaPlayer.stop()
+            try:
+                QMetaObject.invokeMethod(self.player, '_mpris_stop', Qt.QueuedConnection)
+            except Exception:
+                pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def Next(self):
             """Sonraki parça"""
             try:
-                if hasattr(self.player, '_next_track'):
-                    self.player._next_track()
-                    return
-            except Exception:
-                pass
-            try:
-                if hasattr(self.player, '_play_next'):
-                    self.player._play_next()
+                QMetaObject.invokeMethod(self.player, '_mpris_next', Qt.QueuedConnection)
             except Exception:
                 pass
         
@@ -1324,28 +1318,35 @@ if DBUS_AVAILABLE:
         def Previous(self):
             """Önceki parça"""
             try:
-                if hasattr(self.player, '_prev_track'):
-                    self.player._prev_track()
-                    return
-            except Exception:
-                pass
-            try:
-                if hasattr(self.player, '_play_previous'):
-                    self.player._play_previous()
+                QMetaObject.invokeMethod(self.player, '_mpris_previous', Qt.QueuedConnection)
             except Exception:
                 pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player', in_signature='x')
         def Seek(self, offset):
             """İleri/geri sar (mikrosaniye)"""
-            current_ms = self.player.mediaPlayer.position()
-            new_ms = current_ms + (offset // 1000)
-            self.player.mediaPlayer.setPosition(max(0, new_ms))
+            try:
+                QMetaObject.invokeMethod(
+                    self.player,
+                    '_mpris_seek',
+                    Qt.QueuedConnection,
+                    Q_ARG(int, int(offset))
+                )
+            except Exception:
+                pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player', in_signature='ox')
         def SetPosition(self, track_id, position):
             """Pozisyon ayarla (mikrosaniye)"""
-            self.player.mediaPlayer.setPosition(position // 1000)
+            try:
+                QMetaObject.invokeMethod(
+                    self.player,
+                    '_mpris_set_position',
+                    Qt.QueuedConnection,
+                    Q_ARG(int, int(position))
+                )
+            except Exception:
+                pass
         
         # Properties
         @dbus.service.method('org.freedesktop.DBus.Properties',
@@ -22423,10 +22424,161 @@ class AurivoPlayer(QMainWindow):
             if self.search_mode == "web":
                 self._web_toggle_play()
             else:
-                if self.audio_engine.media_player.state() == QMediaPlayer.PlayingState:
-                    self.audio_engine.media_player.pause()
-                else:
-                    self.audio_engine.media_player.play()
+                if not getattr(self, 'audio_engine', None):
+                    return
+                try:
+                    if self.audio_engine.media_player.state() == QMediaPlayer.PlayingState:
+                        self.audio_engine.media_player.pause()
+                        return
+                    # PlayingState değilse: çal
+                    if getattr(self, 'playlist', None) is not None:
+                        if self.playlist.currentIndex() < 0 and self.playlist.mediaCount() > 0:
+                            self.playlist.setCurrentIndex(0)
+                    # Motor NoMedia ise mevcut index'i yükleyerek başlat
+                    if self.audio_engine.media_player.mediaStatus() == QMediaPlayer.NoMedia:
+                        try:
+                            self.playlist_position_changed(self.playlist.currentIndex())
+                        except Exception:
+                            pass
+                    else:
+                        self.audio_engine.media_player.play()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------#
+    # MPRIS (Qt main thread üzerinden çalıştırılmalı)
+    # ------------------------------------------------------------------#
+    @pyqtSlot()
+    def _mpris_play_pause(self):
+        self.play_pause()
+        try:
+            if hasattr(self, 'mpris') and self.mpris:
+                self.mpris.update_playback_status()
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def _mpris_play(self):
+        # Context-aware "play" (toggle değil)
+        try:
+            if hasattr(self, 'mainContentStack') and self.mainContentStack.currentIndex() == 1 and hasattr(self, 'videoPlayer'):
+                self.videoPlayer.play()
+                return
+        except Exception:
+            pass
+
+        if getattr(self, 'search_mode', '') == 'web':
+            try:
+                if hasattr(self, '_web_toggle_play'):
+                    # web tarafında ayrı "play" yok; toggle en güvenlisi.
+                    self._web_toggle_play()
+            except Exception:
+                pass
+            return
+
+        if not getattr(self, 'audio_engine', None):
+            return
+        try:
+            if self.audio_engine.media_player.state() != QMediaPlayer.PlayingState:
+                # play_pause içindeki "NoMedia yükle" mantığını kullan
+                self.play_pause()
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def _mpris_pause(self):
+        try:
+            if hasattr(self, 'mainContentStack') and self.mainContentStack.currentIndex() == 1 and hasattr(self, 'videoPlayer'):
+                self.videoPlayer.pause()
+                return
+        except Exception:
+            pass
+        if getattr(self, 'search_mode', '') == 'web':
+            try:
+                self._web_toggle_play()
+            except Exception:
+                pass
+            return
+        try:
+            if getattr(self, 'audio_engine', None):
+                self.audio_engine.media_player.pause()
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def _mpris_stop(self):
+        try:
+            if hasattr(self, 'mainContentStack') and self.mainContentStack.currentIndex() == 1 and hasattr(self, 'videoPlayer'):
+                self.videoPlayer.stop()
+                return
+        except Exception:
+            pass
+        if getattr(self, 'search_mode', '') == 'web':
+            # Web'de stop yok; durdurmak için pause/toggle
+            try:
+                self._web_toggle_play()
+            except Exception:
+                pass
+            return
+        try:
+            if getattr(self, 'audio_engine', None):
+                self.audio_engine.media_player.stop()
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def _mpris_next(self):
+        try:
+            self._next_track('mpris')
+        except Exception:
+            try:
+                self._next_track()
+            except Exception:
+                pass
+
+    @pyqtSlot()
+    def _mpris_previous(self):
+        try:
+            self._prev_track('mpris')
+        except Exception:
+            try:
+                self._prev_track()
+            except Exception:
+                pass
+
+    @pyqtSlot(int)
+    def _mpris_seek(self, offset_us: int):
+        # offset_us: mikro saniye
+        try:
+            delta_ms = int(offset_us // 1000)
+            self._nudge_position(delta_ms)
+        except Exception:
+            pass
+
+    @pyqtSlot(int)
+    def _mpris_set_position(self, position_us: int):
+        # position_us: mikro saniye
+        try:
+            pos_ms = int(position_us // 1000)
+            if hasattr(self, 'mainContentStack') and self.mainContentStack.currentIndex() == 1 and hasattr(self, 'videoPlayer'):
+                if self.videoPlayer.isSeekable():
+                    self.videoPlayer.setPosition(pos_ms)
+                    try:
+                        self.positionSlider.setValue(pos_ms)
+                    except Exception:
+                        pass
+                return
+            if getattr(self, 'search_mode', '') == 'web':
+                # web seek implementasyonu yok
+                return
+            if getattr(self, 'audio_engine', None) and self.audio_engine.media_player.isSeekable():
+                self.audio_engine.media_player.setPosition(pos_ms)
+                try:
+                    self.positionSlider.setValue(pos_ms)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _nudge_position(self, delta_ms: int):
         """Pozisyonu ileri/geri kaydır (F3/F4) - Context Aware."""
