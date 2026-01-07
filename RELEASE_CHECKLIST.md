@@ -11,7 +11,7 @@
 ## GitHub Ayarları
 
 ### Repository Ayarları
-1. GitHub'da repository oluştur: `https://github.com/KULLANICI_ADINIZ/Angolla-Music-Player`
+1. GitHub'da repository oluştur: `https://github.com/KULLANICI_ADINIZ/Aurivo-Music-Player`
 2. Repository ayarları:
    - **Description**: "🎵 Clementine-inspired music player with 11 visualizations, DSP effects, and video subtitle support"
    - **Topics**: `music-player`, `pyqt5`, `linux`, `audio-visualization`, `gstreamer`, `fft`, `dsp`
@@ -19,7 +19,7 @@
 
 ### İlk Commit ve Push
 ```bash
-cd /home/muhammet-dali/Angolla-Music-Player
+cd /home/muhammet-dali/Aurivo-Music-Player
 
 # Git başlat (eğer yoksa)
 git init
@@ -49,10 +49,10 @@ env/
 *.swo
 
 # Config files (user-specific)
-angolla_config.json
-angolla_playlist.json
-angolla_playlists_collection.json
-angolla_playlists_collection.pkl.bak
+aurivo_config.json
+aurivo_playlist.json
+aurivo_playlists_collection.json
+aurivo_playlists_collection.pkl.bak
 
 # Build artifacts
 *.tar.gz
@@ -70,10 +70,10 @@ EOF
 
 # Dosyaları stage'e al
 git add .
-git commit -m "Initial commit: Angolla Music Player v1.0"
+git commit -m "Initial commit: Aurivo Music Player v1.0"
 
 # Remote ekle
-git remote add origin https://github.com/KULLANICI_ADINIZ/Angolla-Music-Player.git
+git remote add origin https://github.com/KULLANICI_ADINIZ/Aurivo-Music-Player.git
 
 # Push et
 git branch -M main
@@ -83,15 +83,15 @@ git push -u origin main
 ## Release Oluşturma
 
 ### 1. GitHub Web Interface'den
-1. Repository'ye git: `https://github.com/KULLANICI_ADINIZ/Angolla-Music-Player`
+1. Repository'ye git: `https://github.com/KULLANICI_ADINIZ/Aurivo-Music-Player`
 2. Sağ tarafta **"Releases"** → **"Create a new release"**
 3. **"Choose a tag"** → `v1.0` yaz (yeni tag oluştur)
-4. **Release title**: `Angolla Music Player v1.0 - İlk Kararlı Sürüm`
+4. **Release title**: `Aurivo Music Player v1.0 - İlk Kararlı Sürüm`
 5. **Description**: (Aşağıdaki template'i kullan)
 
 #### Release Description Template
 ```markdown
-# 🎉 Angolla Music Player v1.0
+# 🎉 Aurivo Music Player v1.0
 
 İlk kararlı sürümümüzü duyurmaktan mutluluk duyuyoruz!
 
@@ -130,11 +130,11 @@ git push -u origin main
 sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
 
 # 2. Paketi indirip çıkartın
-tar -xzf Angolla-Linux-v1.0.tar.gz
-cd angolla
+tar -xzf Aurivo-Linux-v1.0.tar.gz
+cd aurivo
 
 # 3. Çalıştırın
-./angolla
+./aurivo
 ```
 
 Detaylı talimatlar için [INSTALL.md](INSTALL.md) dosyasına bakın.
@@ -144,8 +144,8 @@ Detaylı talimatlar için [INSTALL.md](INSTALL.md) dosyasına bakın.
 - **Python**: 3.13.11
 - **PyQt5**: 5.15.11
 - **Dahil Bileşenler**:
-  - Ana uygulama (angolla.bin)
-  - DSP motoru (angolla_dsp.so)
+  - Ana uygulama (aurivo.bin)
+  - DSP motoru (aurivo_dsp.so)
   - Subtitle engine (subtitle_engine.so)
   - 11 görselleştirme modu
   - Icon set (SVG)
@@ -169,7 +169,7 @@ Clementine, PyQt5, NumPy, GStreamer ve tüm açık kaynak topluluğuna teşekkü
 ```
 
 6. **Assets Yükleme**:
-   - `Angolla-Linux-v1.0.tar.gz` dosyasını sürükle-bırak (dist/ klasöründen)
+   - `Aurivo-Linux-v1.0.tar.gz` dosyasını sürükle-bırak (dist/ klasöründen)
    - Dosya yüklenene kadar bekle
 
 7. **Set as latest release** işaretle
@@ -185,13 +185,13 @@ sudo pacman -S github-cli  # Arch
 gh auth login
 
 # Tag oluştur
-git tag -a v1.0 -m "Angolla Music Player v1.0 - İlk Kararlı Sürüm"
+git tag -a v1.0 -m "Aurivo Music Player v1.0 - İlk Kararlı Sürüm"
 git push origin v1.0
 
 # Release oluştur
 gh release create v1.0 \
-  dist/Angolla-Linux-v1.0.tar.gz \
-  --title "Angolla Music Player v1.0 - İlk Kararlı Sürüm" \
+  dist/Aurivo-Linux-v1.0.tar.gz \
+  --title "Aurivo Music Player v1.0 - İlk Kararlı Sürüm" \
   --notes-file release_notes.md
 ```
 
@@ -201,7 +201,7 @@ gh release create v1.0 \
 Eğer CLI kullanacaksanız:
 ```bash
 cat > release_notes.md << 'EOF'
-# 🎉 Angolla Music Player v1.0
+# 🎉 Aurivo Music Player v1.0
 
 [Yukarıdaki template'i buraya kopyala]
 EOF
@@ -241,8 +241,8 @@ git push origin main --tags
 ./package_linux.sh
 
 # 5. GitHub'da yeni release oluştur
-gh release create v1.1 dist/Angolla-Linux-v1.1.tar.gz \
-  --title "Angolla v1.1" \
+gh release create v1.1 dist/Aurivo-Linux-v1.1.tar.gz \
+  --title "Aurivo v1.1" \
   --notes "Changelog..."
 ```
 
@@ -254,19 +254,19 @@ gh release create v1.1 dist/Angolla-Linux-v1.1.tar.gz \
 gpg --full-generate-key
 
 # Paketi imzala
-gpg --detach-sign --armor dist/Angolla-Linux-v1.0.tar.gz
+gpg --detach-sign --armor dist/Aurivo-Linux-v1.0.tar.gz
 
 # Release'e imza dosyasını da ekle
-gh release upload v1.0 dist/Angolla-Linux-v1.0.tar.gz.asc
+gh release upload v1.0 dist/Aurivo-Linux-v1.0.tar.gz.asc
 ```
 
 ### SHA256 Checksum
 ```bash
 # Checksum oluştur
-sha256sum dist/Angolla-Linux-v1.0.tar.gz > Angolla-Linux-v1.0.sha256
+sha256sum dist/Aurivo-Linux-v1.0.tar.gz > Aurivo-Linux-v1.0.sha256
 
 # Release notes'a ekle
-cat Angolla-Linux-v1.0.sha256
+cat Aurivo-Linux-v1.0.sha256
 ```
 
 ## Troubleshooting

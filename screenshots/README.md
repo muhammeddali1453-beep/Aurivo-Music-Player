@@ -74,7 +74,7 @@ spectacle
 ### Yöntem 1: Screenshots Klasörü (Bu Repo)
 ```bash
 # Ekran görüntülerini buraya kopyala
-cp ~/Pictures/angolla-*.png screenshots/
+cp ~/Pictures/aurivo-*.png screenshots/
 
 # Git'e ekle
 git add screenshots/
@@ -160,8 +160,8 @@ optipng screenshots/*.png
 Hibrit sistem için:
 ```bash
 # Screenshots'u public repo'ya kopyala
-cp -r screenshots ../Angolla-Music-Player-Public/
-cd ../Angolla-Music-Player-Public/
+cp -r screenshots ../Aurivo-Music-Player-Public/
+cd ../Aurivo-Music-Player-Public/
 git add screenshots/
 git commit -m "Assets: Ekran görüntüleri eklendi"
 git push

@@ -1,4 +1,4 @@
-# Angolla Music Player - Dağıtım Kılavuzu
+# Aurivo Music Player - Dağıtım Kılavuzu
 
 ## 🎵 Paket Stratejisi
 
@@ -38,11 +38,11 @@ pip install PyQt5 mutagen numpy pyinstaller
 build_windows.bat
 ```
 
-**Çıktı:** `dist/Angolla.exe` (~150-200MB)
+**Çıktı:** `dist/Aurivo.exe` (~150-200MB)
 
 ### Test
 ```cmd
-dist\Angolla.exe
+dist\Aurivo.exe
 ```
 
 ---
@@ -69,14 +69,14 @@ pip install PyQt5 mutagen numpy pyinstaller
 ```
 
 **Çıktı:** 
-- `dist/angolla/angolla` (klasör yapısı)
-- `Angolla-x86_64.AppImage` (tek dosya, opsiyonel)
+- `dist/aurivo/aurivo` (klasör yapısı)
+- `Aurivo-x86_64.AppImage` (tek dosya, opsiyonel)
 
 ### Test
 ```bash
-./dist/angolla/angolla
+./dist/aurivo/aurivo
 # veya
-./Angolla-x86_64.AppImage
+./Aurivo-x86_64.AppImage
 ```
 
 ---
@@ -85,23 +85,23 @@ pip install PyQt5 mutagen numpy pyinstaller
 
 ### Windows
 ```
-Angolla-Windows-v1.0.zip
-├── Angolla.exe          # Ana executable
+Aurivo-Windows-v1.0.zip
+├── Aurivo.exe          # Ana executable
 ├── README.txt           # Kullanım kılavuzu
 └── LICENSE.txt
 ```
 
 ### Linux
 ```
-Angolla-Linux-v1.0.tar.gz
-├── angolla/             # Klasör yapısı
-│   ├── angolla          # Executable
+Aurivo-Linux-v1.0.tar.gz
+├── aurivo/             # Klasör yapısı
+│   ├── aurivo          # Executable
 │   └── ...
 └── README.txt
 
 # veya
 
-Angolla-x86_64.AppImage  # Tek dosya
+Aurivo-x86_64.AppImage  # Tek dosya
 ```
 
 ---
@@ -156,8 +156,8 @@ Uygulama ilk kez "Otomatik Altyazı" kullanıldığında:
 
 ### İlk Çalıştırma
 ```
-Windows: Angolla.exe'ye çift tıkla
-Linux:   ./angolla veya AppImage'a çift tıkla
+Windows: Aurivo.exe'ye çift tıkla
+Linux:   ./aurivo veya AppImage'a çift tıkla
 ```
 
 ### Whisper Olmadan Kullanım

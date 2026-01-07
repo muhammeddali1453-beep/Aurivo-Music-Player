@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Angolla Music Player - Tek Dosya, Güncel Sürüm (Sade Geçiş + Çalışan Görselleştirme)
+Aurivo Music Player - Tek Dosya, Güncel Sürüm (Sade Geçiş + Çalışan Görselleştirme)
 """
 import math
 import sys
@@ -212,9 +212,11 @@ from PyQt5.QtWidgets import (
     QAction, QStatusBar, QTreeView, QStackedWidget, QListWidgetItem,
     QMenu, QFileDialog, QMessageBox, QShortcut, QFileSystemModel,
     QDialog, QCheckBox, QGridLayout, QComboBox, QLineEdit, QDial, QFrame,
+    QScrollArea,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QListView,
     QColorDialog, QToolBar, QToolButton, QStyle, QSizePolicy, QProgressBar,
-    QCompleter, QKeySequenceEdit, QActionGroup, QSpinBox, QGroupBox, QProgressDialog
+    QCompleter, QKeySequenceEdit, QActionGroup, QSpinBox, QGroupBox, QProgressDialog,
+    QStyledItemDelegate, QStyleOptionViewItem
 )
 from PyQt5.QtWidgets import QPlainTextEdit
 from PyQt5.QtMultimedia import (
@@ -250,6 +252,8 @@ QWebEngineProfile = None
 QWebChannel = None
 QWebEngineSettings = None
 QWebEngineScript = None
+QWebEngineUrlRequestInterceptor = None
+QWebEngineUrlRequestInfo = None
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEnginePage
@@ -268,6 +272,12 @@ try:
     from PyQt5.QtWebChannel import QWebChannel
 except Exception:
     pass
+
+try:
+    from PyQt5.QtWebEngineCore import QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo  # type: ignore
+except Exception:
+    QWebEngineUrlRequestInterceptor = None
+    QWebEngineUrlRequestInfo = None
 
 import collections # Ensure collections is imported for deque
 
@@ -350,7 +360,6 @@ def _blocked_html(reason: str) -> str:
     r = (reason or "").strip()
     if not r:
         r = "Bu adres güvenlik nedeniyle engellendi."
-    # Güvenlik: HTML içine kullanıcı/metin basmadan önce escape et
     r = _html.escape(r, quote=True)
     return (
         "<html><body style='background:#111;color:#eee;font-family:sans-serif;'>"
@@ -362,144 +371,123 @@ def _blocked_html(reason: str) -> str:
 
 
 def _looks_like_xss_payload(text: str) -> bool:
-    """Çok temel XSS göstergeleri (false-positive olabilir, fail-closed).
+    """URL string'lerinde temel XSS şüphe tespiti (agresif değil, hızlı)."""
+    try:
+        if not text:
+            return False
+        s = str(text)
+        if len(s) > 4096:
+            s = s[:4096]
+        sl = s.lower()
 
-    Not: Web sayfanın içindeki form alanlarını (POST body) göremeyiz; burada
-    en azından URL/path/query üzerinden bariz payloadları engelliyoruz.
-    """
-    if not text:
+        # Çok bariz XSS / JS URL vektörleri
+        needles = (
+            "<script", "</script", "javascript:", "vbscript:",
+            "data:text/html", "srcdoc=", "onerror=", "onload=", "onclick=",
+            "document.cookie", "window.location", "localstorage", "sessionstorage",
+        )
+        if any(n in sl for n in needles):
+            return True
+
+        # HTML tag açılışları + riskli elemanlar
+        if "<" in sl and ">" in sl:
+            risky_tags = ("script", "img", "svg", "iframe", "object", "embed")
+            if any(t in sl for t in risky_tags):
+                return True
         return False
-    t = text.strip().lower()
-    # bariz HTML/JS tag/handler örnekleri
-    needles = (
-        "<script",
-        "</script",
-        "javascript:",
-        "vbscript:",
-        "data:text/html",
-        "onerror=",
-        "onload=",
-        "onmouseover=",
-        "srcdoc=",
-        "document.cookie",
-    )
-    if any(n in t for n in needles):
-        return True
-    # ham tag karakterleri (encode edilmemiş)
-    if "<" in t or ">" in t:
-        return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# WEB DOWNLOAD GÜVENLİĞİ
-# ---------------------------------------------------------------------------
-_ALLOWED_DOWNLOAD_MIME_PREFIXES = ("image/", "audio/", "video/")
-
-# Script/çalıştırılabilir ve riskli uzantılar (indirimi engelle)
-_BLOCKED_DOWNLOAD_EXTS = {
-    "exe", "msi", "bat", "cmd", "com", "scr", "pif",
-    "ps1", "vbs", "js", "jse", "jar",
-    "sh", "bash", "zsh", "fish",
-    "py", "pyw", "rb", "pl", "php",
-    "htm", "html", "xhtml", "mhtml",
-    "svg",  # SVG script içerebilir
-    "apk", "dmg", "pkg", "deb", "rpm", "appimage",
-    "desktop",
-}
-
-# İzinli medya uzantıları (image/audio/video)
-_ALLOWED_DOWNLOAD_EXTS = {
-    # Images
-    "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "ico",
-    # Audio
-    "mp3", "flac", "ogg", "m4a", "wav", "aac", "opus", "wma",
-    # Video
-    "mp4", "mkv", "webm", "avi", "mov", "m4v",
-}
-
-
-def _is_allowed_download(mime_type: str, suggested_name: str) -> bool:
-    """Web sekmesi indirmesi için MIME+uzantı kontrolü.
-
-    Talimat gereği hem MIME hem uzantı denetlenir.
-    """
-    mt = (mime_type or "").strip().lower()
-    name = (suggested_name or "").strip()
-    ext = _os.path.splitext(name)[1].lower().lstrip(".")
-
-    # Uzantı yoksa veya açıkça riskliyse engelle
-    if not ext:
-        return False
-    if ext in _BLOCKED_DOWNLOAD_EXTS:
+    except Exception:
         return False
 
-    # MIME yoksa temkinli davran (talimata göre MIME denetimi şart)
-    if not mt:
+
+def _is_allowed_download(mime: str, filename: str) -> bool:
+    """Web sekmesi indirmelerinde allowlist (resim/müzik/video) uygula."""
+    try:
+        mime = (mime or "").strip().lower()
+        filename = (filename or "").strip().lower()
+
+        # Tehlikeli uzantıları kesin engelle
+        dangerous_ext = {
+            ".exe", ".msi", ".bat", ".cmd", ".com", ".scr",
+            ".ps1", ".vbs", ".js", ".jar", ".py", ".sh",
+            ".html", ".htm", ".xhtml", ".php",
+        }
+        ext = ""
+        try:
+            ext = _os.path.splitext(filename)[1]
+        except Exception:
+            ext = ""
+        if ext in dangerous_ext:
+            return False
+
+        allowed_ext = {
+            # Raster images
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+            # Audio
+            ".mp3", ".flac", ".ogg", ".m4a", ".wav", ".aac", ".opus",
+            # Video
+            ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+        }
+
+        allowed_mime_prefixes = ("image/", "audio/", "video/")
+        blocked_mimes = {"image/svg+xml", "text/html", "application/xhtml+xml"}
+
+        mime_ok = False
+        if mime:
+            if mime in blocked_mimes:
+                mime_ok = False
+            elif mime.startswith(allowed_mime_prefixes):
+                mime_ok = True
+
+        ext_ok = (not ext) or (ext in allowed_ext)
+
+        # Eğer uzantı varsa allowlist'te olmalı; uzantı yoksa MIME yeterli.
+        if ext:
+            return ext in allowed_ext and mime_ok is not False
+        return mime_ok and ext_ok
+    except Exception:
         return False
-
-    # MIME izinli kategori değilse engelle
-    if not any(mt.startswith(p) for p in _ALLOWED_DOWNLOAD_MIME_PREFIXES):
-        return False
-
-    # Uzantı izinli listede değilse engelle
-    if ext not in _ALLOWED_DOWNLOAD_EXTS:
-        return False
-
-    return True
-
-
-try:
-    from PyQt5.QtWebEngineCore import QWebEngineUrlRequestInterceptor
-except Exception:
-    QWebEngineUrlRequestInterceptor = None
 
 
 if QWebEngineUrlRequestInterceptor is not None:
-    class AngollaWebRequestInterceptor(QWebEngineUrlRequestInterceptor):
-        """Tüm alt kaynak isteklerinde HTTPS+allowlist zorunluluğu."""
+    class AurivoWebRequestInterceptor(QWebEngineUrlRequestInterceptor):
+        """Profil seviyesinde istekleri allowlist + HTTPS ile sınırlar."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
 
         def interceptRequest(self, info):
             try:
+                if not info or not hasattr(info, "requestUrl"):
+                    return
                 url = info.requestUrl()
-                # XSS/zarlı payload göstergeleri URL içinde ise engelle
+
+                # about: gibi iç sayfalara izin
                 try:
-                    import urllib.parse
-                    dec = urllib.parse.unquote_plus(url.toString())
-                    if _looks_like_xss_payload(dec):
-                        info.block(True)
+                    scheme = (url.scheme() or "").lower()
+                    if scheme in {"about"}:
                         return
                 except Exception:
                     pass
-                if not _is_allowed_web_qurl(url):
-                    info.block(True)
-            except Exception:
-                # Güvenlikte fail-closed tercih edilir
-                try:
-                    info.block(True)
-                except Exception:
-                    pass
 
-# ---------------------------------------------------------------------------
-# C++ DSP ENGINE BRIDGE
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# PYTHON DSP ENGINE (Replaces buggy C++ implementation)
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# GLOBAL STATE MANAGER (Industrial Persistence)
-# ---------------------------------------------------------------------------
+                if not _is_allowed_web_qurl(url):
+                    if hasattr(info, "block"):
+                        info.block(True)
+            except Exception:
+                pass
+
+
 class AudioManager(QObject):
-    """
-    Central source of truth for all Audio & DSP states.
-    Survives song changes, playlist skips, and app restarts.
-    """
+    """Tüm ses/DSP durumlarının merkezi yöneticisi."""
     state_changed = pyqtSignal()
-    
+
     def __init__(self):
         super().__init__()
-        self.settings = QSettings("Angolla", "AudioSettings")
+        self.settings = QSettings("Aurivo", "AudioSettings")
         self.lock = threading.Lock()
+
+        # Fixed band counts (keep UI predictable)
+        self.PEQ_BANDS = 8
+        self.DYN_EQ_BANDS = 2
         
         # Default State
         self.dsp_enabled = True
@@ -508,8 +496,117 @@ class AudioManager(QObject):
         self.tone_mid = 0.0
         self.tone_treble = 0.0
         self.stereo_width = 1.0
+        # Balance: -1.0 = sol, 0.0 = merkez, +1.0 = sağ
+        self.balance = 0.0
         self.acoustic_space = 0
         self.smart_audio_enabled = True # Varsayılan olarak açık (Efektler hemen duyulsun)
+
+        # New-gen effects (Python-side, lightweight)
+        self.compressor_enabled = False
+        self.limiter_enabled = False
+        self.bass_enhancer_enabled = False
+        self.noise_gate_enabled = False
+
+        self.deesser_enabled = False
+        self.exciter_enabled = False
+
+        self.stereo_widener_v2_enabled = False
+        self.reverb_enabled = False
+        self.echo_enabled = False
+
+        # New-gen effect parameters (defaults tuned for safe, subtle impact)
+        self.compressor_threshold_db = -18.0
+        self.compressor_ratio = 2.6
+        self.compressor_makeup_db = 2.5
+
+        self.limiter_ceiling = 0.98
+
+        self.bass_mix = 0.22
+
+        self.noise_gate_threshold_db = -55.0
+        self.noise_gate_floor_gain = 0.06
+
+        self.deesser_threshold_db = -22.0
+        self.deesser_strength = 0.55  # 0..1
+
+        self.exciter_amount = 0.35    # 0..1
+        self.exciter_mix = 0.18       # 0..1
+
+        # Stereo Widener v2
+        self.widener_width = 1.35     # 0.0..2.0 (S gain)
+        self.widener_mix = 0.35       # 0..1
+        self.widener_mono_safe = 1.0  # 0..1 (1.0 = normal, lower = more mono compatible)
+
+        # Reverb (Room)
+        self.reverb_room = 0.35       # 0..1
+        self.reverb_damping = 0.35    # 0..1
+        self.reverb_mix = 0.18        # 0..1
+        self.reverb_predelay_ms = 15.0
+        self.reverb_tone = 0.50       # 0..1 (1.0 = brighter, 0.0 = darker/high-cut)
+
+        # Echo / Delay
+        self.echo_delay_ms = 240.0
+        self.echo_feedback = 0.35     # 0..0.95
+        self.echo_mix = 0.22          # 0..0.6
+        self.echo_pingpong = False
+        self.echo_tone = 0.60         # 0..1 (1.0 = brighter, 0.0 = darker/high-cut)
+        self.echo_duck_enabled = True
+        self.echo_duck_threshold_db = -28.0
+        self.echo_duck_amount = 0.70  # 0..1
+
+        # ------------------------------------------------------------------
+        # Advanced effects (requested) - all disabled by default
+        # ------------------------------------------------------------------
+        # Convolution IR Reverb
+        self.ir_reverb_enabled = False
+        self.ir_reverb_path = ""
+        self.ir_reverb_mix = 0.18
+        self.ir_reverb_predelay_ms = 0.0
+
+        # Parametric EQ (PEQ)
+        self.peq_enabled = False
+        self.peq_freqs_hz = [100.0, 250.0, 800.0, 2000.0, 5000.0, 8000.0, 12000.0, 16000.0]
+        self.peq_qs = [1.0] * self.PEQ_BANDS
+        self.peq_gains_db = [0.0] * self.PEQ_BANDS
+
+        # Auto Gain / Loudness normalization
+        self.autogain_enabled = False
+        self.autogain_target_dbfs = -18.0
+        self.autogain_max_boost_db = 12.0
+        self.autogain_max_cut_db = 18.0
+
+        # True Peak Limiter + Metering
+        self.true_peak_limiter_enabled = False
+        self.true_peak_ceiling_db = -1.0
+        self.true_peak_release_ms = 120.0
+
+        # Crossfeed (Headphones)
+        self.crossfeed_enabled = False
+        self.crossfeed_amount = 0.35
+        self.crossfeed_cutoff_hz = 700.0
+
+        # Bass/Sub-bass mono
+        self.bass_mono_enabled = False
+        self.bass_mono_cutoff_hz = 120.0
+        self.bass_mono_amount = 1.0
+
+        # Dynamic EQ
+        self.dynamic_eq_enabled = False
+        self.dynamic_eq_freqs_hz = [6000.0, 120.0]
+        self.dynamic_eq_qs = [2.5, 1.0]
+        self.dynamic_eq_threshold_db = [-22.0, -18.0]
+        self.dynamic_eq_ratio = [2.5, 2.0]
+        self.dynamic_eq_range_db = [10.0, 8.0]
+
+        # Harmonic Saturation / Tape
+        self.saturation_enabled = False
+        self.saturation_drive_db = 6.0
+        self.saturation_mix = 0.25
+
+        # Bit-depth simulation + Dither
+        self.bitdepth_enabled = False
+        self.bitdepth_bits = 16
+        self.dither_enabled = True
         self._web_mode_activated_ts = 0.0
         self._last_web_video_count = 0
         
@@ -525,8 +622,122 @@ class AudioManager(QObject):
             self.tone_mid = float(self.settings.value("dsp/tone_mid", 0.0))
             self.tone_treble = float(self.settings.value("dsp/tone_treble", 0.0))
             self.stereo_width = float(self.settings.value("dsp/stereo_width", 1.0))
+            self.balance = float(self.settings.value("dsp/balance", 0.0))
             self.acoustic_space = int(self.settings.value("dsp/acoustic_space", 0))
             self.smart_audio_enabled = self.settings.value("dsp/smart_audio_enabled", True, type=bool)
+
+            self.compressor_enabled = self.settings.value("dsp/compressor_enabled", False, type=bool)
+            self.limiter_enabled = self.settings.value("dsp/limiter_enabled", False, type=bool)
+            self.bass_enhancer_enabled = self.settings.value("dsp/bass_enhancer_enabled", False, type=bool)
+            self.noise_gate_enabled = self.settings.value("dsp/noise_gate_enabled", False, type=bool)
+
+            self.deesser_enabled = self.settings.value("dsp/deesser_enabled", False, type=bool)
+            self.exciter_enabled = self.settings.value("dsp/exciter_enabled", False, type=bool)
+
+            self.stereo_widener_v2_enabled = self.settings.value("dsp/stereo_widener_v2_enabled", False, type=bool)
+            self.reverb_enabled = self.settings.value("dsp/reverb_enabled", False, type=bool)
+            self.echo_enabled = self.settings.value("dsp/echo_enabled", False, type=bool)
+
+            self.compressor_threshold_db = float(self.settings.value("dsp/compressor_threshold_db", -18.0))
+            self.compressor_ratio = float(self.settings.value("dsp/compressor_ratio", 2.6))
+            self.compressor_makeup_db = float(self.settings.value("dsp/compressor_makeup_db", 2.5))
+
+            self.limiter_ceiling = float(self.settings.value("dsp/limiter_ceiling", 0.98))
+
+            self.bass_mix = float(self.settings.value("dsp/bass_mix", 0.22))
+
+            self.noise_gate_threshold_db = float(self.settings.value("dsp/noise_gate_threshold_db", -55.0))
+            self.noise_gate_floor_gain = float(self.settings.value("dsp/noise_gate_floor_gain", 0.06))
+
+            self.deesser_threshold_db = float(self.settings.value("dsp/deesser_threshold_db", -22.0))
+            self.deesser_strength = float(self.settings.value("dsp/deesser_strength", 0.55))
+
+            self.exciter_amount = float(self.settings.value("dsp/exciter_amount", 0.35))
+            self.exciter_mix = float(self.settings.value("dsp/exciter_mix", 0.18))
+
+            self.widener_width = float(self.settings.value("dsp/widener_width", 1.35))
+            self.widener_mix = float(self.settings.value("dsp/widener_mix", 0.35))
+            self.widener_mono_safe = float(self.settings.value("dsp/widener_mono_safe", 1.0))
+
+            self.reverb_room = float(self.settings.value("dsp/reverb_room", 0.35))
+            self.reverb_damping = float(self.settings.value("dsp/reverb_damping", 0.35))
+            self.reverb_mix = float(self.settings.value("dsp/reverb_mix", 0.18))
+            self.reverb_predelay_ms = float(self.settings.value("dsp/reverb_predelay_ms", 15.0))
+            self.reverb_tone = float(self.settings.value("dsp/reverb_tone", 0.50))
+
+            self.echo_delay_ms = float(self.settings.value("dsp/echo_delay_ms", 240.0))
+            self.echo_feedback = float(self.settings.value("dsp/echo_feedback", 0.35))
+            self.echo_mix = float(self.settings.value("dsp/echo_mix", 0.22))
+            self.echo_pingpong = self.settings.value("dsp/echo_pingpong", False, type=bool)
+            self.echo_tone = float(self.settings.value("dsp/echo_tone", 0.60))
+            self.echo_duck_enabled = self.settings.value("dsp/echo_duck_enabled", True, type=bool)
+            self.echo_duck_threshold_db = float(self.settings.value("dsp/echo_duck_threshold_db", -28.0))
+            self.echo_duck_amount = float(self.settings.value("dsp/echo_duck_amount", 0.70))
+
+            # Advanced effects
+            self.ir_reverb_enabled = self.settings.value("dsp/ir_reverb_enabled", False, type=bool)
+            self.ir_reverb_path = str(self.settings.value("dsp/ir_reverb_path", ""))
+            self.ir_reverb_mix = float(self.settings.value("dsp/ir_reverb_mix", 0.18))
+            self.ir_reverb_predelay_ms = float(self.settings.value("dsp/ir_reverb_predelay_ms", 0.0))
+
+            self.peq_enabled = self.settings.value("dsp/peq_enabled", False, type=bool)
+            freqs = self.settings.value("dsp/peq_freqs_hz")
+            qs = self.settings.value("dsp/peq_qs")
+            gains = self.settings.value("dsp/peq_gains_db")
+            try:
+                if freqs and len(freqs) == self.PEQ_BANDS:
+                    self.peq_freqs_hz = [float(x) for x in freqs]
+                if qs and len(qs) == self.PEQ_BANDS:
+                    self.peq_qs = [float(x) for x in qs]
+                if gains and len(gains) == self.PEQ_BANDS:
+                    self.peq_gains_db = [float(x) for x in gains]
+            except Exception:
+                pass
+
+            self.autogain_enabled = self.settings.value("dsp/autogain_enabled", False, type=bool)
+            self.autogain_target_dbfs = float(self.settings.value("dsp/autogain_target_dbfs", -18.0))
+            self.autogain_max_boost_db = float(self.settings.value("dsp/autogain_max_boost_db", 12.0))
+            self.autogain_max_cut_db = float(self.settings.value("dsp/autogain_max_cut_db", 18.0))
+
+            self.true_peak_limiter_enabled = self.settings.value("dsp/true_peak_limiter_enabled", False, type=bool)
+            self.true_peak_ceiling_db = float(self.settings.value("dsp/true_peak_ceiling_db", -1.0))
+            self.true_peak_release_ms = float(self.settings.value("dsp/true_peak_release_ms", 120.0))
+
+            self.crossfeed_enabled = self.settings.value("dsp/crossfeed_enabled", False, type=bool)
+            self.crossfeed_amount = float(self.settings.value("dsp/crossfeed_amount", 0.35))
+            self.crossfeed_cutoff_hz = float(self.settings.value("dsp/crossfeed_cutoff_hz", 700.0))
+
+            self.bass_mono_enabled = self.settings.value("dsp/bass_mono_enabled", False, type=bool)
+            self.bass_mono_cutoff_hz = float(self.settings.value("dsp/bass_mono_cutoff_hz", 120.0))
+            self.bass_mono_amount = float(self.settings.value("dsp/bass_mono_amount", 1.0))
+
+            self.dynamic_eq_enabled = self.settings.value("dsp/dynamic_eq_enabled", False, type=bool)
+            dyn_freqs = self.settings.value("dsp/dynamic_eq_freqs_hz")
+            dyn_qs = self.settings.value("dsp/dynamic_eq_qs")
+            dyn_thr = self.settings.value("dsp/dynamic_eq_threshold_db")
+            dyn_ratio = self.settings.value("dsp/dynamic_eq_ratio")
+            dyn_range = self.settings.value("dsp/dynamic_eq_range_db")
+            try:
+                if dyn_freqs and len(dyn_freqs) == self.DYN_EQ_BANDS:
+                    self.dynamic_eq_freqs_hz = [float(x) for x in dyn_freqs]
+                if dyn_qs and len(dyn_qs) == self.DYN_EQ_BANDS:
+                    self.dynamic_eq_qs = [float(x) for x in dyn_qs]
+                if dyn_thr and len(dyn_thr) == self.DYN_EQ_BANDS:
+                    self.dynamic_eq_threshold_db = [float(x) for x in dyn_thr]
+                if dyn_ratio and len(dyn_ratio) == self.DYN_EQ_BANDS:
+                    self.dynamic_eq_ratio = [float(x) for x in dyn_ratio]
+                if dyn_range and len(dyn_range) == self.DYN_EQ_BANDS:
+                    self.dynamic_eq_range_db = [float(x) for x in dyn_range]
+            except Exception:
+                pass
+
+            self.saturation_enabled = self.settings.value("dsp/saturation_enabled", False, type=bool)
+            self.saturation_drive_db = float(self.settings.value("dsp/saturation_drive_db", 6.0))
+            self.saturation_mix = float(self.settings.value("dsp/saturation_mix", 0.25))
+
+            self.bitdepth_enabled = self.settings.value("dsp/bitdepth_enabled", False, type=bool)
+            self.bitdepth_bits = int(self.settings.value("dsp/bitdepth_bits", 16))
+            self.dither_enabled = self.settings.value("dsp/dither_enabled", True, type=bool)
 
     def save_state(self):
         with self.lock:
@@ -536,14 +747,245 @@ class AudioManager(QObject):
             self.settings.setValue("dsp/tone_mid", self.tone_mid)
             self.settings.setValue("dsp/tone_treble", self.tone_treble)
             self.settings.setValue("dsp/stereo_width", self.stereo_width)
+            self.settings.setValue("dsp/balance", float(self.balance))
             self.settings.setValue("dsp/acoustic_space", self.acoustic_space)
             self.settings.setValue("dsp/smart_audio_enabled", self.smart_audio_enabled)
+
+            self.settings.setValue("dsp/compressor_enabled", self.compressor_enabled)
+            self.settings.setValue("dsp/limiter_enabled", self.limiter_enabled)
+            self.settings.setValue("dsp/bass_enhancer_enabled", self.bass_enhancer_enabled)
+            self.settings.setValue("dsp/noise_gate_enabled", self.noise_gate_enabled)
+
+            self.settings.setValue("dsp/deesser_enabled", self.deesser_enabled)
+            self.settings.setValue("dsp/exciter_enabled", self.exciter_enabled)
+
+            self.settings.setValue("dsp/stereo_widener_v2_enabled", self.stereo_widener_v2_enabled)
+            self.settings.setValue("dsp/reverb_enabled", self.reverb_enabled)
+            self.settings.setValue("dsp/echo_enabled", self.echo_enabled)
+
+            self.settings.setValue("dsp/compressor_threshold_db", float(self.compressor_threshold_db))
+            self.settings.setValue("dsp/compressor_ratio", float(self.compressor_ratio))
+            self.settings.setValue("dsp/compressor_makeup_db", float(self.compressor_makeup_db))
+
+            self.settings.setValue("dsp/limiter_ceiling", float(self.limiter_ceiling))
+
+            self.settings.setValue("dsp/bass_mix", float(self.bass_mix))
+
+            self.settings.setValue("dsp/noise_gate_threshold_db", float(self.noise_gate_threshold_db))
+            self.settings.setValue("dsp/noise_gate_floor_gain", float(self.noise_gate_floor_gain))
+
+            self.settings.setValue("dsp/deesser_threshold_db", float(self.deesser_threshold_db))
+            self.settings.setValue("dsp/deesser_strength", float(self.deesser_strength))
+
+            self.settings.setValue("dsp/exciter_amount", float(self.exciter_amount))
+            self.settings.setValue("dsp/exciter_mix", float(self.exciter_mix))
+
+            self.settings.setValue("dsp/widener_width", float(self.widener_width))
+            self.settings.setValue("dsp/widener_mix", float(self.widener_mix))
+            self.settings.setValue("dsp/widener_mono_safe", float(self.widener_mono_safe))
+
+            self.settings.setValue("dsp/reverb_room", float(self.reverb_room))
+            self.settings.setValue("dsp/reverb_damping", float(self.reverb_damping))
+            self.settings.setValue("dsp/reverb_mix", float(self.reverb_mix))
+            self.settings.setValue("dsp/reverb_predelay_ms", float(self.reverb_predelay_ms))
+            self.settings.setValue("dsp/reverb_tone", float(self.reverb_tone))
+
+            self.settings.setValue("dsp/echo_delay_ms", float(self.echo_delay_ms))
+            self.settings.setValue("dsp/echo_feedback", float(self.echo_feedback))
+            self.settings.setValue("dsp/echo_mix", float(self.echo_mix))
+            self.settings.setValue("dsp/echo_pingpong", bool(self.echo_pingpong))
+            self.settings.setValue("dsp/echo_tone", float(self.echo_tone))
+            self.settings.setValue("dsp/echo_duck_enabled", bool(self.echo_duck_enabled))
+            self.settings.setValue("dsp/echo_duck_threshold_db", float(self.echo_duck_threshold_db))
+            self.settings.setValue("dsp/echo_duck_amount", float(self.echo_duck_amount))
+
+            # Advanced effects
+            self.settings.setValue("dsp/ir_reverb_enabled", bool(self.ir_reverb_enabled))
+            self.settings.setValue("dsp/ir_reverb_path", str(self.ir_reverb_path))
+            self.settings.setValue("dsp/ir_reverb_mix", float(self.ir_reverb_mix))
+            self.settings.setValue("dsp/ir_reverb_predelay_ms", float(self.ir_reverb_predelay_ms))
+
+            self.settings.setValue("dsp/peq_enabled", bool(self.peq_enabled))
+            self.settings.setValue("dsp/peq_freqs_hz", [float(x) for x in self.peq_freqs_hz])
+            self.settings.setValue("dsp/peq_qs", [float(x) for x in self.peq_qs])
+            self.settings.setValue("dsp/peq_gains_db", [float(x) for x in self.peq_gains_db])
+
+            self.settings.setValue("dsp/autogain_enabled", bool(self.autogain_enabled))
+            self.settings.setValue("dsp/autogain_target_dbfs", float(self.autogain_target_dbfs))
+            self.settings.setValue("dsp/autogain_max_boost_db", float(self.autogain_max_boost_db))
+            self.settings.setValue("dsp/autogain_max_cut_db", float(self.autogain_max_cut_db))
+
+            self.settings.setValue("dsp/true_peak_limiter_enabled", bool(self.true_peak_limiter_enabled))
+            self.settings.setValue("dsp/true_peak_ceiling_db", float(self.true_peak_ceiling_db))
+            self.settings.setValue("dsp/true_peak_release_ms", float(self.true_peak_release_ms))
+
+            self.settings.setValue("dsp/crossfeed_enabled", bool(self.crossfeed_enabled))
+            self.settings.setValue("dsp/crossfeed_amount", float(self.crossfeed_amount))
+            self.settings.setValue("dsp/crossfeed_cutoff_hz", float(self.crossfeed_cutoff_hz))
+
+            self.settings.setValue("dsp/bass_mono_enabled", bool(self.bass_mono_enabled))
+            self.settings.setValue("dsp/bass_mono_cutoff_hz", float(self.bass_mono_cutoff_hz))
+            self.settings.setValue("dsp/bass_mono_amount", float(self.bass_mono_amount))
+
+            self.settings.setValue("dsp/dynamic_eq_enabled", bool(self.dynamic_eq_enabled))
+            self.settings.setValue("dsp/dynamic_eq_freqs_hz", [float(x) for x in self.dynamic_eq_freqs_hz])
+            self.settings.setValue("dsp/dynamic_eq_qs", [float(x) for x in self.dynamic_eq_qs])
+            self.settings.setValue("dsp/dynamic_eq_threshold_db", [float(x) for x in self.dynamic_eq_threshold_db])
+            self.settings.setValue("dsp/dynamic_eq_ratio", [float(x) for x in self.dynamic_eq_ratio])
+            self.settings.setValue("dsp/dynamic_eq_range_db", [float(x) for x in self.dynamic_eq_range_db])
+
+            self.settings.setValue("dsp/saturation_enabled", bool(self.saturation_enabled))
+            self.settings.setValue("dsp/saturation_drive_db", float(self.saturation_drive_db))
+            self.settings.setValue("dsp/saturation_mix", float(self.saturation_mix))
+
+            self.settings.setValue("dsp/bitdepth_enabled", bool(self.bitdepth_enabled))
+            self.settings.setValue("dsp/bitdepth_bits", int(self.bitdepth_bits))
+            self.settings.setValue("dsp/dither_enabled", bool(self.dither_enabled))
             self.settings.sync()
+
+    # ------------------------------------------------------------------
+    # Advanced effect setters
+    # ------------------------------------------------------------------
+    def set_ir_reverb_enabled(self, enabled: bool):
+        self.ir_reverb_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_ir_reverb_path(self, path: str):
+        self.ir_reverb_path = str(path or "")
+        self.state_changed.emit()
+
+    def update_ir_reverb(self, mix: float = None, predelay_ms: float = None):
+        if mix is not None:
+            self.ir_reverb_mix = max(0.0, min(1.0, float(mix)))
+        if predelay_ms is not None:
+            self.ir_reverb_predelay_ms = max(0.0, min(250.0, float(predelay_ms)))
+        self.state_changed.emit()
+
+    def set_peq_enabled(self, enabled: bool):
+        self.peq_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def update_peq_band(self, band_index: int, freq_hz: float = None, q: float = None, gain_db: float = None):
+        if not (0 <= band_index < self.PEQ_BANDS):
+            return
+        if freq_hz is not None:
+            self.peq_freqs_hz[band_index] = max(20.0, min(20000.0, float(freq_hz)))
+        if q is not None:
+            self.peq_qs[band_index] = max(0.2, min(12.0, float(q)))
+        if gain_db is not None:
+            self.peq_gains_db[band_index] = max(-18.0, min(18.0, float(gain_db)))
+        self.state_changed.emit()
+
+    def set_autogain_enabled(self, enabled: bool):
+        self.autogain_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def update_autogain(self, target_dbfs: float = None, max_boost_db: float = None, max_cut_db: float = None):
+        if target_dbfs is not None:
+            self.autogain_target_dbfs = max(-40.0, min(-6.0, float(target_dbfs)))
+        if max_boost_db is not None:
+            self.autogain_max_boost_db = max(0.0, min(24.0, float(max_boost_db)))
+        if max_cut_db is not None:
+            self.autogain_max_cut_db = max(0.0, min(36.0, float(max_cut_db)))
+        self.state_changed.emit()
+
+    def set_true_peak_limiter_enabled(self, enabled: bool):
+        self.true_peak_limiter_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def update_true_peak_limiter(self, ceiling_db: float = None, release_ms: float = None):
+        if ceiling_db is not None:
+            self.true_peak_ceiling_db = max(-6.0, min(0.0, float(ceiling_db)))
+        if release_ms is not None:
+            self.true_peak_release_ms = max(10.0, min(1000.0, float(release_ms)))
+        self.state_changed.emit()
+
+    def set_crossfeed_enabled(self, enabled: bool):
+        self.crossfeed_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def update_crossfeed(self, amount: float = None, cutoff_hz: float = None):
+        if amount is not None:
+            self.crossfeed_amount = max(0.0, min(1.0, float(amount)))
+        if cutoff_hz is not None:
+            self.crossfeed_cutoff_hz = max(150.0, min(2000.0, float(cutoff_hz)))
+        self.state_changed.emit()
+
+    def set_bass_mono_enabled(self, enabled: bool):
+        self.bass_mono_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def update_bass_mono(self, cutoff_hz: float = None, amount: float = None):
+        if cutoff_hz is not None:
+            self.bass_mono_cutoff_hz = max(50.0, min(200.0, float(cutoff_hz)))
+        if amount is not None:
+            self.bass_mono_amount = max(0.0, min(1.0, float(amount)))
+        self.state_changed.emit()
+
+    def set_dynamic_eq_enabled(self, enabled: bool):
+        self.dynamic_eq_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def update_dynamic_eq_band(self, band_index: int, freq_hz: float = None, q: float = None,
+                               threshold_db: float = None, ratio: float = None, range_db: float = None):
+        if not (0 <= band_index < self.DYN_EQ_BANDS):
+            return
+        if freq_hz is not None:
+            self.dynamic_eq_freqs_hz[band_index] = max(40.0, min(14000.0, float(freq_hz)))
+        if q is not None:
+            self.dynamic_eq_qs[band_index] = max(0.2, min(12.0, float(q)))
+        if threshold_db is not None:
+            self.dynamic_eq_threshold_db[band_index] = max(-60.0, min(-6.0, float(threshold_db)))
+        if ratio is not None:
+            self.dynamic_eq_ratio[band_index] = max(1.0, min(12.0, float(ratio)))
+        if range_db is not None:
+            self.dynamic_eq_range_db[band_index] = max(0.0, min(24.0, float(range_db)))
+        self.state_changed.emit()
+
+    def set_saturation_enabled(self, enabled: bool):
+        self.saturation_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def update_saturation(self, drive_db: float = None, mix: float = None):
+        if drive_db is not None:
+            self.saturation_drive_db = max(0.0, min(24.0, float(drive_db)))
+        if mix is not None:
+            self.saturation_mix = max(0.0, min(1.0, float(mix)))
+        self.state_changed.emit()
+
+    def set_bitdepth_enabled(self, enabled: bool):
+        self.bitdepth_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def update_bitdepth(self, bits: int = None, dither_enabled: bool = None):
+        if bits is not None:
+            try:
+                b = int(bits)
+            except Exception:
+                b = 16
+            self.bitdepth_bits = max(6, min(24, b))
+        if dither_enabled is not None:
+            self.dither_enabled = bool(dither_enabled)
+        self.state_changed.emit()
 
     def update_band(self, index, gain):
         if 0 <= index < 32:
             self.eq_bands[index] = gain
             self.state_changed.emit()
+
+    def set_eq_bands(self, gains_db: list):
+        """32 bant EQ değerlerini toplu ayarlar (tek emit)."""
+        try:
+            if gains_db is None:
+                return
+            vals = [float(x) for x in list(gains_db)]
+            if len(vals) != 32:
+                return
+            # Slider aralığına uydur (±15 dB)
+            self.eq_bands = [max(-15.0, min(15.0, v)) for v in vals]
+            self.state_changed.emit()
+        except Exception:
+            return
 
     def update_tone(self, bass, mid, treble):
         self.tone_bass = bass
@@ -557,6 +999,19 @@ class AudioManager(QObject):
         self.stereo_width = max(0.0, min(2.0, width))
         if abs(self.stereo_width - 1.0) > 1e-3 and not self.smart_audio_enabled:
             self.smart_audio_enabled = True
+        self.state_changed.emit()
+
+    def update_balance(self, balance: float):
+        """-1.0 (sol) .. 0.0 (merkez) .. +1.0 (sağ)."""
+        try:
+            b = float(balance)
+        except Exception:
+            b = 0.0
+        if b < -1.0:
+            b = -1.0
+        elif b > 1.0:
+            b = 1.0
+        self.balance = b
         self.state_changed.emit()
 
     def update_acoustic_space(self, index):
@@ -577,6 +1032,169 @@ class AudioManager(QObject):
         self.tone_treble = 0.0
         self.stereo_width = 1.0
         self.acoustic_space = 0
+        self.state_changed.emit()
+
+    def set_compressor_enabled(self, enabled: bool):
+        self.compressor_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_limiter_enabled(self, enabled: bool):
+        self.limiter_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_bass_enhancer_enabled(self, enabled: bool):
+        self.bass_enhancer_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_noise_gate_enabled(self, enabled: bool):
+        self.noise_gate_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_deesser_enabled(self, enabled: bool):
+        self.deesser_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_exciter_enabled(self, enabled: bool):
+        self.exciter_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_stereo_widener_v2_enabled(self, enabled: bool):
+        self.stereo_widener_v2_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_reverb_enabled(self, enabled: bool):
+        self.reverb_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_echo_enabled(self, enabled: bool):
+        self.echo_enabled = bool(enabled)
+        self.state_changed.emit()
+
+    def set_compressor_params(self, threshold_db: float = None, ratio: float = None, makeup_db: float = None):
+        if threshold_db is not None:
+            self.compressor_threshold_db = float(threshold_db)
+        if ratio is not None:
+            self.compressor_ratio = float(ratio)
+        if makeup_db is not None:
+            self.compressor_makeup_db = float(makeup_db)
+        self.state_changed.emit()
+
+    def set_limiter_params(self, ceiling: float = None):
+        if ceiling is not None:
+            self.limiter_ceiling = float(ceiling)
+        self.state_changed.emit()
+
+    def set_bass_enhancer_params(self, mix: float = None):
+        if mix is not None:
+            self.bass_mix = float(mix)
+        self.state_changed.emit()
+
+    def set_noise_gate_params(self, threshold_db: float = None, floor_gain: float = None):
+        if threshold_db is not None:
+            self.noise_gate_threshold_db = float(threshold_db)
+        if floor_gain is not None:
+            self.noise_gate_floor_gain = float(floor_gain)
+        self.state_changed.emit()
+
+    def set_deesser_params(self, threshold_db: float = None, strength: float = None):
+        if threshold_db is not None:
+            self.deesser_threshold_db = float(threshold_db)
+        if strength is not None:
+            self.deesser_strength = float(strength)
+        self.state_changed.emit()
+
+    def set_exciter_params(self, amount: float = None, mix: float = None):
+        if amount is not None:
+            self.exciter_amount = float(amount)
+        if mix is not None:
+            self.exciter_mix = float(mix)
+        self.state_changed.emit()
+
+    def set_widener_params(self, width: float = None, mix: float = None, mono_safe: float = None):
+        if width is not None:
+            self.widener_width = float(width)
+        if mix is not None:
+            self.widener_mix = float(mix)
+        if mono_safe is not None:
+            self.widener_mono_safe = float(mono_safe)
+        self.state_changed.emit()
+
+    def set_reverb_params(self, room: float = None, damping: float = None, mix: float = None, predelay_ms: float = None, tone: float = None):
+        if room is not None:
+            self.reverb_room = float(room)
+        if damping is not None:
+            self.reverb_damping = float(damping)
+        if mix is not None:
+            self.reverb_mix = float(mix)
+        if predelay_ms is not None:
+            self.reverb_predelay_ms = float(predelay_ms)
+        if tone is not None:
+            self.reverb_tone = float(tone)
+        self.state_changed.emit()
+
+    def set_echo_params(self, delay_ms: float = None, feedback: float = None, mix: float = None, pingpong: bool = None, tone: float = None,
+                        duck_enabled: bool = None, duck_threshold_db: float = None, duck_amount: float = None):
+        if delay_ms is not None:
+            self.echo_delay_ms = float(delay_ms)
+        if feedback is not None:
+            self.echo_feedback = float(feedback)
+        if mix is not None:
+            self.echo_mix = float(mix)
+        if pingpong is not None:
+            self.echo_pingpong = bool(pingpong)
+        if tone is not None:
+            self.echo_tone = float(tone)
+        if duck_enabled is not None:
+            self.echo_duck_enabled = bool(duck_enabled)
+        if duck_threshold_db is not None:
+            self.echo_duck_threshold_db = float(duck_threshold_db)
+        if duck_amount is not None:
+            self.echo_duck_amount = float(duck_amount)
+        self.state_changed.emit()
+
+    def reset_newgen_effects(self):
+        self.compressor_enabled = False
+        self.limiter_enabled = False
+        self.bass_enhancer_enabled = False
+        self.noise_gate_enabled = False
+        self.deesser_enabled = False
+        self.exciter_enabled = False
+        self.stereo_widener_v2_enabled = False
+        self.reverb_enabled = False
+        self.echo_enabled = False
+
+        self.compressor_threshold_db = -18.0
+        self.compressor_ratio = 2.6
+        self.compressor_makeup_db = 2.5
+        self.limiter_ceiling = 0.98
+        self.bass_mix = 0.22
+        self.noise_gate_threshold_db = -55.0
+        self.noise_gate_floor_gain = 0.06
+
+        self.deesser_threshold_db = -22.0
+        self.deesser_strength = 0.55
+
+        self.exciter_amount = 0.35
+        self.exciter_mix = 0.18
+
+        self.widener_width = 1.35
+        self.widener_mix = 0.35
+        self.widener_mono_safe = 1.0
+
+        self.reverb_room = 0.35
+        self.reverb_damping = 0.35
+        self.reverb_mix = 0.18
+        self.reverb_predelay_ms = 15.0
+        self.reverb_tone = 0.50
+
+        self.echo_delay_ms = 240.0
+        self.echo_feedback = 0.35
+        self.echo_mix = 0.22
+        self.echo_pingpong = False
+        self.echo_tone = 0.60
+        self.echo_duck_enabled = True
+        self.echo_duck_threshold_db = -28.0
+        self.echo_duck_amount = 0.70
         self.state_changed.emit()
 
 # ---------------------------------------------------------------------------
@@ -621,6 +1239,7 @@ class GlobalAudioEngine(QThread):
     Ensures 0% UI lag and high-fidelity output.
     """
     viz_data_ready = pyqtSignal(bytes, int, int, int) # raw, size, channels, rate
+    meters_ready = pyqtSignal(float, float, float)    # rms_dbfs, peak_dbfs, true_peak_dbfs
 
     def __init__(self, manager: AudioManager):
         super().__init__()
@@ -700,6 +1319,90 @@ class GlobalAudioEngine(QThread):
 
         # Transition limiter state (smoothes crossfade peaks without "pumping")
         self._transition_limiter_gain = 1.0
+
+        # Python-side effect states (new-gen effects)
+        self._py_comp_gain = 1.0
+        self._py_limiter_gain = 1.0
+        self._bass_lp_L = 0.0
+        self._bass_lp_R = 0.0
+        self._py_gate_gain = 1.0
+
+        # De-esser / Exciter filter states
+        self._deess_hp_x1_L = 0.0
+        self._deess_hp_y1_L = 0.0
+        self._deess_hp_x1_R = 0.0
+        self._deess_hp_y1_R = 0.0
+        self._py_deess_gain = 1.0
+
+        self._exc_hp_x1_L = 0.0
+        self._exc_hp_y1_L = 0.0
+        self._exc_hp_x1_R = 0.0
+        self._exc_hp_y1_R = 0.0
+
+        # Reverb buffers (initialized lazily)
+        self._rev_buf_L = None
+        self._rev_buf_R = None
+        self._rev_idx = 0
+        self._rev_lp_L = 0.0
+        self._rev_lp_R = 0.0
+
+        # Echo / Delay buffers (initialized lazily)
+        self._echo_buf_L = None
+        self._echo_buf_R = None
+        self._echo_idx = 0
+        self._echo_lp_L = 0.0
+        self._echo_lp_R = 0.0
+        self._echo_was_enabled = False
+        self._echo_duck_gain = 1.0
+
+        # --------------------------------------------------------------
+        # Advanced effect states (requested)
+        # --------------------------------------------------------------
+        self._autogain_track_rms_dbfs = None
+        self._autogain_smooth_gain = 1.0
+
+        # PEQ biquad states (DF2): list of (z1L,z2L,z1R,z2R)
+        self._peq_last_params = None
+        self._peq_coeffs = []
+        self._peq_state = []
+
+        # Crossfeed state (1-pole lowpass)
+        self._xfeed_lp_L = 0.0
+        self._xfeed_lp_R = 0.0
+
+        # Bass mono state (1-pole lowpass)
+        self._bassmono_lp_L = 0.0
+        self._bassmono_lp_R = 0.0
+
+        # Dynamic EQ state
+        self._dyn_last_params = None
+        self._dyn_det_coeffs = []
+        self._dyn_det_state = []
+        self._dyn_peq_state = []
+
+        # True peak limiter state
+        self._tp_gain = 1.0
+        self._meter_rms_dbfs = -120.0
+        self._meter_peak_dbfs = -120.0
+        self._meter_true_peak_dbfs = -120.0
+        self._meter_emit_counter = 0
+
+        # IR convolution reverb state (partitioned overlap-save)
+        self._ir_loading = False
+        self._ir_ready = False
+        self._ir_path_loaded = ""
+        self._ir_part_size = 1024
+        self._ir_fft_size = 2048
+        self._ir_H_L = []
+        self._ir_H_R = []
+        self._ir_X_L = []
+        self._ir_X_R = []
+        self._ir_ring_pos = 0
+        self._ir_prev_in_L = None
+        self._ir_prev_in_R = None
+        self._ir_predelay_buf_L = None
+        self._ir_predelay_buf_R = None
+        self._ir_predelay_idx = 0
         
         # Connect manager updates (thread-safe)
         self.mgr.state_changed.connect(self.sync_dsp_params)
@@ -731,6 +1434,19 @@ class GlobalAudioEngine(QThread):
             pass
         if not self.paused:
             self.media_player.positionChanged.emit(self.get_position_ms())
+
+        # Metering (UI thread): keep it lightweight
+        try:
+            self._meter_emit_counter = int(getattr(self, "_meter_emit_counter", 0)) + 1
+            if self._meter_emit_counter >= 1:
+                self._meter_emit_counter = 0
+                self.meters_ready.emit(
+                    float(getattr(self, "_meter_rms_dbfs", -120.0)),
+                    float(getattr(self, "_meter_peak_dbfs", -120.0)),
+                    float(getattr(self, "_meter_true_peak_dbfs", -120.0)),
+                )
+        except Exception:
+            pass
 
     @pyqtSlot()
     def sync_dsp_params(self):
@@ -962,6 +1678,18 @@ class GlobalAudioEngine(QThread):
                 if data is None or sr is None:
                     return
                 data, _ = self._resample_stereo(data, int(sr), target_sr=48000)
+
+                # AutoGain analysis (RMS dBFS) - store once per track
+                try:
+                    if np is not None and data is not None and len(data) > 0:
+                        eps = 1e-12
+                        rms = float(np.sqrt(np.mean((data.astype(np.float32) ** 2)) + eps))
+                        self._autogain_track_rms_dbfs = 20.0 * math.log10(rms + eps)
+                    else:
+                        self._autogain_track_rms_dbfs = None
+                except Exception:
+                    self._autogain_track_rms_dbfs = None
+
                 with self._lock:
                     if req_id != self._pending_request_id:
                         return
@@ -1257,7 +1985,33 @@ class GlobalAudioEngine(QThread):
                 else:
                     out_view[:frames] = proc_buf.reshape(frames, 2).mean(axis=1) * self.volume
                     return
-            out_view[:frames] = proc_buf.reshape(frames, 2) * self.volume
+            stereo = proc_buf.reshape(frames, 2)
+
+            # Python effects (same chain as local). Note: C++ DSP is not used in web mode.
+            try:
+                self._apply_python_effects(proc_buf, frames)
+                stereo = proc_buf.reshape(frames, 2)
+            except Exception:
+                pass
+
+            # Balance (Sol/Sağ) uygula
+            try:
+                b = float(getattr(self.mgr, "balance", 0.0))
+            except Exception:
+                b = 0.0
+            if b < -1.0:
+                b = -1.0
+            elif b > 1.0:
+                b = 1.0
+            if abs(b) > 1e-6:
+                if b >= 0.0:
+                    gl, gr = (1.0 - b), 1.0
+                else:
+                    gl, gr = 1.0, (1.0 + b)
+                stereo[:, 0] *= float(gl)
+                stereo[:, 1] *= float(gr)
+
+            out_view[:frames] = stereo * self.volume
 
             # Phase 4/6: Emit viz data with 3.0x Gain and Standard Shape
             viz_pushed = (proc_buf * 3.0).clip(-1.0, 1.0).astype(np.float32)
@@ -1342,6 +2096,20 @@ class GlobalAudioEngine(QThread):
                 self.current_frame = 0
                 self.paused = True
 
+            # AutoGain analysis (RMS dBFS) - store once per track
+            try:
+                if np is not None and data is not None and len(data) > 0:
+                    eps = 1e-12
+                    d = np.asarray(data, dtype=np.float32)
+                    if d.ndim == 1:
+                        d = np.column_stack((d, d))
+                    rms = float(np.sqrt(np.mean((d ** 2)) + eps))
+                    self._autogain_track_rms_dbfs = 20.0 * math.log10(rms + eps)
+                else:
+                    self._autogain_track_rms_dbfs = None
+            except Exception:
+                self._autogain_track_rms_dbfs = None
+
             self.media_player.durationChanged.emit(self.get_duration_ms())
             self.media_player._status = QMediaPlayer.LoadedMedia
             self.media_player.mediaStatusChanged.emit(self.media_player._status)
@@ -1376,7 +2144,7 @@ class GlobalAudioEngine(QThread):
         except Exception:
             return None, None
 
-        cache_dir = Path("/tmp/angolla_live_cache")
+        cache_dir = Path("/tmp/aurivo_live_cache")
         cache_dir.mkdir(exist_ok=True)
 
         try:
@@ -1454,6 +2222,13 @@ class GlobalAudioEngine(QThread):
             proc_buf = raw_buf.copy()
             if self.dsp:
                 self.dsp.process_buffer(proc_buf)
+
+            # --- PYTHON EFFECTS (New-gen blocks) ---
+            try:
+                self._apply_python_effects(proc_buf, actual_frames)
+            except Exception:
+                pass
+            # --------------------------------------
             
             # --- CROSSFADE (Modular) ---
             self._apply_crossfade(proc_buf, actual_frames)
@@ -1514,7 +2289,26 @@ class GlobalAudioEngine(QThread):
                     viz_buf = raw_buf
                     self.viz_data_ready.emit(viz_buf.tobytes(), 32, 2, self.samplerate)
                     return
-            stereo = proc_buf.reshape(-1, 2)[:actual_frames] * self.volume
+            stereo = proc_buf.reshape(-1, 2)[:actual_frames]
+
+            # Balance (Sol/Sağ) uygula
+            try:
+                b = float(getattr(self.mgr, "balance", 0.0))
+            except Exception:
+                b = 0.0
+            if b < -1.0:
+                b = -1.0
+            elif b > 1.0:
+                b = 1.0
+            if abs(b) > 1e-6:
+                if b >= 0.0:
+                    gl, gr = (1.0 - b), 1.0
+                else:
+                    gl, gr = 1.0, (1.0 + b)
+                stereo[:, 0] *= float(gl)
+                stereo[:, 1] *= float(gr)
+
+            stereo = stereo * self.volume
             if is_transition and np is not None:
                 try:
                     peak = float(np.max(np.abs(stereo)))
@@ -1543,6 +2337,911 @@ class GlobalAudioEngine(QThread):
             # Emit viz data (PCM for FFT) using pre-DSP audio
             viz_buf = raw_buf
             self.viz_data_ready.emit(viz_buf.tobytes(), 32, 2, self.samplerate)
+
+    def _apply_python_effects(self, proc_buf, actual_frames: int):
+        """Applies lightweight Python-side effects (chunk-based) to processed buffer."""
+        if np is None:
+            return
+        if not self.mgr:
+            return
+        if not getattr(self.mgr, "dsp_enabled", True):
+            # Master DSP kapalıysa efektleri de bypass et.
+            self._py_comp_gain = 1.0
+            self._py_limiter_gain = 1.0
+            self._py_gate_gain = 1.0
+            self._py_deess_gain = 1.0
+            self._autogain_smooth_gain = 1.0
+            self._tp_gain = 1.0
+            return
+
+        stereo = proc_buf.reshape(-1, 2)[:actual_frames]
+
+        # --- Helpers (fast) ---
+        def _db_to_lin(db: float) -> float:
+            try:
+                return float(10.0 ** (float(db) / 20.0))
+            except Exception:
+                return 1.0
+
+        def _safe_dbfs_from_rms(rms: float) -> float:
+            eps = 1e-12
+            try:
+                return 20.0 * math.log10(float(rms) + eps)
+            except Exception:
+                return -120.0
+
+        def _compute_true_peak_dbfs(block_stereo: "np.ndarray") -> float:
+            # Cheap 4x linear-interp estimate (inter-sample peak)
+            try:
+                if block_stereo.shape[0] <= 1:
+                    p = float(np.max(np.abs(block_stereo)))
+                    return 20.0 * math.log10(max(1e-12, p))
+                x0 = block_stereo[:-1]
+                x1 = block_stereo[1:]
+                p0 = float(np.max(np.abs(block_stereo)))
+                p25 = float(np.max(np.abs(0.75 * x0 + 0.25 * x1)))
+                p50 = float(np.max(np.abs(0.50 * x0 + 0.50 * x1)))
+                p75 = float(np.max(np.abs(0.25 * x0 + 0.75 * x1)))
+                p = max(p0, p25, p50, p75)
+                return 20.0 * math.log10(max(1e-12, p))
+            except Exception:
+                return -120.0
+
+        def _biquad_peaking_coeffs(freq_hz: float, q: float, gain_db: float, sr: float):
+            # RBJ peaking EQ
+            f = max(20.0, min(20000.0, float(freq_hz)))
+            qv = max(0.2, min(12.0, float(q)))
+            a = float(10.0 ** (float(gain_db) / 40.0))
+            w0 = 2.0 * math.pi * f / max(1.0, float(sr))
+            cw = math.cos(w0)
+            sw = math.sin(w0)
+            alpha = sw / (2.0 * qv)
+            b0 = 1.0 + alpha * a
+            b1 = -2.0 * cw
+            b2 = 1.0 - alpha * a
+            a0 = 1.0 + alpha / a
+            a1 = -2.0 * cw
+            a2 = 1.0 - alpha / a
+            # Normalize to a0
+            b0 /= a0
+            b1 /= a0
+            b2 /= a0
+            a1 /= a0
+            a2 /= a0
+            return float(b0), float(b1), float(b2), float(a1), float(a2)
+
+        def _biquad_bandpass_coeffs(freq_hz: float, q: float, sr: float):
+            # RBJ bandpass (constant skirt gain)
+            f = max(20.0, min(20000.0, float(freq_hz)))
+            qv = max(0.2, min(24.0, float(q)))
+            w0 = 2.0 * math.pi * f / max(1.0, float(sr))
+            cw = math.cos(w0)
+            sw = math.sin(w0)
+            alpha = sw / (2.0 * qv)
+            b0 = alpha
+            b1 = 0.0
+            b2 = -alpha
+            a0 = 1.0 + alpha
+            a1 = -2.0 * cw
+            a2 = 1.0 - alpha
+            b0 /= a0
+            b1 /= a0
+            b2 /= a0
+            a1 /= a0
+            a2 /= a0
+            return float(b0), float(b1), float(b2), float(a1), float(a2)
+
+        def _biquad_df2_process_inplace(arr: "np.ndarray", coeffs, state):
+            # state: [z1L,z2L,z1R,z2R]
+            b0, b1, b2, a1, a2 = coeffs
+            z1L, z2L, z1R, z2R = state
+            n = int(arr.shape[0])
+            for i in range(n):
+                xL = float(arr[i, 0])
+                xR = float(arr[i, 1])
+                yL = b0 * xL + z1L
+                z1L = b1 * xL - a1 * yL + z2L
+                z2L = b2 * xL - a2 * yL
+                yR = b0 * xR + z1R
+                z1R = b1 * xR - a1 * yR + z2R
+                z2R = b2 * xR - a2 * yR
+                arr[i, 0] = yL
+                arr[i, 1] = yR
+            state[0], state[1], state[2], state[3] = float(z1L), float(z2L), float(z1R), float(z2R)
+
+        def _ensure_ir_loaded():
+            if np is None or not sf:
+                return
+            try:
+                want_path = str(getattr(self.mgr, "ir_reverb_path", "") or "")
+                if not want_path:
+                    self._ir_ready = False
+                    self._ir_path_loaded = ""
+                    return
+                if want_path == str(getattr(self, "_ir_path_loaded", "")) and bool(getattr(self, "_ir_ready", False)):
+                    return
+                if bool(getattr(self, "_ir_loading", False)):
+                    return
+            except Exception:
+                return
+
+            def _loader(path: str):
+                try:
+                    self._ir_loading = True
+                    data, sr = sf.read(path, dtype="float32")
+                    data = np.asarray(data, dtype=np.float32)
+                    if data.ndim == 1:
+                        data = np.column_stack((data, data))
+                    elif data.shape[1] == 1:
+                        data = np.column_stack((data[:, 0], data[:, 0]))
+                    elif data.shape[1] >= 2:
+                        data = data[:, :2]
+
+                    # Resample to engine samplerate if needed
+                    sr = int(sr) if sr else int(getattr(self, "samplerate", 48000) or 48000)
+                    target_sr = int(getattr(self, "samplerate", 48000) or 48000)
+                    if sr != target_sr and sr > 0:
+                        data, _ = self._resample_stereo(data, sr, target_sr=target_sr)
+
+                    # Normalize IR to avoid huge gain
+                    mx = float(np.max(np.abs(data))) if data.size else 1.0
+                    if mx > 1e-9:
+                        data = data / mx
+                    data = data * 0.60
+
+                    # Limit IR length for real-time safety (~0.7s by default)
+                    max_parts = 32
+                    part = int(getattr(self, "_ir_part_size", 1024) or 1024)
+                    max_len = max_parts * part
+                    if data.shape[0] > max_len:
+                        data = data[:max_len]
+
+                    fft_size = int(getattr(self, "_ir_fft_size", 2048) or 2048)
+                    if fft_size != 2 * part:
+                        fft_size = 2 * part
+
+                    # Partition IR
+                    num_parts = int(math.ceil(data.shape[0] / float(part)))
+                    H_L = []
+                    H_R = []
+                    for k in range(num_parts):
+                        seg = data[k * part : (k + 1) * part]
+                        if seg.shape[0] < part:
+                            pad = np.zeros((part - seg.shape[0], 2), dtype=np.float32)
+                            seg = np.vstack((seg, pad))
+                        h2L = np.zeros((fft_size,), dtype=np.float32)
+                        h2R = np.zeros((fft_size,), dtype=np.float32)
+                        h2L[:part] = seg[:, 0]
+                        h2R[:part] = seg[:, 1]
+                        H_L.append(np.fft.rfft(h2L))
+                        H_R.append(np.fft.rfft(h2R))
+
+                    X_L = [np.zeros_like(H_L[0]) for _ in range(num_parts)]
+                    X_R = [np.zeros_like(H_R[0]) for _ in range(num_parts)]
+
+                    self._ir_H_L = H_L
+                    self._ir_H_R = H_R
+                    self._ir_X_L = X_L
+                    self._ir_X_R = X_R
+                    self._ir_ring_pos = 0
+                    self._ir_prev_in_L = np.zeros((part,), dtype=np.float32)
+                    self._ir_prev_in_R = np.zeros((part,), dtype=np.float32)
+                    self._ir_ready = True
+                    self._ir_path_loaded = str(path)
+                except Exception:
+                    self._ir_ready = False
+                    self._ir_path_loaded = ""
+                finally:
+                    self._ir_loading = False
+
+            threading.Thread(target=_loader, args=(want_path,), daemon=True).start()
+
+        def _apply_ir_reverb_inplace(arr: "np.ndarray"):
+            if np is None:
+                return
+            if not bool(getattr(self.mgr, "ir_reverb_enabled", False)):
+                return
+            _ensure_ir_loaded()
+            if not bool(getattr(self, "_ir_ready", False)):
+                return
+            mix = float(getattr(self.mgr, "ir_reverb_mix", 0.18))
+            mix = max(0.0, min(0.6, mix))
+            if mix <= 1e-6:
+                return
+
+            part = int(getattr(self, "_ir_part_size", 1024) or 1024)
+            fft_size = int(getattr(self, "_ir_fft_size", 2048) or 2048)
+            if fft_size != 2 * part:
+                fft_size = 2 * part
+            H_L = getattr(self, "_ir_H_L", [])
+            H_R = getattr(self, "_ir_H_R", [])
+            X_L = getattr(self, "_ir_X_L", [])
+            X_R = getattr(self, "_ir_X_R", [])
+            if not H_L or not X_L:
+                return
+            num_parts = len(H_L)
+
+            # Build fixed-size input block (part samples)
+            n = int(arr.shape[0])
+            xL = np.zeros((part,), dtype=np.float32)
+            xR = np.zeros((part,), dtype=np.float32)
+            take = min(part, n)
+            xL[:take] = arr[:take, 0]
+            xR[:take] = arr[:take, 1]
+
+            prevL = getattr(self, "_ir_prev_in_L", None)
+            prevR = getattr(self, "_ir_prev_in_R", None)
+            if prevL is None or prevL.shape[0] != part:
+                prevL = np.zeros((part,), dtype=np.float32)
+                prevR = np.zeros((part,), dtype=np.float32)
+
+            x2L = np.concatenate((prevL, xL), axis=0)
+            x2R = np.concatenate((prevR, xR), axis=0)
+            XL = np.fft.rfft(x2L)
+            XR = np.fft.rfft(x2R)
+
+            pos = int(getattr(self, "_ir_ring_pos", 0)) % max(1, num_parts)
+            X_L[pos] = XL
+            X_R[pos] = XR
+
+            # Accumulate in frequency domain
+            YL = np.zeros_like(XL)
+            YR = np.zeros_like(XR)
+            for k in range(num_parts):
+                j = (pos - k) % num_parts
+                YL += H_L[k] * X_L[j]
+                YR += H_R[k] * X_R[j]
+
+            y2L = np.fft.irfft(YL, n=fft_size).astype(np.float32, copy=False)
+            y2R = np.fft.irfft(YR, n=fft_size).astype(np.float32, copy=False)
+            wetL = y2L[part:part + take]
+            wetR = y2R[part:part + take]
+
+            # Predelay for wet
+            pred_ms = float(getattr(self.mgr, "ir_reverb_predelay_ms", 0.0))
+            pred_ms = max(0.0, min(250.0, pred_ms))
+            sr = float(getattr(self, "samplerate", 48000) or 48000)
+            pred_samp = int((pred_ms / 1000.0) * sr)
+            if pred_samp > 0:
+                size = max(1, pred_samp + part + 4)
+                if self._ir_predelay_buf_L is None or self._ir_predelay_buf_L.size != size:
+                    self._ir_predelay_buf_L = np.zeros((size,), dtype=np.float32)
+                    self._ir_predelay_buf_R = np.zeros((size,), dtype=np.float32)
+                    self._ir_predelay_idx = 0
+                bufDL = self._ir_predelay_buf_L
+                bufDR = self._ir_predelay_buf_R
+                idxD = int(self._ir_predelay_idx)
+                outWetL = np.empty((take,), dtype=np.float32)
+                outWetR = np.empty((take,), dtype=np.float32)
+                for i in range(take):
+                    bufDL[idxD] = float(wetL[i])
+                    bufDR[idxD] = float(wetR[i])
+                    read = (idxD - pred_samp) % size
+                    outWetL[i] = float(bufDL[read])
+                    outWetR[i] = float(bufDR[read])
+                    idxD += 1
+                    if idxD >= size:
+                        idxD = 0
+                self._ir_predelay_idx = int(idxD)
+                wetL = outWetL
+                wetR = outWetR
+
+            # Mix
+            arr[:take, 0] = (1.0 - mix) * arr[:take, 0] + mix * wetL
+            arr[:take, 1] = (1.0 - mix) * arr[:take, 1] + mix * wetR
+            np.clip(arr, -0.995, 0.995, out=arr)
+
+            self._ir_prev_in_L = xL
+            self._ir_prev_in_R = xR
+            self._ir_ring_pos = (pos + 1) % max(1, num_parts)
+
+        # 0) Auto Gain / Loudness Normalization (ReplayGain benzeri)
+        if getattr(self.mgr, "autogain_enabled", False):
+            try:
+                target_db = float(getattr(self.mgr, "autogain_target_dbfs", -18.0))
+                max_boost = float(getattr(self.mgr, "autogain_max_boost_db", 12.0))
+                max_cut = float(getattr(self.mgr, "autogain_max_cut_db", 18.0))
+                track_db = getattr(self, "_autogain_track_rms_dbfs", None)
+                if track_db is None:
+                    eps = 1e-12
+                    rms_now = float(np.sqrt(np.mean(stereo * stereo) + eps))
+                    track_db = _safe_dbfs_from_rms(rms_now)
+                gain_db = float(target_db) - float(track_db)
+                gain_db = max(-max_cut, min(max_boost, gain_db))
+                tgt = _db_to_lin(gain_db)
+                g0 = float(getattr(self, "_autogain_smooth_gain", 1.0))
+                if tgt < g0:
+                    g1 = g0 + (tgt - g0) * 0.20
+                else:
+                    g1 = g0 + (tgt - g0) * 0.05
+                self._autogain_smooth_gain = float(g1)
+                stereo *= float(g1)
+            except Exception:
+                pass
+
+        # 1) Noise Gate (Gürültü Kesici) - en başta uygula
+        if getattr(self.mgr, "noise_gate_enabled", False):
+            thr_db = float(getattr(self.mgr, "noise_gate_threshold_db", -55.0))
+            floor_gain = float(getattr(self.mgr, "noise_gate_floor_gain", 0.06))
+            eps = 1e-9
+            rms = float(np.sqrt(np.mean(stereo * stereo) + eps))
+            in_db = 20.0 * math.log10(rms + eps)
+            target = 1.0 if in_db >= thr_db else floor_gain
+
+            g0 = float(getattr(self, "_py_gate_gain", 1.0))
+            # Attack hızlı kapanış, release yumuşak açılış
+            if target < g0:
+                g1 = g0 + (target - g0) * 0.55
+            else:
+                g1 = g0 + (target - g0) * 0.06
+            self._py_gate_gain = float(g1)
+            stereo *= float(g1)
+        else:
+            self._py_gate_gain = 1.0
+
+        # 1.5) Parametrik EQ (PEQ) - cerrahi bell filtreler
+        if getattr(self.mgr, "peq_enabled", False):
+            try:
+                sr = float(getattr(self, "samplerate", 48000) or 48000)
+                freqs = list(getattr(self.mgr, "peq_freqs_hz", []))
+                qs = list(getattr(self.mgr, "peq_qs", []))
+                gains = list(getattr(self.mgr, "peq_gains_db", []))
+                params = (sr, tuple(round(float(x), 3) for x in freqs), tuple(round(float(x), 3) for x in qs), tuple(round(float(x), 3) for x in gains))
+                if params != getattr(self, "_peq_last_params", None) or not getattr(self, "_peq_coeffs", None):
+                    coeffs = []
+                    state = []
+                    band_count = min(len(freqs), len(qs), len(gains))
+                    band_count = min(band_count, 16)
+                    for i in range(band_count):
+                        coeffs.append(_biquad_peaking_coeffs(freqs[i], qs[i], gains[i], sr))
+                        state.append([0.0, 0.0, 0.0, 0.0])
+                    self._peq_coeffs = coeffs
+                    self._peq_state = state
+                    self._peq_last_params = params
+                for i in range(len(self._peq_coeffs)):
+                    _biquad_df2_process_inplace(stereo, self._peq_coeffs[i], self._peq_state[i])
+                np.clip(stereo, -0.995, 0.995, out=stereo)
+            except Exception:
+                pass
+
+        # 2) Kompresör (chunk-based, yumuşak)
+        if getattr(self.mgr, "compressor_enabled", False):
+            thr_db = float(getattr(self.mgr, "compressor_threshold_db", -18.0))
+            ratio = float(getattr(self.mgr, "compressor_ratio", 2.6))
+            ratio = max(1.0, ratio)
+            makeup_db = float(getattr(self.mgr, "compressor_makeup_db", 2.5))
+            eps = 1e-9
+            rms = float(np.sqrt(np.mean(stereo * stereo) + eps))
+            in_db = 20.0 * math.log10(rms + eps)
+            if in_db > thr_db:
+                out_db = thr_db + (in_db - thr_db) / ratio
+                gain_db = (out_db - in_db) + makeup_db
+                target = float(10.0 ** (gain_db / 20.0))
+            else:
+                target = float(10.0 ** (makeup_db / 20.0))
+
+            g0 = float(getattr(self, "_py_comp_gain", 1.0))
+            if target < g0:
+                g1 = g0 + (target - g0) * 0.35
+            else:
+                g1 = g0 + (target - g0) * 0.08
+            self._py_comp_gain = float(g1)
+            stereo *= float(g1)
+        else:
+            self._py_comp_gain = 1.0
+
+        # 3) Bas Güçlendirici (1-pole lowpass + mix)
+        if getattr(self.mgr, "bass_enhancer_enabled", False):
+            sr = float(getattr(self, "samplerate", 48000) or 48000)
+            fc = 160.0
+            a = float(math.exp(-2.0 * math.pi * fc / max(1.0, sr)))
+            mix = float(getattr(self.mgr, "bass_mix", 0.22))
+            mix = max(0.0, min(0.8, mix))
+            yL = float(getattr(self, "_bass_lp_L", 0.0))
+            yR = float(getattr(self, "_bass_lp_R", 0.0))
+            for i in range(int(actual_frames)):
+                xL = float(stereo[i, 0])
+                xR = float(stereo[i, 1])
+                yL = a * yL + (1.0 - a) * xL
+                yR = a * yR + (1.0 - a) * xR
+                stereo[i, 0] = xL + mix * yL
+                stereo[i, 1] = xR + mix * yR
+            self._bass_lp_L = float(yL)
+            self._bass_lp_R = float(yR)
+
+            # Safety clip
+            np.clip(stereo, -0.995, 0.995, out=stereo)
+
+        # 3.5) Dynamic EQ (genel) - eşik üstünde bell cut
+        if getattr(self.mgr, "dynamic_eq_enabled", False):
+            try:
+                sr = float(getattr(self, "samplerate", 48000) or 48000)
+                freqs = list(getattr(self.mgr, "dynamic_eq_freqs_hz", []))
+                qs = list(getattr(self.mgr, "dynamic_eq_qs", []))
+                thrs = list(getattr(self.mgr, "dynamic_eq_threshold_db", []))
+                ratios = list(getattr(self.mgr, "dynamic_eq_ratio", []))
+                ranges = list(getattr(self.mgr, "dynamic_eq_range_db", []))
+                band_count = min(len(freqs), len(qs), len(thrs), len(ratios), len(ranges))
+                band_count = min(band_count, 4)
+                params = (sr,
+                          tuple(round(float(x), 3) for x in freqs[:band_count]),
+                          tuple(round(float(x), 3) for x in qs[:band_count]),
+                          tuple(round(float(x), 3) for x in thrs[:band_count]),
+                          tuple(round(float(x), 3) for x in ratios[:band_count]),
+                          tuple(round(float(x), 3) for x in ranges[:band_count]))
+                if params != getattr(self, "_dyn_last_params", None) or not getattr(self, "_dyn_det_coeffs", None):
+                    det_coeffs = []
+                    det_state = []
+                    peq_state = []
+                    for i in range(band_count):
+                        det_coeffs.append(_biquad_bandpass_coeffs(freqs[i], qs[i], sr))
+                        det_state.append([0.0, 0.0, 0.0, 0.0])
+                        peq_state.append([0.0, 0.0, 0.0, 0.0])
+                    self._dyn_det_coeffs = det_coeffs
+                    self._dyn_det_state = det_state
+                    self._dyn_peq_state = peq_state
+                    self._dyn_last_params = params
+
+                # Per-band detection & apply dynamic cut using peaking filter
+                for i in range(len(getattr(self, "_dyn_det_coeffs", []))):
+                    tmp = stereo.copy()
+                    _biquad_df2_process_inplace(tmp, self._dyn_det_coeffs[i], self._dyn_det_state[i])
+                    eps = 1e-12
+                    rms_b = float(np.sqrt(np.mean(tmp * tmp) + eps))
+                    in_db = _safe_dbfs_from_rms(rms_b)
+                    thr = float(thrs[i])
+                    ratio = max(1.0, float(ratios[i]))
+                    rng = max(0.0, float(ranges[i]))
+                    if in_db > thr:
+                        over = in_db - thr
+                        red_db = min(rng, over * (1.0 - (1.0 / ratio)))
+                    else:
+                        red_db = 0.0
+                    if red_db > 0.01:
+                        coeff = _biquad_peaking_coeffs(freqs[i], qs[i], -red_db, sr)
+                        _biquad_df2_process_inplace(stereo, coeff, self._dyn_peq_state[i])
+                np.clip(stereo, -0.995, 0.995, out=stereo)
+            except Exception:
+                pass
+
+        # 4) De-esser (sibilance azaltma) - high band dinamik kısma
+        if getattr(self.mgr, "deesser_enabled", False):
+            sr = float(getattr(self, "samplerate", 48000) or 48000)
+            fc = 4500.0
+            a = float(math.exp(-2.0 * math.pi * fc / max(1.0, sr)))
+            thr_db = float(getattr(self.mgr, "deesser_threshold_db", -22.0))
+            strength = float(getattr(self.mgr, "deesser_strength", 0.55))
+            strength = max(0.0, min(1.0, strength))
+            eps = 1e-9
+
+            x1L = float(getattr(self, "_deess_hp_x1_L", 0.0))
+            y1L = float(getattr(self, "_deess_hp_y1_L", 0.0))
+            x1R = float(getattr(self, "_deess_hp_x1_R", 0.0))
+            y1R = float(getattr(self, "_deess_hp_y1_R", 0.0))
+
+            # High-pass component (for detection & subtraction)
+            hp = np.empty((int(actual_frames), 2), dtype=np.float32)
+            for i in range(int(actual_frames)):
+                xL = float(stereo[i, 0])
+                xR = float(stereo[i, 1])
+
+                yL = a * (y1L + xL - x1L)
+                yR = a * (y1R + xR - x1R)
+
+                x1L, y1L = xL, yL
+                x1R, y1R = xR, yR
+
+                hp[i, 0] = yL
+                hp[i, 1] = yR
+
+            self._deess_hp_x1_L, self._deess_hp_y1_L = float(x1L), float(y1L)
+            self._deess_hp_x1_R, self._deess_hp_y1_R = float(x1R), float(y1R)
+
+            rms_hp = float(np.sqrt(np.mean(hp * hp) + eps))
+            in_db = 20.0 * math.log10(rms_hp + eps)
+            if in_db > thr_db:
+                over = in_db - thr_db
+                # Up to ~15 dB reduction scaled by strength
+                red_db = -min(15.0, over * 0.9) * strength
+                target = float(10.0 ** (red_db / 20.0))
+            else:
+                target = 1.0
+
+            g0 = float(getattr(self, "_py_deess_gain", 1.0))
+            if target < g0:
+                g1 = g0 + (target - g0) * 0.45
+            else:
+                g1 = g0 + (target - g0) * 0.06
+            self._py_deess_gain = float(g1)
+
+            # Subtract reduced high band from original
+            stereo -= (1.0 - float(g1)) * hp
+
+        else:
+            self._py_deess_gain = 1.0
+
+        # 5) Netleştirici (Exciter) - high band harmonics + mix
+        if getattr(self.mgr, "exciter_enabled", False):
+            sr = float(getattr(self, "samplerate", 48000) or 48000)
+            fc = 3000.0
+            a = float(math.exp(-2.0 * math.pi * fc / max(1.0, sr)))
+            amount = float(getattr(self.mgr, "exciter_amount", 0.35))
+            mix = float(getattr(self.mgr, "exciter_mix", 0.18))
+            amount = max(0.0, min(1.0, amount))
+            mix = max(0.0, min(0.6, mix))
+
+            x1L = float(getattr(self, "_exc_hp_x1_L", 0.0))
+            y1L = float(getattr(self, "_exc_hp_y1_L", 0.0))
+            x1R = float(getattr(self, "_exc_hp_x1_R", 0.0))
+            y1R = float(getattr(self, "_exc_hp_y1_R", 0.0))
+
+            drive = 1.0 + 6.0 * amount
+            for i in range(int(actual_frames)):
+                xL = float(stereo[i, 0])
+                xR = float(stereo[i, 1])
+
+                hpL = a * (y1L + xL - x1L)
+                hpR = a * (y1R + xR - x1R)
+                x1L, y1L = xL, hpL
+                x1R, y1R = xR, hpR
+
+                # soft clip on high band
+                exL = math.tanh(drive * hpL)
+                exR = math.tanh(drive * hpR)
+
+                stereo[i, 0] = xL + mix * exL
+                stereo[i, 1] = xR + mix * exR
+
+            self._exc_hp_x1_L, self._exc_hp_y1_L = float(x1L), float(y1L)
+            self._exc_hp_x1_R, self._exc_hp_y1_R = float(x1R), float(y1R)
+
+            np.clip(stereo, -0.995, 0.995, out=stereo)
+
+        # 6) Stereo Widener v2 (Mid/Side)
+        if getattr(self.mgr, "stereo_widener_v2_enabled", False):
+            width = float(getattr(self.mgr, "widener_width", 1.35))
+            mix = float(getattr(self.mgr, "widener_mix", 0.35))
+            mono_safe = float(getattr(self.mgr, "widener_mono_safe", 1.0))
+            width = max(0.0, min(2.0, width))
+            mix = max(0.0, min(1.0, mix))
+            mono_safe = max(0.0, min(1.0, mono_safe))
+
+            L = stereo[:, 0]
+            R = stereo[:, 1]
+            M = 0.5 * (L + R)
+            S = 0.5 * (L - R)
+            Sw = S * width * mono_safe
+            Lw = M + Sw
+            Rw = M - Sw
+            stereo[:, 0] = (1.0 - mix) * L + mix * Lw
+            stereo[:, 1] = (1.0 - mix) * R + mix * Rw
+            np.clip(stereo, -0.995, 0.995, out=stereo)
+
+        # 7) Echo (Yankı) - lightweight feedback delay
+        echo_enabled = bool(getattr(self.mgr, "echo_enabled", False))
+        if not echo_enabled:
+            if bool(getattr(self, "_echo_was_enabled", False)):
+                self._echo_was_enabled = False
+                try:
+                    if self._echo_buf_L is not None:
+                        self._echo_buf_L.fill(0)
+                    if self._echo_buf_R is not None:
+                        self._echo_buf_R.fill(0)
+                except Exception:
+                    pass
+                self._echo_lp_L = 0.0
+                self._echo_lp_R = 0.0
+        else:
+            self._echo_was_enabled = True
+            sr = int(getattr(self, "samplerate", 48000) or 48000)
+            delay_ms = float(getattr(self.mgr, "echo_delay_ms", 240.0))
+            feedback = float(getattr(self.mgr, "echo_feedback", 0.35))
+            mix = float(getattr(self.mgr, "echo_mix", 0.22))
+            pingpong = bool(getattr(self.mgr, "echo_pingpong", False))
+            tone = float(getattr(self.mgr, "echo_tone", 0.60))
+            duck_enabled = bool(getattr(self.mgr, "echo_duck_enabled", True))
+            duck_thr_db = float(getattr(self.mgr, "echo_duck_threshold_db", -22.0))
+            duck_amount = float(getattr(self.mgr, "echo_duck_amount", 0.55))
+
+            delay_ms = max(20.0, min(1200.0, delay_ms))
+            feedback = max(0.0, min(0.95, feedback))
+            mix = max(0.0, min(0.60, mix))
+            tone = max(0.0, min(1.0, tone))
+            duck_amount = max(0.0, min(1.0, duck_amount))
+
+            size = int(sr * 2.0)  # up to 2s delay line (safe)
+            if self._echo_buf_L is None or self._echo_buf_R is None or len(self._echo_buf_L) != size:
+                self._echo_buf_L = np.zeros(size, dtype=np.float32)
+                self._echo_buf_R = np.zeros(size, dtype=np.float32)
+                self._echo_idx = 0
+                self._echo_lp_L = 0.0
+                self._echo_lp_R = 0.0
+
+            bufL = self._echo_buf_L
+            bufR = self._echo_buf_R
+            n = int(bufL.size)
+            idx = int(self._echo_idx)
+
+            d = int((delay_ms / 1000.0) * sr)
+            d = max(1, min(n - 1, d))
+
+            # Damping inside feedback loop (Tone/High-cut): tone düşükse daha koyu
+            damp = 0.12 + (1.0 - tone) * 0.70
+            damp = max(0.0, min(0.92, damp))
+            lpL = float(self._echo_lp_L)
+            lpR = float(self._echo_lp_R)
+
+            # Ducking: giriş güçlü ise echo mix azalt
+            mix_eff = mix
+            try:
+                if duck_enabled and mix > 1e-6:
+                    eps = 1e-9
+                    rms = float(np.sqrt(np.mean(stereo * stereo) + eps))
+                    in_db = 20.0 * math.log10(rms + eps)
+                    over = in_db - float(duck_thr_db)
+                    amt = float(duck_amount)
+                    # 0..12 dB aralığında yumuşak duck eğrisi
+                    t = max(0.0, min(1.0, over / 12.0))
+                    target_duck = 1.0 - amt * t
+                    g0 = float(getattr(self, "_echo_duck_gain", 1.0))
+                    if target_duck < g0:
+                        g1 = g0 + (target_duck - g0) * 0.45  # attack
+                    else:
+                        g1 = g0 + (target_duck - g0) * 0.08  # release
+                    self._echo_duck_gain = float(g1)
+                    mix_eff = mix * float(g1)
+                else:
+                    self._echo_duck_gain = 1.0
+            except Exception:
+                pass
+
+            for i in range(int(actual_frames)):
+                inL = float(stereo[i, 0])
+                inR = float(stereo[i, 1])
+
+                dl = float(bufL[(idx - d) % n])
+                dr = float(bufR[(idx - d) % n])
+
+                lpL = (1.0 - damp) * dl + damp * lpL
+                lpR = (1.0 - damp) * dr + damp * lpR
+
+                if pingpong:
+                    bufL[idx] = inL + feedback * lpR
+                    bufR[idx] = inR + feedback * lpL
+                else:
+                    bufL[idx] = inL + feedback * lpL
+                    bufR[idx] = inR + feedback * lpR
+
+                stereo[i, 0] = (1.0 - mix_eff) * inL + mix_eff * lpL
+                stereo[i, 1] = (1.0 - mix_eff) * inR + mix_eff * lpR
+
+                idx += 1
+                if idx >= n:
+                    idx = 0
+
+            self._echo_idx = int(idx)
+            self._echo_lp_L = float(lpL)
+            self._echo_lp_R = float(lpR)
+            np.clip(stereo, -0.995, 0.995, out=stereo)
+
+        # 8) Reverb (Oda) - lightweight feedback delay + damping
+        if getattr(self.mgr, "reverb_enabled", False):
+            sr = int(getattr(self, "samplerate", 48000) or 48000)
+            room = float(getattr(self.mgr, "reverb_room", 0.35))
+            damping = float(getattr(self.mgr, "reverb_damping", 0.35))
+            mix = float(getattr(self.mgr, "reverb_mix", 0.18))
+            predelay_ms = float(getattr(self.mgr, "reverb_predelay_ms", 15.0))
+            tone = float(getattr(self.mgr, "reverb_tone", 0.50))
+            room = max(0.0, min(1.0, room))
+            damping = max(0.0, min(1.0, damping))
+            mix = max(0.0, min(0.6, mix))
+            predelay_ms = max(0.0, min(60.0, predelay_ms))
+            tone = max(0.0, min(1.0, tone))
+
+            # Buffer init: ~0.25s stereo delay line (safe)
+            if self._rev_buf_L is None or self._rev_buf_R is None or len(self._rev_buf_L) != int(sr * 0.25):
+                size = int(sr * 0.25)
+                self._rev_buf_L = np.zeros(size, dtype=np.float32)
+                self._rev_buf_R = np.zeros(size, dtype=np.float32)
+                self._rev_idx = 0
+                self._rev_lp_L = 0.0
+                self._rev_lp_R = 0.0
+
+            bufL = self._rev_buf_L
+            bufR = self._rev_buf_R
+            n = bufL.size
+            idx = int(self._rev_idx)
+
+            # Delay taps (ms) scaled by room
+            pre = predelay_ms / 1000.0
+            base = pre + (0.045 + 0.12 * room)  # pre + 45ms..165ms
+            d1 = int(sr * (base * 0.65))
+            d2 = int(sr * (base * 0.83))
+            d3 = int(sr * (base * 1.07))
+            d4 = int(sr * (base * 1.23))
+            d1 = max(1, min(n - 1, d1))
+            d2 = max(1, min(n - 1, d2))
+            d3 = max(1, min(n - 1, d3))
+            d4 = max(1, min(n - 1, d4))
+
+            fb = 0.25 + 0.55 * room   # feedback strength
+            # Damping + Tone/High-cut: tone düşükse daha koyu (daha fazla low-pass)
+            damp = 0.05 + 0.85 * damping
+            damp = max(0.0, min(0.98, damp + (1.0 - tone) * 0.35))
+            lpL = float(self._rev_lp_L)
+            lpR = float(self._rev_lp_R)
+
+            for i in range(int(actual_frames)):
+                inL = float(stereo[i, 0])
+                inR = float(stereo[i, 1])
+
+                r1L = float(bufL[(idx - d1) % n])
+                r2L = float(bufL[(idx - d2) % n])
+                r3L = float(bufL[(idx - d3) % n])
+                r4L = float(bufL[(idx - d4) % n])
+                r1R = float(bufR[(idx - d1) % n])
+                r2R = float(bufR[(idx - d2) % n])
+                r3R = float(bufR[(idx - d3) % n])
+                r4R = float(bufR[(idx - d4) % n])
+
+                wetL = 0.35 * (r1L + r2L) + 0.25 * (r3L + r4L)
+                wetR = 0.35 * (r1R + r2R) + 0.25 * (r3R + r4R)
+
+                # damping low-pass inside feedback
+                lpL = (1.0 - damp) * wetL + damp * lpL
+                lpR = (1.0 - damp) * wetR + damp * lpR
+
+                # write with feedback + a tiny crossfeed for width
+                bufL[idx] = (inL + fb * (lpL + 0.12 * lpR))
+                bufR[idx] = (inR + fb * (lpR + 0.12 * lpL))
+
+                outL = (1.0 - mix) * inL + mix * lpL
+                outR = (1.0 - mix) * inR + mix * lpR
+                stereo[i, 0] = outL
+                stereo[i, 1] = outR
+
+                idx += 1
+                if idx >= n:
+                    idx = 0
+
+            self._rev_idx = int(idx)
+            self._rev_lp_L = float(lpL)
+            self._rev_lp_R = float(lpR)
+            np.clip(stereo, -0.995, 0.995, out=stereo)
+
+        # 8.5) Konvolüsyon Reverb (IR Reverb)
+        try:
+            _apply_ir_reverb_inplace(stereo)
+        except Exception:
+            pass
+
+        # 8.7) Crossfeed (Kulaklık) - basit lowpass cross-mix
+        if getattr(self.mgr, "crossfeed_enabled", False):
+            try:
+                sr = float(getattr(self, "samplerate", 48000) or 48000)
+                amt = float(getattr(self.mgr, "crossfeed_amount", 0.35))
+                fc = float(getattr(self.mgr, "crossfeed_cutoff_hz", 700.0))
+                amt = max(0.0, min(1.0, amt))
+                fc = max(150.0, min(2000.0, fc))
+                a = float(math.exp(-2.0 * math.pi * fc / max(1.0, sr)))
+                lpL = float(getattr(self, "_xfeed_lp_L", 0.0))
+                lpR = float(getattr(self, "_xfeed_lp_R", 0.0))
+                for i in range(int(actual_frames)):
+                    xL = float(stereo[i, 0])
+                    xR = float(stereo[i, 1])
+                    lpL = a * lpL + (1.0 - a) * xL
+                    lpR = a * lpR + (1.0 - a) * xR
+                    stereo[i, 0] = xL + amt * lpR
+                    stereo[i, 1] = xR + amt * lpL
+                self._xfeed_lp_L = float(lpL)
+                self._xfeed_lp_R = float(lpR)
+                np.clip(stereo, -0.995, 0.995, out=stereo)
+            except Exception:
+                pass
+
+        # 8.8) Bass/Sub-bass Mono
+        if getattr(self.mgr, "bass_mono_enabled", False):
+            try:
+                sr = float(getattr(self, "samplerate", 48000) or 48000)
+                fc = float(getattr(self.mgr, "bass_mono_cutoff_hz", 120.0))
+                amt = float(getattr(self.mgr, "bass_mono_amount", 1.0))
+                fc = max(50.0, min(200.0, fc))
+                amt = max(0.0, min(1.0, amt))
+                a = float(math.exp(-2.0 * math.pi * fc / max(1.0, sr)))
+                lpL = float(getattr(self, "_bassmono_lp_L", 0.0))
+                lpR = float(getattr(self, "_bassmono_lp_R", 0.0))
+                for i in range(int(actual_frames)):
+                    xL = float(stereo[i, 0])
+                    xR = float(stereo[i, 1])
+                    lpL = a * lpL + (1.0 - a) * xL
+                    lpR = a * lpR + (1.0 - a) * xR
+                    avg = 0.5 * (lpL + lpR)
+                    stereo[i, 0] = (xL - lpL) + (1.0 - amt) * lpL + amt * avg
+                    stereo[i, 1] = (xR - lpR) + (1.0 - amt) * lpR + amt * avg
+                self._bassmono_lp_L = float(lpL)
+                self._bassmono_lp_R = float(lpR)
+            except Exception:
+                pass
+
+        # 9) Harmonic Saturation / Tape (soft clip)
+        if getattr(self.mgr, "saturation_enabled", False):
+            try:
+                drive_db = float(getattr(self.mgr, "saturation_drive_db", 6.0))
+                mix = float(getattr(self.mgr, "saturation_mix", 0.25))
+                drive_db = max(0.0, min(24.0, drive_db))
+                mix = max(0.0, min(1.0, mix))
+                if mix > 1e-6:
+                    drive = _db_to_lin(drive_db)
+                    denom = math.tanh(drive) if drive > 1e-6 else 1.0
+                    wet = np.tanh(stereo * drive) / max(1e-6, denom)
+                    stereo[:] = (1.0 - mix) * stereo + mix * wet
+                    np.clip(stereo, -0.995, 0.995, out=stereo)
+            except Exception:
+                pass
+
+        # 10) Limiter (chunk-based, soft smoothing)
+        if getattr(self.mgr, "limiter_enabled", False):
+            ceiling = float(getattr(self.mgr, "limiter_ceiling", 0.98))
+            ceiling = max(0.80, min(0.999, ceiling))
+            peak = float(np.max(np.abs(stereo)))
+            target = 1.0 if peak <= ceiling else (ceiling / max(1e-9, peak))
+            g0 = float(getattr(self, "_py_limiter_gain", 1.0))
+            if target < g0:
+                g1 = target
+            else:
+                g1 = g0 + (target - g0) * 0.04
+            self._py_limiter_gain = float(g1)
+            stereo *= float(g1)
+        else:
+            self._py_limiter_gain = 1.0
+
+        # 11) True Peak Limiter + Metering (inter-sample peak estimate)
+        try:
+            # Metering (post-processing, pre-volume)
+            eps = 1e-12
+            rms_v = float(np.sqrt(np.mean(stereo * stereo) + eps))
+            self._meter_rms_dbfs = _safe_dbfs_from_rms(rms_v)
+            peak_v = float(np.max(np.abs(stereo))) if stereo.size else 0.0
+            self._meter_peak_dbfs = 20.0 * math.log10(max(1e-12, peak_v))
+            tp_db = _compute_true_peak_dbfs(stereo)
+            self._meter_true_peak_dbfs = float(tp_db)
+
+            if getattr(self.mgr, "true_peak_limiter_enabled", False):
+                ceiling_db = float(getattr(self.mgr, "true_peak_ceiling_db", -1.0))
+                release_ms = float(getattr(self.mgr, "true_peak_release_ms", 120.0))
+                ceiling = _db_to_lin(ceiling_db)
+                tp_lin = float(10.0 ** (tp_db / 20.0))
+                target = 1.0 if tp_lin <= ceiling else (ceiling / max(1e-12, tp_lin))
+                g0 = float(getattr(self, "_tp_gain", 1.0))
+                if target < g0:
+                    g1 = target
+                else:
+                    sr = float(getattr(self, "samplerate", 48000) or 48000)
+                    rel_samp = max(1.0, (float(release_ms) / 1000.0) * sr)
+                    alpha = math.exp(-float(actual_frames) / rel_samp)
+                    g1 = target + (g0 - target) * alpha
+                self._tp_gain = float(g1)
+                stereo *= float(g1)
+                np.clip(stereo, -0.995, 0.995, out=stereo)
+        except Exception:
+            pass
+
+        # 12) Bit-depth simülasyonu + Dither (opsiyonel)
+        if getattr(self.mgr, "bitdepth_enabled", False):
+            try:
+                bits = int(getattr(self.mgr, "bitdepth_bits", 16))
+                bits = max(6, min(24, bits))
+                dither_on = bool(getattr(self.mgr, "dither_enabled", True))
+                step = float(1.0 / (2.0 ** (bits - 1)))
+                if dither_on:
+                    # TPDF dither: (U1-U2) * step
+                    n = int(stereo.shape[0])
+                    noise = (np.random.random((n, 2)).astype(np.float32) - np.random.random((n, 2)).astype(np.float32)) * step
+                    stereo += noise
+                stereo[:] = np.round(stereo / step) * step
+                np.clip(stereo, -1.0, 1.0, out=stereo)
+            except Exception:
+                pass
 
     def _apply_transport_fade(self, proc_buf, actual_frames):
         """Applies pause/resume/stop fades to the processed buffer."""
@@ -1814,7 +3513,7 @@ class OfflineDSPProcessor:
     
     def __init__(self, dsp_engine):
         self.dsp = dsp_engine
-        self.cache_dir = Path("/tmp/angolla_dsp_cache")
+        self.cache_dir = Path("/tmp/aurivo_dsp_cache")
         self.cache_dir.mkdir(exist_ok=True)
         
     def _get_settings_hash(self):
@@ -2163,6 +3862,21 @@ class ToneKnob(QDial):
         self.heat_max_value = max_val
         self.use_heat_map = True
         self.alert_active = False
+        self._is_hovered = False
+
+        # Akıcı rainbow renk döngüsü (hover/drag sırasında)
+        self._rainbow_shift = 0.0
+        self._rainbow_timer = QTimer(self)
+        self._rainbow_timer.setInterval(50)
+        self._rainbow_timer.timeout.connect(self._animate_rainbow)
+        self._rainbow_timer.start()
+
+    def _animate_rainbow(self):
+        self._rainbow_shift += 0.02
+        if self._rainbow_shift > 1.0:
+            self._rainbow_shift -= 1.0
+        if self._is_hovered or self._drag_active:
+            self.update()
 
     def set_heat_map(self, min_value, warn_value, max_value):
         self.heat_min_value = min_value
@@ -2279,6 +3993,16 @@ class ToneKnob(QDial):
 
         event.accept()
 
+    def enterEvent(self, event):
+        self._is_hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._is_hovered = False
+        self.update()
+        super().leaveEvent(event)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -2304,25 +4028,101 @@ class ToneKnob(QDial):
             (radius - 5) * 2
         )
 
-        pen_base = QPen(QColor("#3a3a3a"), 8, Qt.SolidLine, Qt.RoundCap)
-        painter.setPen(pen_base)
-        painter.drawArc(ring_rect, start_angle, total_span)
-
         span = self.maximum() - self.minimum()
         val_norm = 0.0 if span == 0 else (self._display_value - self.minimum()) / span
-        active_span = int(total_span * val_norm)
-        pen_active = QPen(self._heat_color(self._display_value), 8, Qt.SolidLine, Qt.RoundCap)
-        painter.setPen(pen_active)
-        painter.drawArc(ring_rect, start_angle, active_span)
+        val_norm = max(0.0, min(1.0, float(val_norm)))
 
-        # End-dot on ring
+        sh = float(self._rainbow_shift)
+
+        def _rainbow_color(t: float, alpha: int, sat: int, val: int) -> QColor:
+            t = max(0.0, min(1.0, float(t)))
+            hue = int((sh * 360.0 + t * 300.0) % 360.0)
+            c = QColor.fromHsv(hue, int(sat), int(val))
+            c.setAlpha(int(alpha))
+            return c
+
+        # Rainbow ring (base + active)
+        segs = 54
+        seg_span = float(total_span) / float(segs)
+
+        if self.alert_active:
+            base = QPen(QColor(120, 50, 50, 140), 8, Qt.SolidLine, Qt.RoundCap)
+            active = QPen(QColor(255, 70, 70, 235), 8, Qt.SolidLine, Qt.RoundCap)
+            painter.setPen(base)
+            painter.drawArc(ring_rect, start_angle, total_span)
+            painter.setPen(active)
+            painter.drawArc(ring_rect, start_angle, int(total_span * val_norm))
+            dot_color = QColor(255, 70, 70)
+        else:
+            # Base: dim rainbow
+            for i in range(segs):
+                t = i / float(segs - 1)
+                pen = QPen(_rainbow_color(t, alpha=85, sat=210, val=255), 8, Qt.SolidLine, Qt.RoundCap)
+                painter.setPen(pen)
+                painter.drawArc(ring_rect, int(start_angle + seg_span * i), int(seg_span))
+
+            # Active: bright rainbow (up to current value)
+            active_f = val_norm * float(segs)
+            active_full = int(active_f)
+            active_rem = active_f - float(active_full)
+
+            for i in range(min(segs, active_full)):
+                t = i / float(segs - 1)
+                pen = QPen(_rainbow_color(t, alpha=235, sat=235, val=255), 8, Qt.SolidLine, Qt.RoundCap)
+                painter.setPen(pen)
+                painter.drawArc(ring_rect, int(start_angle + seg_span * i), int(seg_span))
+
+            if 0 < active_rem < 1.0 and active_full < segs:
+                t = active_full / float(segs - 1)
+                pen = QPen(_rainbow_color(t, alpha=235, sat=235, val=255), 8, Qt.SolidLine, Qt.RoundCap)
+                painter.setPen(pen)
+                painter.drawArc(ring_rect, int(start_angle + seg_span * active_full), int(seg_span * active_rem))
+
+            dot_color = _rainbow_color(val_norm, alpha=255, sat=235, val=255)
+
+        # End-dot on ring (FX slider noktası gibi: ring + hole + glow)
         angle_deg = 225.0 + (-270.0 * val_norm)
         angle_rad = math.radians(angle_deg)
         dot_r = radius - 5
         dot_x = c.x() + dot_r * math.cos(angle_rad)
         dot_y = c.y() - dot_r * math.sin(angle_rad)
-        painter.setBrush(self._heat_color(self._display_value))
-        painter.drawEllipse(QPointF(dot_x, dot_y), 4.2, 4.2)
+
+        dot_pos = QPointF(dot_x, dot_y)
+        dot_radius = 6.6
+        if self._drag_active:
+            dot_radius += 1.1
+        elif self._is_hovered:
+            dot_radius += 0.7
+
+        glow = QRadialGradient(dot_pos, dot_radius + 8)
+        glow_col = QColor(dot_color)
+        glow_alpha = 170
+        if self._drag_active:
+            glow_alpha = 235
+        elif self._is_hovered:
+            glow_alpha = 205
+        glow_col.setAlpha(glow_alpha)
+        glow.setColorAt(0.0, glow_col)
+        glow.setColorAt(1.0, QColor(glow_col.red(), glow_col.green(), glow_col.blue(), 0))
+        painter.setBrush(QBrush(glow))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(dot_pos, dot_radius + 8, dot_radius + 8)
+
+        painter.setBrush(QColor(18, 18, 18, 235))
+        ring_w = 2
+        if self._drag_active:
+            ring_w = 3
+        elif self._is_hovered:
+            ring_w = 3
+        painter.setPen(QPen(dot_color, ring_w))
+        painter.drawEllipse(dot_pos, dot_radius, dot_radius)
+
+        painter.setBrush(QColor(8, 8, 8, 255))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(dot_pos, max(1.0, dot_radius - 2.8), max(1.0, dot_radius - 2.8))
+
+        painter.setBrush(QColor(255, 255, 255, 210))
+        painter.drawEllipse(dot_pos + QPointF(-1.4, -1.4), 1.8, 1.8)
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#5a5a5a"))
@@ -2366,7 +4166,7 @@ class ToneKnobWidget(QWidget):
 
         self.title_label = QLabel(title)
         self.title_label.setAlignment(Qt.AlignCenter)
-        self.title_label.setStyleSheet("color: #cfcfcf; font-size: 10px;")
+        self.title_label.setStyleSheet("color: #cfcfcf; font-size: 13px; font-weight: 600;")
 
         self.knob = ToneKnob(min_val, max_val, default_val)
         if self.suffix == "dB":
@@ -2379,7 +4179,7 @@ class ToneKnobWidget(QWidget):
 
         self.value_label = QLabel("")
         self.value_label.setAlignment(Qt.AlignCenter)
-        self.value_label.setStyleSheet("color: #9a9a9a; font-size: 9px;")
+        self.value_label.setStyleSheet("color: #c0c0c0; font-size: 12px;")
 
         layout.addWidget(self.title_label)
         layout.addWidget(self.knob, alignment=Qt.AlignHCenter)
@@ -2423,18 +4223,28 @@ class ToneKnobWidget(QWidget):
 class PopupEqualizerWidget(QDialog):
     eq_changed_signal = pyqtSignal(list)
 
-    def __init__(self, parent=None, manager: AudioManager = None):
+    def __init__(self, parent=None, manager: AudioManager = None, engine: GlobalAudioEngine = None):
         super().__init__(parent)
         self.mgr = manager
+        self.engine = engine
         self.setWindowTitle("Ses Efektleri")
         self.setWindowFlags(Qt.Window) # Independent window
-        self.resize(1120, 620)
+        self.resize(1320, 720)
+        self.setMinimumSize(1180, 650)
         
         self._updating_from_manager = False # Flag for remote sync
+        self._eq_curve_update_pending = False
         
         # Connect to manager
         if self.mgr:
             self.mgr.state_changed.connect(self.sync_from_manager)
+
+        # Metering (optional)
+        try:
+            if self.engine is not None:
+                self.engine.meters_ready.connect(self._on_meters_ready)
+        except Exception:
+            pass
         
         # Easy Effects inspired dark UI
         self.setStyleSheet("""
@@ -2535,28 +4345,47 @@ class PopupEqualizerWidget(QDialog):
         content_layout.setSpacing(12)
 
         sidebar = QWidget()
-        sidebar.setFixedWidth(190)
-        sidebar.setStyleSheet("background-color: #1f1f1f; border: 1px solid #2a2a2a; border-radius: 8px;")
+        # Sidebar should blend with the window (no boxed border) and grow with content.
+        sidebar.setStyleSheet("background-color: transparent; border: none;")
+        sidebar.setFixedWidth(240)
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(10, 10, 10, 10)
         sidebar_layout.setSpacing(10)
 
         plugins_label = QLabel("Eklentiler")
-        plugins_label.setStyleSheet("color: #bdbdbd; font-size: 10px; font-weight: bold;")
+        plugins_label.setStyleSheet("color: #bdbdbd; font-size: 11px; font-weight: bold;")
         sidebar_layout.addWidget(plugins_label)
 
         self.effects_list = QListWidget()
         self.effects_list.addItem("Ekolayzır")
+        self.effects_list.addItem("Dinamik Kompresör")
+        self.effects_list.addItem("Limiter")
+        self.effects_list.addItem("Bas Güçlendirici")
+        self.effects_list.addItem("Akıllı Noise Gate")
+        self.effects_list.addItem("De-esser")
+        self.effects_list.addItem("Netleştirici (Exciter)")
+        self.effects_list.addItem("Stereo Widener v2")
+        self.effects_list.addItem("Reverb (Oda)")
+        self.effects_list.addItem("Echo (Yankı)")
+        self.effects_list.addItem("Konvolüsyon Reverb (IR)")
+        self.effects_list.addItem("Parametrik EQ (PEQ)")
+        self.effects_list.addItem("Auto Gain / Normalize")
+        self.effects_list.addItem("True Peak Limiter + Meter")
+        self.effects_list.addItem("Crossfeed (Kulaklık)")
+        self.effects_list.addItem("Bass Mono / Sub Mono")
+        self.effects_list.addItem("Dynamic EQ")
+        self.effects_list.addItem("Tape / Saturation")
+        self.effects_list.addItem("Bit-depth / Dither")
         self.effects_list.setCurrentRow(0)
         self.effects_list.setStyleSheet("""
             QListWidget {
-                background: #1f1f1f;
-                border: 1px solid #2a2a2a;
+                background: transparent;
+                border: none;
                 color: #cfcfcf;
-                font-size: 10px;
+                font-size: 11px;
             }
             QListWidget::item {
-                padding: 6px 8px;
+                padding: 7px 9px;
             }
             QListWidget::item:selected {
                 background: #2a2a2a;
@@ -2564,8 +4393,7 @@ class PopupEqualizerWidget(QDialog):
                 border-left: 2px solid #ff8f00;
             }
         """)
-        sidebar_layout.addWidget(self.effects_list)
-        sidebar_layout.addStretch()
+        sidebar_layout.addWidget(self.effects_list, 1)
 
         content_layout.addWidget(sidebar)
 
@@ -2589,18 +4417,71 @@ class PopupEqualizerWidget(QDialog):
 
         eq_header = QHBoxLayout()
         eq_title = QLabel("32-Bandlı Profesyonel Ekolayzır")
-        eq_title.setStyleSheet("color: #d8d8d8; font-size: 11px; font-weight: bold;")
+        eq_title.setStyleSheet("color: #d8d8d8; font-size: 15px; font-weight: bold;")
+
+        self.eq_presets_btn = QPushButton("Hazır Ayarlar")
+        self.eq_presets_btn.setCursor(Qt.PointingHandCursor)
+        try:
+            # Transparan, renkli "EQ bant" ikonu (arka siyahlık yok)
+            _is = 26
+            _pm = QPixmap(_is, _is)
+            _pm.fill(Qt.transparent)
+            _p = QPainter(_pm)
+            _p.setRenderHint(QPainter.Antialiasing, True)
+
+            def _hsv(t: float, a: int = 255) -> QColor:
+                t = max(0.0, min(1.0, float(t)))
+                hue = int(round(300.0 * t))  # Kırmızı → Mor
+                c = QColor.fromHsv(hue, 255, 255)
+                c.setAlpha(int(a))
+                return c
+
+            # 5 bar: soldan sağa gökkuşağı
+            _xs = [3, 8, 13, 18, 23]
+            _hs = [16, 19, 22, 18, 14]
+            _ts = [0.00, 0.22, 0.45, 0.68, 0.90]
+            _bar_w = 3
+            _radius = 1.6
+
+            for _x, _h, _t in zip(_xs, _hs, _ts):
+                _y = _is - 2 - _h
+                _p.setPen(Qt.NoPen)
+                _p.setBrush(QBrush(_hsv(_t, a=255)))
+                _p.drawRoundedRect(QRectF(float(_x), float(_y), float(_bar_w), float(_h)), _radius, _radius)
+
+            # İnce alt çizgi (çok silik)
+            _p.setPen(QPen(QColor(255, 255, 255, 60), 1))
+            _p.drawLine(QPointF(2.0, float(_is - 2)), QPointF(float(_is - 2), float(_is - 2)))
+
+            _p.end()
+
+            self.eq_presets_btn.setIcon(QIcon(_pm))
+            self.eq_presets_btn.setIconSize(QSize(_is, _is))
+        except Exception:
+            pass
+        self.eq_presets_btn.setStyleSheet(
+            "QPushButton { background-color: #242424; color: #bdbdbd; border: 1px solid #333; border-radius: 4px; padding: 7px 14px; font-size: 12px; }"
+            "QPushButton:hover { background-color: #2f2f2f; color: #fff; }"
+        )
+
         eq_reset_btn = QPushButton("Sıfırla")
         eq_reset_btn.setCursor(Qt.PointingHandCursor)
         eq_reset_btn.setStyleSheet("""
-            QPushButton { background-color: #2b2b2b; color: #bbb; border: 1px solid #3a3a3a; border-radius: 4px; padding: 4px 10px; }
+            QPushButton { background-color: #2b2b2b; color: #bbb; border: 1px solid #3a3a3a; border-radius: 4px; padding: 7px 14px; font-size: 12px; }
             QPushButton:hover { background-color: #3a3a3a; color: #fff; }
         """)
         eq_reset_btn.clicked.connect(self.reset_eq)
         eq_header.addWidget(eq_title)
         eq_header.addStretch()
+        eq_header.addWidget(self.eq_presets_btn)
         eq_header.addWidget(eq_reset_btn)
         eq_container_layout.addLayout(eq_header)
+
+        # Seçili preset adı (bantların hemen üstünde)
+        self._eq_selected_preset_name = "Düz (Flat)"
+        self.eq_selected_preset_lbl = QLabel(f"Seçili Hazır Ayar: {self._eq_selected_preset_name}")
+        self.eq_selected_preset_lbl.setStyleSheet("color: #9a9a9a; font-size: 12px; font-weight: 600;")
+        eq_container_layout.addWidget(self.eq_selected_preset_lbl)
         
         # EQ sliders
         eq_widget = QWidget()
@@ -2610,32 +4491,47 @@ class PopupEqualizerWidget(QDialog):
         eq_layout.setContentsMargins(8, 8, 8, 6)
         
         self.sliders = []
+        self.eq_value_labels = []
         self.frequencies = list(EQ_BAND_LABELS)
         
         for i, freq in enumerate(self.frequencies):
             v_box = QVBoxLayout()
             v_box.setSpacing(3)
+
+            val_lbl = QLabel("+0.0 dB")
+            val_lbl.setAlignment(Qt.AlignCenter)
+            val_lbl.setStyleSheet("color: #c8c8c8; font-size: 11px; font-weight: bold;")
             
-            slider = QSlider(Qt.Vertical)
+            slider = RainbowEQBandSlider(Qt.Vertical)
             slider.setRange(-150, 150)
             slider.setValue(0)
             slider.setMinimumHeight(180)  # Taller sliders
             slider.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
             slider.valueChanged.connect(lambda val, idx=i: self._on_slider_change(idx, val))
+            slider.valueChanged.connect(lambda val, lbl=val_lbl: lbl.setText(f"{val/10.0:+.1f} dB"))
             slider.sliderReleased.connect(self._trigger_reprocess)
+
+            # sync_from_manager sırasında sinyaller blocklanınca label güncellenmiyordu.
+            slider._eq_value_label = val_lbl
             
             freq_lbl = QLabel(freq)
             freq_lbl.setAlignment(Qt.AlignCenter)
-            freq_lbl.setStyleSheet("color: #666; font-size: 8px;")
+            freq_lbl.setStyleSheet("color: #8a8a8a; font-size: 10px; font-weight: 600;")
             
+            v_box.addWidget(val_lbl, alignment=Qt.AlignHCenter)
             v_box.addWidget(slider, alignment=Qt.AlignHCenter)
             v_box.addWidget(freq_lbl, alignment=Qt.AlignHCenter)
             eq_layout.addLayout(v_box)
             self.sliders.append(slider)
+            self.eq_value_labels.append(val_lbl)
 
         self.eq_curve = EQCurveWidget(eq_widget)
         self.eq_curve.setGeometry(eq_widget.rect())
         self.eq_curve.lower()
+
+        # Keep EQ curve in sync with layout-driven resizes (window resize isn't enough).
+        self._eq_widget = eq_widget
+        self._eq_widget.installEventFilter(self)
 
         eq_visual_container = QFrame()
         eq_visual_container.setStyleSheet(
@@ -2656,8 +4552,8 @@ class PopupEqualizerWidget(QDialog):
         tone_layout.setContentsMargins(16, 12, 16, 12)
         tone_layout.setSpacing(10)
 
-        tone_title = QLabel("Tone_Space (Poweramp Modülü)")
-        tone_title.setStyleSheet("color: #bfe5c8; font-weight: bold; font-size: 10px;")
+        tone_title = QLabel("Aurivo Modülü")
+        tone_title.setStyleSheet("color: #bfe5c8; font-weight: bold; font-size: 13px;")
         tone_layout.addWidget(tone_title)
 
         knob_row = QHBoxLayout()
@@ -2683,12 +4579,83 @@ class PopupEqualizerWidget(QDialog):
         knob_row.addWidget(self.tone_treble_knob)
         knob_row.addWidget(self.stereo_knob)
         knob_row.addStretch()
+
+        # Balance (Sol/Sağ)
+        class _BalanceWrap(QWidget):
+            def __init__(self, slider: QSlider, parent=None):
+                super().__init__(parent)
+                self._slider = slider
+                self._slider.setParent(self)
+
+                self._center_line = QFrame(self)
+                self._center_line.setObjectName("balanceCenterTick")
+                self._center_line.setStyleSheet(
+                    "QFrame#balanceCenterTick { background-color: rgba(64, 196, 255, 140); }"
+                )
+
+            def resizeEvent(self, event):
+                super().resizeEvent(event)
+                try:
+                    self._slider.setGeometry(0, 0, self.width(), self.height())
+                except Exception:
+                    pass
+                try:
+                    w = 2
+                    x = (self.width() - w) // 2
+                    self._center_line.setGeometry(x, 2, w, max(0, self.height() - 4))
+                    self._center_line.raise_()
+                except Exception:
+                    pass
+
+        balance_host = QWidget()
+        balance_layout = QVBoxLayout(balance_host)
+        balance_layout.setContentsMargins(0, 0, 0, 0)
+        balance_layout.setSpacing(6)
+
+        balance_lbl = QLabel("Denge (Sol ↔ Sağ)")
+        balance_lbl.setStyleSheet("color: #8a8a8a; font-size: 10px; font-weight: 600;")
+
+        self.balance_slider = GradientSlider(Qt.Horizontal)
+        self.balance_slider.set_track_thickness(4)
+        self.balance_slider.setFixedHeight(18)
+        self.balance_slider.setFixedWidth(280)
+        self.balance_slider.setRange(-100, 100)
+        self.balance_slider.setValue(0)
+        self.balance_slider.setToolTip("Ses dengesi (Sol/Sağ)")
+
+        self.balance_value_lbl = QLabel("Merkez (0%)")
+        self.balance_value_lbl.setStyleSheet("color: #c8c8c8; font-size: 11px; font-weight: bold;")
+
+        def _update_balance_ui(v: int):
+            try:
+                if abs(int(v)) <= 0:
+                    self.balance_value_lbl.setText("Merkez (0%)")
+                elif v < 0:
+                    self.balance_value_lbl.setText(f"Sol %{-int(v)}")
+                else:
+                    self.balance_value_lbl.setText(f"Sağ %{int(v)}")
+            except Exception:
+                pass
+            try:
+                self.update_balance(float(v) / 100.0)
+            except Exception:
+                pass
+
+        self.balance_slider.valueChanged.connect(_update_balance_ui)
+
+        balance_wrap = _BalanceWrap(self.balance_slider)
+        balance_wrap.setFixedSize(280, 18)
+
+        balance_layout.addWidget(balance_lbl, alignment=Qt.AlignLeft)
+        balance_layout.addWidget(balance_wrap, alignment=Qt.AlignLeft)
+        balance_layout.addWidget(self.balance_value_lbl, alignment=Qt.AlignLeft)
+        knob_row.addWidget(balance_host)
         tone_layout.addLayout(knob_row)
 
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(8)
         acoustic_label = QLabel("Akustik Mekan:")
-        acoustic_label.setStyleSheet("color: #cfcfcf; font-size: 10px;")
+        acoustic_label.setStyleSheet("color: #cfcfcf; font-size: 12px;")
         self.acoustic_combo = QComboBox()
         self.acoustic_combo.addItems(["Kapalı", "Oda", "Stüdyo", "Konser", "Kilise"])
         self.acoustic_combo.setCursor(Qt.PointingHandCursor)
@@ -2699,7 +4666,7 @@ class PopupEqualizerWidget(QDialog):
                 border: 1px solid #3a3a3a;
                 border-radius: 4px;
                 padding: 4px 8px;
-                font-size: 9px;
+                font-size: 12px;
             }
             QComboBox::drop-down { border: none; }
         """)
@@ -2708,7 +4675,7 @@ class PopupEqualizerWidget(QDialog):
         self.reset_tone_btn = QPushButton("Modülü Sıfırla")
         self.reset_tone_btn.setCursor(Qt.PointingHandCursor)
         self.reset_tone_btn.setStyleSheet("""
-            QPushButton { background-color: #2b2b2b; color: #bbb; border: 1px solid #3a3a3a; border-radius: 4px; padding: 4px 10px; }
+            QPushButton { background-color: #2b2b2b; color: #bbb; border: 1px solid #3a3a3a; border-radius: 4px; padding: 7px 14px; font-size: 12px; }
             QPushButton:hover { background-color: #3a3a3a; color: #fff; }
         """)
         self.reset_tone_btn.clicked.connect(self.reset_tone_space)
@@ -2744,15 +4711,1424 @@ class PopupEqualizerWidget(QDialog):
         eq_page_layout.addWidget(tone_container, stretch=1)
         
         # Footer
-        footer = QLabel("Angolla DSP Engine v2.0 • 48kHz / 32-bit Float Processing")
+        footer = QLabel("Aurivo DSP Engine v2.0 • 48kHz / 32-bit Float Processing")
         footer.setAlignment(Qt.AlignRight)
-        footer.setStyleSheet("color: #444; font-size: 9px; margin-top: 10px;")
+        footer.setStyleSheet("color: #444; font-size: 10px; margin-top: 10px;")
         eq_page_layout.addWidget(footer)
 
         self.effects_stack.addWidget(eq_page)
+
+        # EQ preset data + wiring
+        try:
+            self._eq_presets_all = self._build_eq_presets_32()
+        except Exception:
+            self._eq_presets_all = [("Düz (Flat)", [0.0] * 32)]
+
+        # Preset popup (layout bozmaz)
+        self._eq_preset_popup = QFrame(self, Qt.Popup)
+        self._eq_preset_popup.setStyleSheet("QFrame { background: #151515; border: 1px solid #2a2a2a; border-radius: 8px; }")
+        pop_l = QVBoxLayout(self._eq_preset_popup)
+        pop_l.setContentsMargins(10, 10, 10, 10)
+        pop_l.setSpacing(8)
+
+        pop_title = QLabel("Hazır Ayarlar")
+        pop_title.setStyleSheet("color: #cfcfcf; font-size: 13px; font-weight: 700;")
+        pop_l.addWidget(pop_title)
+
+        self.eq_preset_search = QLineEdit(self._eq_preset_popup)
+        self.eq_preset_search.setPlaceholderText("Hazır ayar ara… (örn. bass, v-shape, vocal)")
+        self.eq_preset_search.setStyleSheet(
+            "QLineEdit { background: #1f1f1f; border: 1px solid #333; border-radius: 6px; padding: 8px 10px; color: #d6d6d6; font-size: 13px; }"
+        )
+        pop_l.addWidget(self.eq_preset_search)
+
+        self.eq_preset_list = QListWidget(self._eq_preset_popup)
+        self.eq_preset_list.setStyleSheet(
+            "QListWidget { background: transparent; border: none; color: #d6d6d6; font-size: 13px; }"
+            "QListWidget::item { padding: 10px 12px; }"
+            "QListWidget::item:selected { background: #2a2a2a; border-left: 2px solid #35c6ff; }"
+            "QScrollBar:vertical { background: #141414; width: 14px; margin: 6px 6px 6px 0px; border: 1px solid #2a2a2a; border-radius: 7px; }"
+            "QScrollBar::handle:vertical { background: #505050; min-height: 40px; border-radius: 7px; }"
+            "QScrollBar::handle:vertical:hover { background: #6a6a6a; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; width: 0px; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+        )
+        # Daha dar + daha uzun preset penceresi
+        self.eq_preset_list.setMinimumWidth(260)
+        self.eq_preset_list.setMinimumHeight(560)
+        try:
+            self.eq_preset_list.setIconSize(QSize(132, 78))
+        except Exception:
+            pass
+        try:
+            self.eq_preset_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        except Exception:
+            pass
+        pop_l.addWidget(self.eq_preset_list)
+
+        try:
+            # Popup genişliğini listeden türetip dar tut
+            self._eq_preset_popup.setFixedWidth(360)
+        except Exception:
+            pass
+
+        # Not: Listeyi tek seferde doldurmak GIL/UI'yi kilitleyip ses callback'inde drop-out yapabiliyor.
+        # Bu yüzden doldurma işi parça parça yapılır (bkz. _populate_eq_preset_list).
+        self.eq_preset_search.textChanged.connect(self._populate_eq_preset_list)
+        self.eq_preset_list.itemClicked.connect(self._on_eq_preset_clicked)
+
+        def _show_eq_preset_popup():
+            try:
+                if self._eq_preset_popup.isVisible():
+                    self._eq_preset_popup.hide()
+                    return
+                self._eq_preset_popup.adjustSize()
+                pos = self.eq_presets_btn.mapToGlobal(QPoint(0, self.eq_presets_btn.height() + 6))
+                self._eq_preset_popup.move(pos)
+                self._eq_preset_popup.show()
+                self.eq_preset_search.setFocus()
+                self.eq_preset_search.selectAll()
+                # Popup görünür olduktan sonra doldur (takılma azaltır)
+                QTimer.singleShot(
+                    0,
+                    lambda: self._populate_eq_preset_list(self.eq_preset_search.text() if hasattr(self, "eq_preset_search") else "")
+                )
+            except Exception:
+                pass
+
+        self.eq_presets_btn.clicked.connect(_show_eq_preset_popup)
+
+        # "Ön Ayarlar" butonu: EQ sayfasına getir + aramaya odaklan
+        try:
+            btn_presets.clicked.connect(lambda: (self.effects_list.setCurrentRow(0), _show_eq_preset_popup()))
+        except Exception:
+            pass
+
+        # ------------------------------
+        # Effect pages (sidebar entries)
+        # ------------------------------
+        def _build_effect_page(title_text):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(10, 10, 10, 10)
+            page_layout.setSpacing(12)
+
+            header = QHBoxLayout()
+            title_lbl = QLabel(title_text)
+            title_lbl.setStyleSheet("color: #d8d8d8; font-size: 15px; font-weight: bold;")
+            header.addWidget(title_lbl)
+            header.addStretch()
+
+            enable_cb = QCheckBox("Etkinleştir")
+            enable_cb.setCursor(Qt.PointingHandCursor)
+            enable_cb.setStyleSheet("QCheckBox { color: #cfcfcf; font-size: 12px; }")
+            default_btn = QPushButton("Varsayılan")
+            default_btn.setCursor(Qt.PointingHandCursor)
+            default_btn.setStyleSheet(
+                "QPushButton { background-color: #2b2b2b; color: #bbb; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 14px; font-size: 12px; }"
+                "QPushButton:hover { background-color: #3a3a3a; color: #fff; }"
+            )
+            header.addWidget(enable_cb)
+            header.addWidget(default_btn)
+            page_layout.addLayout(header)
+
+            sep = QFrame()
+            sep.setFixedHeight(1)
+            sep.setStyleSheet("background-color: #2a2a2a; border: none;")
+            page_layout.addWidget(sep)
+            return page, page_layout, enable_cb, default_btn
+
+        def _add_slider(page_layout, label_text, min_val, max_val, value, fmt_func, on_change):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(10)
+
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet("color: #bdbdbd; font-size: 12px;")
+            lbl.setFixedWidth(170)
+
+            slider = RainbowFrequencySlider(Qt.Horizontal)
+            slider.setRange(int(min_val), int(max_val))
+            slider.setValue(int(value))
+            slider.setCursor(Qt.PointingHandCursor)
+            slider.set_value_formatter(fmt_func)
+
+            val_lbl = QLabel(fmt_func(slider.value()))
+            val_lbl.setStyleSheet("color: #9a9a9a; font-size: 12px;")
+            val_lbl.setFixedWidth(92)
+            val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+            # sync_from_manager sırasında slider sinyalleri blocklanınca label güncel kalmıyordu.
+            # Bu yüzden label + formatter referansını slider'a iliştiriyoruz.
+            slider._fx_value_label = val_lbl
+            slider._fx_value_fmt = fmt_func
+
+            def _changed(v):
+                val_lbl.setText(fmt_func(v))
+                on_change(v)
+
+            slider.valueChanged.connect(_changed)
+
+            row_layout.addWidget(lbl)
+            row_layout.addWidget(slider, 1)
+            row_layout.addWidget(val_lbl)
+            page_layout.addWidget(row)
+            return slider, val_lbl
+
+        # Compressor page
+        comp_page, comp_layout, self.comp_enable_cb, self.comp_default_btn = _build_effect_page("Dinamik Kompresör")
+        self.comp_enable_cb.stateChanged.connect(lambda _: self._set_compressor_enabled(self.comp_enable_cb.isChecked()))
+        self.comp_default_btn.clicked.connect(self._reset_compressor_section)
+        self.comp_thr_slider, _ = _add_slider(
+            comp_layout,
+            "Eşik (Threshold)",
+            -60,
+            0,
+            int(round(getattr(self.mgr, "compressor_threshold_db", -18.0))) if self.mgr else -18,
+            lambda v: f"{v:+.0f} dB",
+            lambda v: self.mgr.set_compressor_params(threshold_db=float(v)) if self.mgr else None,
+        )
+        self.comp_ratio_slider, _ = _add_slider(
+            comp_layout,
+            "Oran (Ratio)",
+            10,
+            100,
+            int(round((getattr(self.mgr, "compressor_ratio", 2.6) if self.mgr else 2.6) * 10)),
+            lambda v: f"{v/10.0:.1f}:1",
+            lambda v: self.mgr.set_compressor_params(ratio=float(v) / 10.0) if self.mgr else None,
+        )
+        self.comp_makeup_slider, _ = _add_slider(
+            comp_layout,
+            "Makeup Gain",
+            0,
+            120,
+            int(round((getattr(self.mgr, "compressor_makeup_db", 2.5) if self.mgr else 2.5) * 10)),
+            lambda v: f"{v/10.0:+.1f} dB",
+            lambda v: self.mgr.set_compressor_params(makeup_db=float(v) / 10.0) if self.mgr else None,
+        )
+        comp_layout.addStretch()
+        self.effects_stack.addWidget(comp_page)
+
+        # Limiter page
+        lim_page, lim_layout, self.lim_enable_cb, self.lim_default_btn = _build_effect_page("Limiter")
+        self.lim_enable_cb.stateChanged.connect(lambda _: self._set_limiter_enabled(self.lim_enable_cb.isChecked()))
+        self.lim_default_btn.clicked.connect(self._reset_limiter_section)
+        self.lim_ceiling_slider, _ = _add_slider(
+            lim_layout,
+            "Ceiling",
+            80,
+            100,
+            int(round((getattr(self.mgr, "limiter_ceiling", 0.98) if self.mgr else 0.98) * 100)),
+            lambda v: f"{v/100.0:.2f}",
+            lambda v: self.mgr.set_limiter_params(ceiling=float(v) / 100.0) if self.mgr else None,
+        )
+        lim_layout.addStretch()
+        self.effects_stack.addWidget(lim_page)
+
+        # Bass Enhancer page
+        bass_page, bass_layout, self.bass_enable_cb, self.bass_default_btn = _build_effect_page("Bas Güçlendirici")
+        self.bass_enable_cb.stateChanged.connect(lambda _: self._set_bass_enhancer_enabled(self.bass_enable_cb.isChecked()))
+        self.bass_default_btn.clicked.connect(self._reset_bass_enhancer_section)
+        self.bass_mix_slider, _ = _add_slider(
+            bass_layout,
+            "Karışım (Mix)",
+            0,
+            50,
+            int(round((getattr(self.mgr, "bass_mix", 0.22) if self.mgr else 0.22) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_bass_enhancer_params(mix=float(v) / 100.0) if self.mgr else None,
+        )
+        bass_layout.addStretch()
+        self.effects_stack.addWidget(bass_page)
+
+        # Noise Gate page
+        gate_page, gate_layout, self.gate_enable_cb, self.gate_default_btn = _build_effect_page("Akıllı Noise Gate")
+        self.gate_enable_cb.stateChanged.connect(lambda _: self._set_noise_gate_enabled(self.gate_enable_cb.isChecked()))
+        self.gate_default_btn.clicked.connect(self._reset_noise_gate_section)
+        self.gate_thr_slider, _ = _add_slider(
+            gate_layout,
+            "Eşik (Threshold)",
+            -80,
+            -30,
+            int(round(getattr(self.mgr, "noise_gate_threshold_db", -55.0))) if self.mgr else -55,
+            lambda v: f"{v:+.0f} dB",
+            lambda v: self.mgr.set_noise_gate_params(threshold_db=float(v)) if self.mgr else None,
+        )
+        self.gate_floor_slider, _ = _add_slider(
+            gate_layout,
+            "Taban Ses (Floor)",
+            0,
+            20,
+            int(round((getattr(self.mgr, "noise_gate_floor_gain", 0.06) if self.mgr else 0.06) * 100)),
+            lambda v: f"{v/100.0:.2f}x",
+            lambda v: self.mgr.set_noise_gate_params(floor_gain=float(v) / 100.0) if self.mgr else None,
+        )
+        gate_layout.addStretch()
+        self.effects_stack.addWidget(gate_page)
+
+        # De-esser page
+        deess_page, deess_layout, self.deess_enable_cb, self.deess_default_btn = _build_effect_page("De-esser")
+        self.deess_enable_cb.stateChanged.connect(lambda _: self._set_deesser_enabled(self.deess_enable_cb.isChecked()))
+        self.deess_default_btn.clicked.connect(self._reset_deesser_section)
+        self.deess_thr_slider, _ = _add_slider(
+            deess_layout,
+            "Eşik (Threshold)",
+            -40,
+            0,
+            int(round(getattr(self.mgr, "deesser_threshold_db", -22.0))) if self.mgr else -22,
+            lambda v: f"{v:+.0f} dB",
+            lambda v: self.mgr.set_deesser_params(threshold_db=float(v)) if self.mgr else None,
+        )
+        self.deess_strength_slider, _ = _add_slider(
+            deess_layout,
+            "Şiddet (Strength)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "deesser_strength", 0.55) if self.mgr else 0.55) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_deesser_params(strength=float(v) / 100.0) if self.mgr else None,
+        )
+        deess_layout.addStretch()
+        self.effects_stack.addWidget(deess_page)
+
+        # Exciter page
+        exc_page, exc_layout, self.exc_enable_cb, self.exc_default_btn = _build_effect_page("Netleştirici (Exciter)")
+        self.exc_enable_cb.stateChanged.connect(lambda _: self._set_exciter_enabled(self.exc_enable_cb.isChecked()))
+        self.exc_default_btn.clicked.connect(self._reset_exciter_section)
+        self.exc_amount_slider, _ = _add_slider(
+            exc_layout,
+            "Güç (Amount)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "exciter_amount", 0.35) if self.mgr else 0.35) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_exciter_params(amount=float(v) / 100.0) if self.mgr else None,
+        )
+        self.exc_mix_slider, _ = _add_slider(
+            exc_layout,
+            "Karışım (Mix)",
+            0,
+            60,
+            int(round((getattr(self.mgr, "exciter_mix", 0.18) if self.mgr else 0.18) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_exciter_params(mix=float(v) / 100.0) if self.mgr else None,
+        )
+        exc_layout.addStretch()
+        self.effects_stack.addWidget(exc_page)
+
+        # Stereo Widener v2 page
+        wid_page, wid_layout, self.wid_enable_cb, self.wid_default_btn = _build_effect_page("Stereo Widener v2")
+        self.wid_enable_cb.stateChanged.connect(lambda _: self._set_widener_v2_enabled(self.wid_enable_cb.isChecked()))
+        self.wid_default_btn.clicked.connect(self._reset_widener_v2_section)
+        self.wid_width_slider, _ = _add_slider(
+            wid_layout,
+            "Genişlik (Width)",
+            0,
+            200,
+            int(round((getattr(self.mgr, "widener_width", 1.35) if self.mgr else 1.35) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_widener_params(width=float(v) / 100.0) if self.mgr else None,
+        )
+        self.wid_mix_slider, _ = _add_slider(
+            wid_layout,
+            "Karışım (Mix)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "widener_mix", 0.35) if self.mgr else 0.35) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_widener_params(mix=float(v) / 100.0) if self.mgr else None,
+        )
+        self.wid_mono_slider, _ = _add_slider(
+            wid_layout,
+            "Mono Uyumluluk",
+            0,
+            100,
+            int(round((getattr(self.mgr, "widener_mono_safe", 1.0) if self.mgr else 1.0) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_widener_params(mono_safe=float(v) / 100.0) if self.mgr else None,
+        )
+        wid_layout.addStretch()
+        self.effects_stack.addWidget(wid_page)
+
+        # Reverb (Oda) page
+        rev_page, rev_layout, self.rev_enable_cb, self.rev_default_btn = _build_effect_page("Reverb (Oda)")
+        self.rev_enable_cb.stateChanged.connect(lambda _: self._set_reverb_enabled(self.rev_enable_cb.isChecked()))
+        self.rev_default_btn.clicked.connect(self._reset_reverb_section)
+        self.rev_room_slider, _ = _add_slider(
+            rev_layout,
+            "Oda (Room)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "reverb_room", 0.35) if self.mgr else 0.35) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_reverb_params(room=float(v) / 100.0) if self.mgr else None,
+        )
+        self.rev_damp_slider, _ = _add_slider(
+            rev_layout,
+            "Sönüm (Damping)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "reverb_damping", 0.35) if self.mgr else 0.35) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_reverb_params(damping=float(v) / 100.0) if self.mgr else None,
+        )
+        self.rev_tone_slider, _ = _add_slider(
+            rev_layout,
+            "Tone / High-cut",
+            0,
+            100,
+            int(round((getattr(self.mgr, "reverb_tone", 0.50) if self.mgr else 0.50) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_reverb_params(tone=float(v) / 100.0) if self.mgr else None,
+        )
+        self.rev_mix_slider, _ = _add_slider(
+            rev_layout,
+            "Karışım (Mix)",
+            0,
+            60,
+            int(round((getattr(self.mgr, "reverb_mix", 0.18) if self.mgr else 0.18) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_reverb_params(mix=float(v) / 100.0) if self.mgr else None,
+        )
+        self.rev_pre_slider, _ = _add_slider(
+            rev_layout,
+            "Pre-delay",
+            0,
+            60,
+            int(round(getattr(self.mgr, "reverb_predelay_ms", 15.0))) if self.mgr else 15,
+            lambda v: f"{v:.0f} ms",
+            lambda v: self.mgr.set_reverb_params(predelay_ms=float(v)) if self.mgr else None,
+        )
+        rev_layout.addStretch()
+        self.effects_stack.addWidget(rev_page)
+
+        # Echo (Yankı) page
+        echo_page, echo_layout, self.echo_enable_cb, self.echo_default_btn = _build_effect_page("Echo (Yankı)")
+        self.echo_enable_cb.stateChanged.connect(lambda _: self._set_echo_enabled(self.echo_enable_cb.isChecked()))
+        self.echo_default_btn.clicked.connect(self._reset_echo_section)
+        self.echo_pingpong_cb = QCheckBox("Ping-Pong (L↔R)")
+        self.echo_pingpong_cb.setCursor(Qt.PointingHandCursor)
+        self.echo_pingpong_cb.setStyleSheet("QCheckBox { color: #bdbdbd; font-size: 9px; }")
+        self.echo_pingpong_cb.stateChanged.connect(lambda _: self.mgr.set_echo_params(pingpong=self.echo_pingpong_cb.isChecked()) if self.mgr else None)
+        echo_layout.addWidget(self.echo_pingpong_cb)
+
+        self.echo_duck_cb = QCheckBox("Duck (Vokal Koruma)")
+        self.echo_duck_cb.setCursor(Qt.PointingHandCursor)
+        self.echo_duck_cb.setStyleSheet("QCheckBox { color: #bdbdbd; font-size: 9px; }")
+        self.echo_duck_cb.stateChanged.connect(lambda _: self.mgr.set_echo_params(duck_enabled=self.echo_duck_cb.isChecked()) if self.mgr else None)
+        echo_layout.addWidget(self.echo_duck_cb)
+        self.echo_delay_slider, _ = _add_slider(
+            echo_layout,
+            "Gecikme (Delay)",
+            20,
+            1200,
+            int(round(getattr(self.mgr, "echo_delay_ms", 240.0))) if self.mgr else 240,
+            lambda v: f"{v:.0f} ms",
+            lambda v: self.mgr.set_echo_params(delay_ms=float(v)) if self.mgr else None,
+        )
+        self.echo_feedback_slider, _ = _add_slider(
+            echo_layout,
+            "Geri Besleme (Feedback)",
+            0,
+            95,
+            int(round((getattr(self.mgr, "echo_feedback", 0.35) if self.mgr else 0.35) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_echo_params(feedback=float(v) / 100.0) if self.mgr else None,
+        )
+        self.echo_mix_slider, _ = _add_slider(
+            echo_layout,
+            "Karışım (Mix)",
+            0,
+            60,
+            int(round((getattr(self.mgr, "echo_mix", 0.22) if self.mgr else 0.22) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_echo_params(mix=float(v) / 100.0) if self.mgr else None,
+        )
+
+        self.echo_duck_thr_slider, _ = _add_slider(
+            echo_layout,
+            "Duck Eşik (Threshold)",
+            -60,
+            0,
+            int(round(getattr(self.mgr, "echo_duck_threshold_db", -28.0))) if self.mgr else -28,
+            lambda v: f"{v:+.0f} dB",
+            lambda v: self.mgr.set_echo_params(duck_threshold_db=float(v)) if self.mgr else None,
+        )
+        self.echo_duck_amt_slider, _ = _add_slider(
+            echo_layout,
+            "Duck Miktar (Amount)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "echo_duck_amount", 0.70) if self.mgr else 0.70) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_echo_params(duck_amount=float(v) / 100.0) if self.mgr else None,
+        )
+        self.echo_tone_slider, _ = _add_slider(
+            echo_layout,
+            "Tone / High-cut",
+            0,
+            100,
+            int(round((getattr(self.mgr, "echo_tone", 0.60) if self.mgr else 0.60) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.set_echo_params(tone=float(v) / 100.0) if self.mgr else None,
+        )
+        echo_layout.addStretch()
+        self.effects_stack.addWidget(echo_page)
+
+        # ----------------------------------------------------------
+        # Advanced effects (requested)
+        # ----------------------------------------------------------
+        # IR Convolution Reverb
+        ir_page, ir_layout, self.ir_enable_cb, self.ir_default_btn = _build_effect_page("Konvolüsyon Reverb (IR)")
+        self.ir_enable_cb.stateChanged.connect(lambda _: self.mgr.set_ir_reverb_enabled(self.ir_enable_cb.isChecked()) if self.mgr else None)
+        self.ir_default_btn.clicked.connect(lambda: self._reset_ir_reverb_section())
+
+        ir_path_row = QWidget()
+        ir_path_layout = QHBoxLayout(ir_path_row)
+        ir_path_layout.setContentsMargins(0, 0, 0, 0)
+        ir_path_layout.setSpacing(10)
+        ir_lbl = QLabel("IR Dosyası (.wav)")
+        ir_lbl.setStyleSheet("color: #bdbdbd; font-size: 12px;")
+        ir_lbl.setFixedWidth(170)
+        self.ir_path_edit = QLineEdit()
+        self.ir_path_edit.setPlaceholderText("Bir impulse response (.wav) seçin")
+        self.ir_path_edit.setStyleSheet("QLineEdit { background: #1f1f1f; border: 1px solid #333; border-radius: 4px; padding: 6px 8px; color: #d6d6d6; }")
+        ir_browse = QPushButton("Seç")
+        ir_browse.setCursor(Qt.PointingHandCursor)
+        ir_browse.setStyleSheet(
+            "QPushButton { background-color: #2b2b2b; color: #bbb; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 12px; font-size: 12px; }"
+            "QPushButton:hover { background-color: #3a3a3a; color: #fff; }"
+        )
+
+        def _pick_ir():
+            try:
+                path, _ = QFileDialog.getOpenFileName(self, "IR Dosyası Seç", "", "WAV Dosyaları (*.wav)")
+                if path:
+                    self.ir_path_edit.setText(path)
+                    if self.mgr:
+                        self.mgr.set_ir_reverb_path(path)
+            except Exception:
+                pass
+
+        ir_browse.clicked.connect(_pick_ir)
+        self.ir_path_edit.editingFinished.connect(lambda: self.mgr.set_ir_reverb_path(self.ir_path_edit.text()) if self.mgr else None)
+        ir_path_layout.addWidget(ir_lbl)
+        ir_path_layout.addWidget(self.ir_path_edit, 1)
+        ir_path_layout.addWidget(ir_browse)
+        ir_layout.addWidget(ir_path_row)
+
+        self.ir_mix_slider, _ = _add_slider(
+            ir_layout,
+            "Karışım (Mix)",
+            0,
+            60,
+            int(round((getattr(self.mgr, "ir_reverb_mix", 0.18) if self.mgr else 0.18) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.update_ir_reverb(mix=float(v) / 100.0) if self.mgr else None,
+        )
+        self.ir_pre_slider, _ = _add_slider(
+            ir_layout,
+            "Pre-delay",
+            0,
+            250,
+            int(round(getattr(self.mgr, "ir_reverb_predelay_ms", 0.0))) if self.mgr else 0,
+            lambda v: f"{v:.0f} ms",
+            lambda v: self.mgr.update_ir_reverb(predelay_ms=float(v)) if self.mgr else None,
+        )
+        ir_layout.addStretch()
+        self.effects_stack.addWidget(ir_page)
+
+        # Parametric EQ (PEQ)
+        peq_page, peq_layout, self.peq_enable_cb, self.peq_default_btn = _build_effect_page("Parametrik EQ (PEQ)")
+        self.peq_enable_cb.stateChanged.connect(lambda _: self.mgr.set_peq_enabled(self.peq_enable_cb.isChecked()) if self.mgr else None)
+        self.peq_default_btn.clicked.connect(lambda: self._reset_peq_section())
+
+        peq_scroll = QScrollArea()
+        peq_scroll.setWidgetResizable(True)
+        peq_scroll.setFrameShape(QFrame.NoFrame)
+        peq_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        peq_inner = QWidget()
+        peq_inner_layout = QVBoxLayout(peq_inner)
+        peq_inner_layout.setContentsMargins(0, 0, 0, 0)
+        peq_inner_layout.setSpacing(12)
+
+        self.peq_freq_sliders = []
+        self.peq_q_sliders = []
+        self.peq_gain_sliders = []
+
+        peq_bands = int(getattr(self.mgr, "PEQ_BANDS", 8)) if self.mgr else 8
+        for i in range(peq_bands):
+            band_title = QLabel(f"Band {i+1}")
+            band_title.setStyleSheet("color: #cfcfcf; font-size: 12px; font-weight: 600; margin-top: 4px;")
+            peq_inner_layout.addWidget(band_title)
+
+            s_f, _ = _add_slider(
+                peq_inner_layout,
+                "Frekans",
+                20,
+                20000,
+                int(round((self.mgr.peq_freqs_hz[i] if (self.mgr and hasattr(self.mgr, "peq_freqs_hz") and i < len(self.mgr.peq_freqs_hz)) else 100.0))),
+                lambda v: f"{v:.0f} Hz",
+                lambda v, idx=i: self.mgr.update_peq_band(idx, freq_hz=float(v)) if self.mgr else None,
+            )
+            s_q, _ = _add_slider(
+                peq_inner_layout,
+                "Q",
+                2,
+                120,
+                int(round(((self.mgr.peq_qs[i] if (self.mgr and hasattr(self.mgr, "peq_qs") and i < len(self.mgr.peq_qs)) else 1.0)) * 10)),
+                lambda v: f"{v/10.0:.2f}",
+                lambda v, idx=i: self.mgr.update_peq_band(idx, q=float(v) / 10.0) if self.mgr else None,
+            )
+            s_g, _ = _add_slider(
+                peq_inner_layout,
+                "Gain",
+                -180,
+                180,
+                int(round(((self.mgr.peq_gains_db[i] if (self.mgr and hasattr(self.mgr, "peq_gains_db") and i < len(self.mgr.peq_gains_db)) else 0.0)) * 10)),
+                lambda v: f"{v/10.0:+.1f} dB",
+                lambda v, idx=i: self.mgr.update_peq_band(idx, gain_db=float(v) / 10.0) if self.mgr else None,
+            )
+            self.peq_freq_sliders.append(s_f)
+            self.peq_q_sliders.append(s_q)
+            self.peq_gain_sliders.append(s_g)
+
+            sep2 = QFrame()
+            sep2.setFixedHeight(1)
+            sep2.setStyleSheet("background-color: #2a2a2a; border: none;")
+            peq_inner_layout.addWidget(sep2)
+
+        peq_inner_layout.addStretch(1)
+        peq_scroll.setWidget(peq_inner)
+        peq_layout.addWidget(peq_scroll, 1)
+        self.effects_stack.addWidget(peq_page)
+
+        # Auto Gain / Loudness normalization
+        ag_page, ag_layout, self.ag_enable_cb, self.ag_default_btn = _build_effect_page("Auto Gain / Normalize")
+        self.ag_enable_cb.stateChanged.connect(lambda _: self.mgr.set_autogain_enabled(self.ag_enable_cb.isChecked()) if self.mgr else None)
+        self.ag_default_btn.clicked.connect(lambda: self._reset_autogain_section())
+        self.ag_target_slider, _ = _add_slider(
+            ag_layout,
+            "Hedef (Target)",
+            -40,
+            -6,
+            int(round(getattr(self.mgr, "autogain_target_dbfs", -18.0))) if self.mgr else -18,
+            lambda v: f"{v:+.0f} dBFS",
+            lambda v: self.mgr.update_autogain(target_dbfs=float(v)) if self.mgr else None,
+        )
+        self.ag_boost_slider, _ = _add_slider(
+            ag_layout,
+            "Max Boost",
+            0,
+            24,
+            int(round(getattr(self.mgr, "autogain_max_boost_db", 12.0))) if self.mgr else 12,
+            lambda v: f"{v:.0f} dB",
+            lambda v: self.mgr.update_autogain(max_boost_db=float(v)) if self.mgr else None,
+        )
+        self.ag_cut_slider, _ = _add_slider(
+            ag_layout,
+            "Max Cut",
+            0,
+            36,
+            int(round(getattr(self.mgr, "autogain_max_cut_db", 18.0))) if self.mgr else 18,
+            lambda v: f"{v:.0f} dB",
+            lambda v: self.mgr.update_autogain(max_cut_db=float(v)) if self.mgr else None,
+        )
+        ag_layout.addStretch()
+        self.effects_stack.addWidget(ag_page)
+
+        # True Peak limiter + metering
+        tp_page, tp_layout, self.tp_enable_cb, self.tp_default_btn = _build_effect_page("True Peak Limiter + Meter")
+        self.tp_enable_cb.stateChanged.connect(lambda _: self.mgr.set_true_peak_limiter_enabled(self.tp_enable_cb.isChecked()) if self.mgr else None)
+        self.tp_default_btn.clicked.connect(lambda: self._reset_true_peak_section())
+        self.tp_ceiling_slider, _ = _add_slider(
+            tp_layout,
+            "Ceiling (dBTP)",
+            -6,
+            0,
+            int(round(getattr(self.mgr, "true_peak_ceiling_db", -1.0))) if self.mgr else -1,
+            lambda v: f"{v:+.0f} dB",
+            lambda v: self.mgr.update_true_peak_limiter(ceiling_db=float(v)) if self.mgr else None,
+        )
+        self.tp_release_slider, _ = _add_slider(
+            tp_layout,
+            "Release",
+            10,
+            1000,
+            int(round(getattr(self.mgr, "true_peak_release_ms", 120.0))) if self.mgr else 120,
+            lambda v: f"{v:.0f} ms",
+            lambda v: self.mgr.update_true_peak_limiter(release_ms=float(v)) if self.mgr else None,
+        )
+
+        meter_box = QFrame()
+        meter_box.setStyleSheet("QFrame { background: #1f1f1f; border: 1px solid #2a2a2a; border-radius: 6px; }")
+        meter_l = QVBoxLayout(meter_box)
+        meter_l.setContentsMargins(10, 10, 10, 10)
+        meter_l.setSpacing(6)
+        m_title = QLabel("Metering")
+        m_title.setStyleSheet("color: #cfcfcf; font-size: 12px; font-weight: 600;")
+        self.tp_rms_lbl = QLabel("RMS: -- dBFS")
+        self.tp_peak_lbl = QLabel("Peak: -- dBFS")
+        self.tp_tp_lbl = QLabel("True Peak: -- dBTP")
+        for w in (self.tp_rms_lbl, self.tp_peak_lbl, self.tp_tp_lbl):
+            w.setStyleSheet("color: #9a9a9a; font-size: 12px;")
+        meter_l.addWidget(m_title)
+        meter_l.addWidget(self.tp_rms_lbl)
+        meter_l.addWidget(self.tp_peak_lbl)
+        meter_l.addWidget(self.tp_tp_lbl)
+        tp_layout.addWidget(meter_box)
+        tp_layout.addStretch()
+        self.effects_stack.addWidget(tp_page)
+
+        # Crossfeed
+        x_page, x_layout, self.xf_enable_cb, self.xf_default_btn = _build_effect_page("Crossfeed (Kulaklık)")
+        self.xf_enable_cb.stateChanged.connect(lambda _: self.mgr.set_crossfeed_enabled(self.xf_enable_cb.isChecked()) if self.mgr else None)
+        self.xf_default_btn.clicked.connect(lambda: self._reset_crossfeed_section())
+        self.xf_amount_slider, _ = _add_slider(
+            x_layout,
+            "Miktar (Amount)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "crossfeed_amount", 0.35) if self.mgr else 0.35) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.update_crossfeed(amount=float(v) / 100.0) if self.mgr else None,
+        )
+        self.xf_cutoff_slider, _ = _add_slider(
+            x_layout,
+            "Cutoff",
+            150,
+            2000,
+            int(round(getattr(self.mgr, "crossfeed_cutoff_hz", 700.0))) if self.mgr else 700,
+            lambda v: f"{v:.0f} Hz",
+            lambda v: self.mgr.update_crossfeed(cutoff_hz=float(v)) if self.mgr else None,
+        )
+        x_layout.addStretch()
+        self.effects_stack.addWidget(x_page)
+
+        # Bass Mono
+        bm_page, bm_layout, self.bm_enable_cb, self.bm_default_btn = _build_effect_page("Bass Mono / Sub Mono")
+        self.bm_enable_cb.stateChanged.connect(lambda _: self.mgr.set_bass_mono_enabled(self.bm_enable_cb.isChecked()) if self.mgr else None)
+        self.bm_default_btn.clicked.connect(lambda: self._reset_bass_mono_section())
+        self.bm_cutoff_slider, _ = _add_slider(
+            bm_layout,
+            "Cutoff",
+            50,
+            200,
+            int(round(getattr(self.mgr, "bass_mono_cutoff_hz", 120.0))) if self.mgr else 120,
+            lambda v: f"{v:.0f} Hz",
+            lambda v: self.mgr.update_bass_mono(cutoff_hz=float(v)) if self.mgr else None,
+        )
+        self.bm_amount_slider, _ = _add_slider(
+            bm_layout,
+            "Miktar (Amount)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "bass_mono_amount", 1.0) if self.mgr else 1.0) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.update_bass_mono(amount=float(v) / 100.0) if self.mgr else None,
+        )
+        bm_layout.addStretch()
+        self.effects_stack.addWidget(bm_page)
+
+        # Dynamic EQ
+        dq_page, dq_layout, self.dq_enable_cb, self.dq_default_btn = _build_effect_page("Dynamic EQ")
+        self.dq_enable_cb.stateChanged.connect(lambda _: self.mgr.set_dynamic_eq_enabled(self.dq_enable_cb.isChecked()) if self.mgr else None)
+        self.dq_default_btn.clicked.connect(lambda: self._reset_dynamic_eq_section())
+
+        dq_scroll = QScrollArea()
+        dq_scroll.setWidgetResizable(True)
+        dq_scroll.setFrameShape(QFrame.NoFrame)
+        dq_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        dq_inner = QWidget()
+        dq_inner_layout = QVBoxLayout(dq_inner)
+        dq_inner_layout.setContentsMargins(0, 0, 0, 0)
+        dq_inner_layout.setSpacing(12)
+
+        self.dq_freq_sliders = []
+        self.dq_q_sliders = []
+        self.dq_thr_sliders = []
+        self.dq_ratio_sliders = []
+        self.dq_range_sliders = []
+
+        dq_bands = int(getattr(self.mgr, "DYN_EQ_BANDS", 2)) if self.mgr else 2
+        for i in range(dq_bands):
+            band_title = QLabel(f"Band {i+1}")
+            band_title.setStyleSheet("color: #cfcfcf; font-size: 12px; font-weight: 600; margin-top: 4px;")
+            dq_inner_layout.addWidget(band_title)
+
+            s_f, _ = _add_slider(
+                dq_inner_layout,
+                "Frekans",
+                40,
+                14000,
+                int(round((self.mgr.dynamic_eq_freqs_hz[i] if (self.mgr and hasattr(self.mgr, "dynamic_eq_freqs_hz") and i < len(self.mgr.dynamic_eq_freqs_hz)) else 6000.0))),
+                lambda v: f"{v:.0f} Hz",
+                lambda v, idx=i: self.mgr.update_dynamic_eq_band(idx, freq_hz=float(v)) if self.mgr else None,
+            )
+            s_q, _ = _add_slider(
+                dq_inner_layout,
+                "Q",
+                2,
+                120,
+                int(round(((self.mgr.dynamic_eq_qs[i] if (self.mgr and hasattr(self.mgr, "dynamic_eq_qs") and i < len(self.mgr.dynamic_eq_qs)) else 2.5)) * 10)),
+                lambda v: f"{v/10.0:.2f}",
+                lambda v, idx=i: self.mgr.update_dynamic_eq_band(idx, q=float(v) / 10.0) if self.mgr else None,
+            )
+            s_t, _ = _add_slider(
+                dq_inner_layout,
+                "Eşik (Threshold)",
+                -60,
+                -6,
+                int(round((self.mgr.dynamic_eq_threshold_db[i] if (self.mgr and hasattr(self.mgr, "dynamic_eq_threshold_db") and i < len(self.mgr.dynamic_eq_threshold_db)) else -22.0))),
+                lambda v: f"{v:+.0f} dB",
+                lambda v, idx=i: self.mgr.update_dynamic_eq_band(idx, threshold_db=float(v)) if self.mgr else None,
+            )
+            s_r, _ = _add_slider(
+                dq_inner_layout,
+                "Oran (Ratio)",
+                10,
+                120,
+                int(round(((self.mgr.dynamic_eq_ratio[i] if (self.mgr and hasattr(self.mgr, "dynamic_eq_ratio") and i < len(self.mgr.dynamic_eq_ratio)) else 2.5)) * 10)),
+                lambda v: f"{v/10.0:.1f}:1",
+                lambda v, idx=i: self.mgr.update_dynamic_eq_band(idx, ratio=float(v) / 10.0) if self.mgr else None,
+            )
+            s_rg, _ = _add_slider(
+                dq_inner_layout,
+                "Maks. Kesme (Range)",
+                0,
+                240,
+                int(round(((self.mgr.dynamic_eq_range_db[i] if (self.mgr and hasattr(self.mgr, "dynamic_eq_range_db") and i < len(self.mgr.dynamic_eq_range_db)) else 10.0)) * 10)),
+                lambda v: f"{v/10.0:.1f} dB",
+                lambda v, idx=i: self.mgr.update_dynamic_eq_band(idx, range_db=float(v) / 10.0) if self.mgr else None,
+            )
+
+            self.dq_freq_sliders.append(s_f)
+            self.dq_q_sliders.append(s_q)
+            self.dq_thr_sliders.append(s_t)
+            self.dq_ratio_sliders.append(s_r)
+            self.dq_range_sliders.append(s_rg)
+
+            sep3 = QFrame()
+            sep3.setFixedHeight(1)
+            sep3.setStyleSheet("background-color: #2a2a2a; border: none;")
+            dq_inner_layout.addWidget(sep3)
+
+        dq_inner_layout.addStretch(1)
+        dq_scroll.setWidget(dq_inner)
+        dq_layout.addWidget(dq_scroll, 1)
+        self.effects_stack.addWidget(dq_page)
+
+        # Saturation / Tape
+        sat_page, sat_layout, self.sat_enable_cb, self.sat_default_btn = _build_effect_page("Tape / Saturation")
+        self.sat_enable_cb.stateChanged.connect(lambda _: self.mgr.set_saturation_enabled(self.sat_enable_cb.isChecked()) if self.mgr else None)
+        self.sat_default_btn.clicked.connect(lambda: self._reset_saturation_section())
+        self.sat_drive_slider, _ = _add_slider(
+            sat_layout,
+            "Drive",
+            0,
+            24,
+            int(round(getattr(self.mgr, "saturation_drive_db", 6.0))) if self.mgr else 6,
+            lambda v: f"{v:.0f} dB",
+            lambda v: self.mgr.update_saturation(drive_db=float(v)) if self.mgr else None,
+        )
+        self.sat_mix_slider, _ = _add_slider(
+            sat_layout,
+            "Karışım (Mix)",
+            0,
+            100,
+            int(round((getattr(self.mgr, "saturation_mix", 0.25) if self.mgr else 0.25) * 100)),
+            lambda v: f"{v:.0f}%",
+            lambda v: self.mgr.update_saturation(mix=float(v) / 100.0) if self.mgr else None,
+        )
+        sat_layout.addStretch()
+        self.effects_stack.addWidget(sat_page)
+
+        # Bit-depth / Dither
+        bd_page, bd_layout, self.bd_enable_cb, self.bd_default_btn = _build_effect_page("Bit-depth / Dither")
+        self.bd_enable_cb.stateChanged.connect(lambda _: self.mgr.set_bitdepth_enabled(self.bd_enable_cb.isChecked()) if self.mgr else None)
+        self.bd_default_btn.clicked.connect(lambda: self._reset_bitdepth_section())
+        self.bd_bits_slider, _ = _add_slider(
+            bd_layout,
+            "Bit-depth",
+            6,
+            24,
+            int(round(getattr(self.mgr, "bitdepth_bits", 16))) if self.mgr else 16,
+            lambda v: f"{v:d} bit",
+            lambda v: self.mgr.update_bitdepth(bits=int(v)) if self.mgr else None,
+        )
+        self.bd_dither_cb = QCheckBox("Dither (TPDF)")
+        self.bd_dither_cb.setCursor(Qt.PointingHandCursor)
+        self.bd_dither_cb.setStyleSheet("QCheckBox { color: #bdbdbd; font-size: 11px; }")
+        self.bd_dither_cb.stateChanged.connect(lambda _: self.mgr.update_bitdepth(dither_enabled=self.bd_dither_cb.isChecked()) if self.mgr else None)
+        bd_layout.addWidget(self.bd_dither_cb)
+        bd_layout.addStretch()
+        self.effects_stack.addWidget(bd_page)
         
         # Load saved settings
         self.load_settings()
+
+    def _on_meters_ready(self, rms_dbfs: float, peak_dbfs: float, true_peak_dbfs: float):
+        try:
+            if hasattr(self, "tp_rms_lbl") and self.tp_rms_lbl is not None:
+                self.tp_rms_lbl.setText(f"RMS: {rms_dbfs:+.1f} dBFS")
+            if hasattr(self, "tp_peak_lbl") and self.tp_peak_lbl is not None:
+                self.tp_peak_lbl.setText(f"Peak: {peak_dbfs:+.1f} dBFS")
+            if hasattr(self, "tp_tp_lbl") and self.tp_tp_lbl is not None:
+                self.tp_tp_lbl.setText(f"True Peak: {true_peak_dbfs:+.1f} dBTP")
+        except Exception:
+            pass
+
+    def _build_eq_presets_32(self):
+        """32 bant EQ için yüzlerce hazır ayar üretir (harici bir preset listesini kopyalamaz)."""
+        freqs = list(EQ_BAND_FREQS)
+
+        def _clip(v):
+            return max(-15.0, min(15.0, float(v)))
+
+        def _bell(freq_hz, center_hz, width_oct, gain_db):
+            x = math.log2(max(1e-9, freq_hz) / max(1e-9, center_hz))
+            return float(gain_db) * math.exp(-0.5 * (x / max(1e-6, float(width_oct))) ** 2)
+
+        def _low_shelf(freq_hz, fc_hz, slope, gain_db):
+            x = math.log2(max(1e-9, freq_hz) / max(1e-9, fc_hz))
+            t = 1.0 / (1.0 + math.exp(x / max(1e-6, float(slope))))
+            return float(gain_db) * t
+
+        def _high_shelf(freq_hz, fc_hz, slope, gain_db):
+            x = math.log2(max(1e-9, freq_hz) / max(1e-9, fc_hz))
+            t = 1.0 / (1.0 + math.exp(-x / max(1e-6, float(slope))))
+            return float(gain_db) * t
+
+        def _curve(fn):
+            return [_clip(fn(f)) for f in freqs]
+
+        presets = []
+        presets.append(("Düz (Flat)", [0.0] * 32))
+        presets.append(("Gece (Yumuşak)", _curve(lambda f: _low_shelf(f, 160, 0.7, -2.5) + _high_shelf(f, 6500, 0.7, -2.0))))
+        presets.append(("Loudness (Hafif)", _curve(lambda f: _low_shelf(f, 140, 0.6, 4.0) + _high_shelf(f, 6500, 0.8, 2.5))))
+
+        # Aileler: 20 seviye * 6 şablon = 120
+        for level in range(1, 21):
+            a = level / 20.0
+            bass = 2.0 + 10.0 * a
+            treble = 1.0 + 6.0 * a
+            midcut = 1.0 + 6.0 * a
+
+            presets.append((f"Bas Boost {level}", _curve(lambda f, b=bass: _low_shelf(f, 120, 0.55, b) - 0.18 * b * _high_shelf(f, 9000, 0.8, 1.0))))
+            presets.append((f"Tiz Boost {level}", _curve(lambda f, t=treble: _high_shelf(f, 6500, 0.6, t) - 0.12 * t * _low_shelf(f, 90, 0.7, 1.0))))
+            presets.append((f"V-Shape {level}", _curve(lambda f, b=bass, t=treble, m=midcut: _low_shelf(f, 120, 0.55, 0.9*b) + _high_shelf(f, 7500, 0.65, 0.9*t) - _bell(f, 1200, 1.2, 0.7*m))))
+            presets.append((f"Mid Scoop {level}", _curve(lambda f, m=midcut, a=a: -_bell(f, 1000, 1.0, 1.1*m) + _low_shelf(f, 140, 0.65, 1.5 + 2.5*a) + _high_shelf(f, 8500, 0.8, 1.0 + 2.0*a))))
+            presets.append((f"Vokal Netliği {level}", _curve(lambda f, a=a: -_bell(f, 250, 0.8, 2.0 + 4.0*a) + _bell(f, 3000, 0.9, 2.5 + 7.0*a) + _high_shelf(f, 11000, 0.9, 0.8 + 2.0*a))))
+            presets.append((f"Podcast / Konuşma {level}", _curve(lambda f, a=a: -_low_shelf(f, 140, 0.6, 3.0 + 7.0*a) + _bell(f, 1800, 1.0, 2.5 + 5.0*a) - _high_shelf(f, 9500, 0.8, 1.0 + 2.5*a))))
+
+        # Tür benzeri (tamamen jenerik): 7 tür * 12 varyasyon = 84
+        genres = [
+            ("Rock", 7.5, 4.5, 4.0, 1200),
+            ("Pop", 6.0, 3.5, 3.0, 900),
+            ("Elektronik", 9.0, 6.0, 5.5, 1400),
+            ("Hip-Hop", 10.0, 2.5, 3.0, 1100),
+            ("Caz", 2.5, 3.0, 2.0, 800),
+            ("Klasik", 1.5, 4.0, 1.5, 700),
+            ("Akustik", 2.0, 3.5, 1.5, 600),
+        ]
+        for name, bass, treble, midcut, midhz in genres:
+            for v in range(1, 13):
+                k = v / 12.0
+                presets.append(
+                    (f"{name} {v}", _curve(lambda f, b=bass, t=treble, m=midcut, mh=midhz, k=k: _low_shelf(f, 110, 0.6, b*k) + _high_shelf(f, 8000, 0.7, t*k) - _bell(f, mh, 1.1, m*k)))
+                )
+
+        # Toplam ~207+ (başlıklar + aileler + türler)
+        seen = set()
+        unique = []
+        for n, g in presets:
+            if n in seen:
+                continue
+            if not isinstance(g, list) or len(g) != 32:
+                continue
+            seen.add(n)
+            unique.append((n, [float(x) for x in g]))
+        return unique
+
+    def _populate_eq_preset_list(self, text: str):
+        try:
+            if not hasattr(self, "eq_preset_list") or self.eq_preset_list is None:
+                return
+
+            q = (text or "").strip().lower()
+            self._eq_preset_populate_gen = int(getattr(self, "_eq_preset_populate_gen", 0)) + 1
+            gen = int(self._eq_preset_populate_gen)
+
+            # Hızlı filtre (çizim yok)
+            src = list(getattr(self, "_eq_presets_all", []) or [])
+            if q:
+                pending = [(n, g) for (n, g) in src if q in str(n).lower()]
+            else:
+                pending = src
+
+            self._eq_preset_pending_items = pending
+            self._eq_preset_pending_index = 0
+
+            try:
+                self.eq_preset_list.blockSignals(True)
+            except Exception:
+                pass
+            self.eq_preset_list.clear()
+
+            QTimer.singleShot(0, lambda gen=gen: self._populate_eq_preset_list_chunk(gen))
+        except Exception:
+            try:
+                self.eq_preset_list.blockSignals(False)
+            except Exception:
+                pass
+
+    def _populate_eq_preset_list_chunk(self, gen: int):
+        try:
+            if int(gen) != int(getattr(self, "_eq_preset_populate_gen", 0)):
+                return
+            if not hasattr(self, "eq_preset_list") or self.eq_preset_list is None:
+                return
+
+            pending = list(getattr(self, "_eq_preset_pending_items", []) or [])
+            idx = int(getattr(self, "_eq_preset_pending_index", 0))
+            if idx >= len(pending):
+                try:
+                    self.eq_preset_list.blockSignals(False)
+                except Exception:
+                    pass
+                return
+
+            selected_name = str(getattr(self, "_eq_selected_preset_name", ""))
+            chunk = int(getattr(self, "_eq_preset_chunk", 28))
+            if chunk <= 0:
+                chunk = 28
+            end = min(idx + chunk, len(pending))
+
+            for i in range(idx, end):
+                name, _g = pending[i]
+                name = str(name)
+                is_sel = (name == selected_name)
+                shown = ("✓ " + name) if is_sel else ("  " + name)
+                it = QListWidgetItem(shown)
+                it.setData(Qt.UserRole, name)
+                try:
+                    it.setSizeHint(QSize(0, 96))
+                except Exception:
+                    pass
+                try:
+                    icon = self._make_eq_preset_icon(_g, selected=is_sel)
+                    if icon is not None:
+                        it.setIcon(icon)
+                except Exception:
+                    pass
+                self.eq_preset_list.addItem(it)
+
+            self._eq_preset_pending_index = end
+
+            if end < len(pending):
+                QTimer.singleShot(0, lambda gen=gen: self._populate_eq_preset_list_chunk(gen))
+            else:
+                try:
+                    self.eq_preset_list.blockSignals(False)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                self.eq_preset_list.blockSignals(False)
+            except Exception:
+                pass
+
+    def _make_eq_preset_icon(self, gains_db: list, selected: bool = False):
+        """Preset eğrisini küçük bir ikon olarak çizer (32 band)."""
+        p = None
+        try:
+            if gains_db is None or len(gains_db) != 32:
+                return None
+
+            # Cache: yüzlerce preset için QPainter çizimi pahalı (ses drop-out yapabilir).
+            try:
+                cache = getattr(self, "_eq_preset_icon_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._eq_preset_icon_cache = cache
+                key = (bool(selected), tuple(int(round(float(v) * 10.0)) for v in gains_db))
+                hit = cache.get(key)
+                if hit is not None:
+                    return hit
+            except Exception:
+                cache = None
+                key = None
+
+            w, h = 132, 78
+            pm = QPixmap(w, h)
+            pm.fill(Qt.transparent)
+
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing, True)
+
+            def rainbow_color(t: float, alpha: int = 255, sat: int = 255, val: int = 255) -> QColor:
+                t = max(0.0, min(1.0, float(t)))
+                hue = int(round(300.0 * t))  # 0=Kırmızı (bass) → 300=Mor/Magenta (tiz)
+                c = QColor.fromHsv(hue, int(sat), int(val))
+                c.setAlpha(int(alpha))
+                return c
+
+            left = 10.0
+            right = w - 10.0
+            top = 10.0
+            bottom = h - 10.0
+            span_y = bottom - top
+
+            def y_from_db(db: float) -> float:
+                db = max(-15.0, min(15.0, float(db)))
+                norm = (db + 15.0) / 30.0  # 0..1
+                return bottom - (norm * span_y)
+
+            base_y = y_from_db(0.0)
+            base_color = QColor(245, 245, 245, 120 if selected else 90)
+            base_pen = QPen(base_color, 2)
+            base_pen.setCapStyle(Qt.RoundCap)
+            p.setPen(base_pen)
+            p.drawLine(QPointF(left, base_y), QPointF(right, base_y))
+
+            pts = []
+            for i, db in enumerate(gains_db):
+                x = left + (right - left) * (i / 31.0)
+                y = y_from_db(db)
+                pts.append(QPointF(x, y))
+            if len(pts) < 2:
+                return None
+
+            # Dolgu: referans çizgisi ile eğri arası (boost/cut için ayrı yoğunluk)
+            p.save()
+            try:
+                p.setPen(Qt.NoPen)
+
+                def fill_segment(x0: float, y0: float, x1: float, y1: float, t_mid: float, side: str):
+                    if side == "up":
+                        mag = max(0.0, min(1.0, (base_y - (y0 + y1) * 0.5) / max(1e-6, span_y)))
+                        a = int(60 + 175 * mag)
+                        col = rainbow_color(t_mid, alpha=a, sat=245, val=255)
+                    else:
+                        mag = max(0.0, min(1.0, (((y0 + y1) * 0.5) - base_y) / max(1e-6, span_y)))
+                        a = int(50 + 145 * mag)
+                        col = rainbow_color(t_mid, alpha=a, sat=220, val=235)
+
+                    poly = QPolygonF([
+                        QPointF(x0, base_y),
+                        QPointF(x0, y0),
+                        QPointF(x1, y1),
+                        QPointF(x1, base_y),
+                    ])
+                    p.setBrush(QBrush(col))
+                    p.drawPolygon(poly)
+
+                for i in range(31):
+                    x0, y0 = pts[i].x(), pts[i].y()
+                    x1, y1 = pts[i + 1].x(), pts[i + 1].y()
+                    t_mid = (i + 0.5) / 31.0
+
+                    dy0 = y0 - base_y
+                    dy1 = y1 - base_y
+                    if dy0 <= 0 and dy1 <= 0:
+                        fill_segment(x0, y0, x1, y1, t_mid, "up")
+                    elif dy0 >= 0 and dy1 >= 0:
+                        fill_segment(x0, y0, x1, y1, t_mid, "down")
+                    else:
+                        denom = (y1 - y0)
+                        if abs(denom) < 1e-6:
+                            side = "up" if ((y0 + y1) * 0.5) < base_y else "down"
+                            fill_segment(x0, y0, x1, y1, t_mid, side)
+                        else:
+                            t_cross = (base_y - y0) / denom
+                            t_cross = max(0.0, min(1.0, float(t_cross)))
+                            x_cross = x0 + (x1 - x0) * t_cross
+                            if dy0 < 0:
+                                fill_segment(x0, y0, x_cross, base_y, t_mid, "up")
+                                fill_segment(x_cross, base_y, x1, y1, t_mid, "down")
+                            else:
+                                fill_segment(x0, y0, x_cross, base_y, t_mid, "down")
+                                fill_segment(x_cross, base_y, x1, y1, t_mid, "up")
+            finally:
+                p.restore()
+
+            # Eğri çizgisi: frekans ekseninde statik gökkuşağı gradyan
+            grad_line = QLinearGradient(left, 0, right, 0)
+            stops = [0.00, 0.18, 0.36, 0.54, 0.72, 0.90, 1.00]
+            for at in stops:
+                col = rainbow_color(at, alpha=255)
+                col.setAlpha(255 if selected else 235)
+                grad_line.setColorAt(float(at), col)
+
+            pen = QPen(QBrush(grad_line), 4 if selected else 3)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+
+            path = QPainterPath(pts[0])
+            for pt in pts[1:]:
+                path.lineTo(pt)
+            p.drawPath(path)
+
+            icon = QIcon(pm)
+            try:
+                if cache is not None and key is not None:
+                    # Basit bir üst limit (kontrolsüz büyümeyi engelle)
+                    if len(cache) > 800:
+                        cache.clear()
+                    cache[key] = icon
+            except Exception:
+                pass
+            return icon
+        except Exception:
+            return None
+        finally:
+            try:
+                if p is not None:
+                    p.end()
+            except Exception:
+                pass
+            
+    def _on_eq_preset_clicked(self, item: QListWidgetItem):
+        try:
+            name = None
+            try:
+                name = item.data(Qt.UserRole)
+            except Exception:
+                name = None
+            if not name:
+                name = item.text().replace("✓", "").strip()
+
+            try:
+                self._eq_selected_preset_name = str(name)
+                if hasattr(self, "eq_selected_preset_lbl") and self.eq_selected_preset_lbl is not None:
+                    self.eq_selected_preset_lbl.setText(f"Seçili Hazır Ayar: {self._eq_selected_preset_name}")
+            except Exception:
+                pass
+
+            for n, gains in getattr(self, "_eq_presets_all", []):
+                if n == name:
+                    self._apply_eq_preset_gains(gains)
+                    try:
+                        if hasattr(self, "_eq_preset_popup") and self._eq_preset_popup is not None:
+                            self._eq_preset_popup.hide()
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass
+
+    def _apply_eq_preset_gains(self, gains_db: list):
+        if not self.mgr:
+            return
+        try:
+            if gains_db is None or len(gains_db) != 32:
+                return
+            # Seçimi sakla + etiketi güncelle
+            try:
+                # Çağıran _on_eq_preset_clicked seçimi zaten biliyor, ama burada da güvenli tut.
+                # Mevcut listeden seçili item adını çekmeye çalış.
+                if hasattr(self, "eq_preset_list") and self.eq_preset_list is not None:
+                    it = self.eq_preset_list.currentItem()
+                    if it is not None:
+                        nm = it.data(Qt.UserRole) if hasattr(it, "data") else None
+                        if nm:
+                            self._eq_selected_preset_name = str(nm)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "eq_selected_preset_lbl") and self.eq_selected_preset_lbl is not None:
+                    self.eq_selected_preset_lbl.setText(f"Seçili Hazır Ayar: {getattr(self, '_eq_selected_preset_name', '')}")
+            except Exception:
+                pass
+
+            self.mgr.set_eq_bands(gains_db)
+            self._trigger_reprocess()
+            # Popup listesinde tikleri güncelle (sadece popup açıkken; aksi halde gereksiz çizim yapıp sesi takabilir)
+            try:
+                if hasattr(self, "_eq_preset_popup") and self._eq_preset_popup is not None and self._eq_preset_popup.isVisible():
+                    if hasattr(self, "eq_preset_search") and self.eq_preset_search is not None:
+                        self._populate_eq_preset_list(self.eq_preset_search.text())
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _reset_ir_reverb_section(self):
+        if self.mgr:
+            self.mgr.set_ir_reverb_enabled(False)
+            self.mgr.update_ir_reverb(mix=0.18, predelay_ms=0.0)
+
+    def _reset_peq_section(self):
+        if self.mgr:
+            self.mgr.set_peq_enabled(False)
+            # Keep existing frequency defaults; reset gain/Q to neutral
+            try:
+                bands = int(getattr(self.mgr, "PEQ_BANDS", 8))
+                for i in range(bands):
+                    self.mgr.update_peq_band(i, q=1.0, gain_db=0.0)
+            except Exception:
+                pass
+
+    def _reset_autogain_section(self):
+        if self.mgr:
+            self.mgr.set_autogain_enabled(False)
+            self.mgr.update_autogain(target_dbfs=-18.0, max_boost_db=12.0, max_cut_db=18.0)
+
+    def _reset_true_peak_section(self):
+        if self.mgr:
+            self.mgr.set_true_peak_limiter_enabled(False)
+            self.mgr.update_true_peak_limiter(ceiling_db=-1.0, release_ms=120.0)
+
+    def _reset_crossfeed_section(self):
+        if self.mgr:
+            self.mgr.set_crossfeed_enabled(False)
+            self.mgr.update_crossfeed(amount=0.35, cutoff_hz=700.0)
+
+    def _reset_bass_mono_section(self):
+        if self.mgr:
+            self.mgr.set_bass_mono_enabled(False)
+            self.mgr.update_bass_mono(cutoff_hz=120.0, amount=1.0)
+
+    def _reset_dynamic_eq_section(self):
+        if self.mgr:
+            self.mgr.set_dynamic_eq_enabled(False)
+            try:
+                # Restore manager defaults
+                defaults = [
+                    (6000.0, 2.5, -22.0, 2.5, 10.0),
+                    (120.0, 1.0, -18.0, 2.0, 8.0),
+                ]
+                for i, (f, q, thr, ratio, rng) in enumerate(defaults[: int(getattr(self.mgr, "DYN_EQ_BANDS", 2))]):
+                    self.mgr.update_dynamic_eq_band(i, freq_hz=f, q=q, threshold_db=thr, ratio=ratio, range_db=rng)
+            except Exception:
+                pass
+
+    def _reset_saturation_section(self):
+        if self.mgr:
+            self.mgr.set_saturation_enabled(False)
+            self.mgr.update_saturation(drive_db=6.0, mix=0.25)
+
+    def _reset_bitdepth_section(self):
+        if self.mgr:
+            self.mgr.set_bitdepth_enabled(False)
+            self.mgr.update_bitdepth(bits=16, dither_enabled=True)
+
+    def _set_compressor_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_compressor_enabled(bool(enabled))
+
+    def _set_limiter_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_limiter_enabled(bool(enabled))
+
+    def _set_bass_enhancer_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_bass_enhancer_enabled(bool(enabled))
+
+    def _reset_compressor_section(self):
+        if self.mgr:
+            self.mgr.set_compressor_enabled(False)
+            self.mgr.set_compressor_params(threshold_db=-18.0, ratio=2.6, makeup_db=2.5)
+
+    def _reset_limiter_section(self):
+        if self.mgr:
+            self.mgr.set_limiter_enabled(False)
+            self.mgr.set_limiter_params(ceiling=0.98)
+
+    def _reset_bass_enhancer_section(self):
+        if self.mgr:
+            self.mgr.set_bass_enhancer_enabled(False)
+            self.mgr.set_bass_enhancer_params(mix=0.22)
+
+    def _set_noise_gate_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_noise_gate_enabled(bool(enabled))
+
+    def _set_deesser_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_deesser_enabled(bool(enabled))
+
+    def _set_exciter_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_exciter_enabled(bool(enabled))
+
+    def _set_widener_v2_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_stereo_widener_v2_enabled(bool(enabled))
+
+    def _set_reverb_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_reverb_enabled(bool(enabled))
+
+    def _set_echo_enabled(self, enabled: bool):
+        if self.mgr:
+            self.mgr.set_echo_enabled(bool(enabled))
+
+    def _reset_noise_gate_section(self):
+        if self.mgr:
+            self.mgr.set_noise_gate_enabled(False)
+            self.mgr.set_noise_gate_params(threshold_db=-55.0, floor_gain=0.06)
+
+    def _reset_deesser_section(self):
+        if self.mgr:
+            self.mgr.set_deesser_enabled(False)
+            self.mgr.set_deesser_params(threshold_db=-22.0, strength=0.55)
+
+    def _reset_exciter_section(self):
+        if self.mgr:
+            self.mgr.set_exciter_enabled(False)
+            self.mgr.set_exciter_params(amount=0.35, mix=0.18)
+
+    def _reset_widener_v2_section(self):
+        if self.mgr:
+            self.mgr.set_stereo_widener_v2_enabled(False)
+            self.mgr.set_widener_params(width=1.35, mix=0.35, mono_safe=1.0)
+
+    def _reset_reverb_section(self):
+        if self.mgr:
+            self.mgr.set_reverb_enabled(False)
+            self.mgr.set_reverb_params(room=0.35, damping=0.35, tone=0.50, mix=0.18, predelay_ms=15.0)
+
+    def _reset_echo_section(self):
+        if self.mgr:
+            self.mgr.set_echo_enabled(False)
+            self.mgr.set_echo_params(
+                delay_ms=240.0,
+                feedback=0.35,
+                mix=0.22,
+                pingpong=False,
+                tone=0.60,
+                duck_enabled=True,
+                duck_threshold_db=-28.0,
+                duck_amount=0.70,
+            )
+
+    def _schedule_eq_curve_update(self):
+        if self._eq_curve_update_pending:
+            return
+        self._eq_curve_update_pending = True
+
+        def _do_update():
+            self._eq_curve_update_pending = False
+            try:
+                self._update_eq_curve()
+            except Exception:
+                pass
+
+        # Run after the layout has applied final geometries.
+        QTimer.singleShot(0, _do_update)
+
+    def eventFilter(self, obj, event):
+        try:
+            if hasattr(self, "_eq_widget") and obj is self._eq_widget:
+                et = event.type()
+                if et in (QEvent.Resize, QEvent.LayoutRequest, QEvent.Show):
+                    self._schedule_eq_curve_update()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
 
     def _on_slider_change(self, index, value):
         # 0. Sync with Manager
@@ -2776,6 +6152,10 @@ class PopupEqualizerWidget(QDialog):
         if self.mgr:
             self.mgr.update_stereo(width)
 
+    def update_balance(self, balance: float):
+        if self.mgr:
+            self.mgr.update_balance(balance)
+
     def update_acoustic_space(self, index):
         if self.mgr:
             self.mgr.update_acoustic_space(index)
@@ -2797,6 +6177,12 @@ class PopupEqualizerWidget(QDialog):
         if not self.mgr:
             return
         self.eq_curve.show()
+
+        # Ensure curve covers the full EQ widget area (important after layout updates).
+        try:
+            self.eq_curve.setGeometry(self.eq_curve.parent().rect())
+        except Exception:
+            pass
 
         positions = []
         peak_gain = -999.0
@@ -2834,7 +6220,18 @@ class PopupEqualizerWidget(QDialog):
         if peak_gain < -900.0:
             peak_gain = 0.0
         self.eq_curve.set_slider_positions(positions, baseline_y, peak_gain=peak_gain)
+        # Geometry already handled above; keep last for safety.
         self.eq_curve.setGeometry(self.eq_curve.parent().rect())
+
+    def resizeEvent(self, event):
+        """Handle window resize to update EQ curve"""
+        super().resizeEvent(event)
+        try:
+            if hasattr(self, 'eq_curve') and self.eq_curve:
+                # Defer until layout settles; also covered by eq_widget eventFilter.
+                QTimer.singleShot(0, self._schedule_eq_curve_update)
+        except Exception:
+            pass
         
     def _update_bass_alert(self):
         if not self.mgr:
@@ -2868,10 +6265,33 @@ class PopupEqualizerWidget(QDialog):
             self.sliders[i].setValue(val)
             self.sliders[i].blockSignals(False)
 
+            lbl = getattr(self.sliders[i], "_eq_value_label", None)
+            if lbl is not None:
+                lbl.setText(f"{self.sliders[i].value()/10.0:+.1f} dB")
+
         self.tone_bass_knob.set_value(int(self.mgr.tone_bass * 10.0))
         self.tone_mid_knob.set_value(int(self.mgr.tone_mid * 10.0))
         self.tone_treble_knob.set_value(int(self.mgr.tone_treble * 10.0))
         self.stereo_knob.set_value(int(self.mgr.stereo_width * 100.0))
+
+        try:
+            if hasattr(self, "balance_slider") and self.balance_slider is not None:
+                self.balance_slider.blockSignals(True)
+                v = int(float(getattr(self.mgr, "balance", 0.0)) * 100.0)
+                self.balance_slider.setValue(v)
+                self.balance_slider.blockSignals(False)
+                try:
+                    if hasattr(self, "balance_value_lbl") and self.balance_value_lbl is not None:
+                        if abs(int(v)) <= 0:
+                            self.balance_value_lbl.setText("Merkez (0%)")
+                        elif v < 0:
+                            self.balance_value_lbl.setText(f"Sol %{-int(v)}")
+                        else:
+                            self.balance_value_lbl.setText(f"Sağ %{int(v)}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         self.acoustic_combo.blockSignals(True)
         self.acoustic_combo.setCurrentIndex(self.mgr.acoustic_space)
@@ -2881,6 +6301,437 @@ class PopupEqualizerWidget(QDialog):
         self.master_toggle_btn.setChecked(self.mgr.smart_audio_enabled)
         self.master_toggle_btn.blockSignals(False)
 
+        # New-gen effect sections
+        try:
+            if hasattr(self, "comp_enable_cb"):
+                self.comp_enable_cb.blockSignals(True)
+                self.comp_enable_cb.setChecked(bool(getattr(self.mgr, "compressor_enabled", False)))
+                self.comp_enable_cb.blockSignals(False)
+            if hasattr(self, "lim_enable_cb"):
+                self.lim_enable_cb.blockSignals(True)
+                self.lim_enable_cb.setChecked(bool(getattr(self.mgr, "limiter_enabled", False)))
+                self.lim_enable_cb.blockSignals(False)
+            if hasattr(self, "bass_enable_cb"):
+                self.bass_enable_cb.blockSignals(True)
+                self.bass_enable_cb.setChecked(bool(getattr(self.mgr, "bass_enhancer_enabled", False)))
+                self.bass_enable_cb.blockSignals(False)
+            if hasattr(self, "gate_enable_cb"):
+                self.gate_enable_cb.blockSignals(True)
+                self.gate_enable_cb.setChecked(bool(getattr(self.mgr, "noise_gate_enabled", False)))
+                self.gate_enable_cb.blockSignals(False)
+            if hasattr(self, "deess_enable_cb"):
+                self.deess_enable_cb.blockSignals(True)
+                self.deess_enable_cb.setChecked(bool(getattr(self.mgr, "deesser_enabled", False)))
+                self.deess_enable_cb.blockSignals(False)
+            if hasattr(self, "exc_enable_cb"):
+                self.exc_enable_cb.blockSignals(True)
+                self.exc_enable_cb.setChecked(bool(getattr(self.mgr, "exciter_enabled", False)))
+                self.exc_enable_cb.blockSignals(False)
+            if hasattr(self, "wid_enable_cb"):
+                self.wid_enable_cb.blockSignals(True)
+                self.wid_enable_cb.setChecked(bool(getattr(self.mgr, "stereo_widener_v2_enabled", False)))
+                self.wid_enable_cb.blockSignals(False)
+            if hasattr(self, "rev_enable_cb"):
+                self.rev_enable_cb.blockSignals(True)
+                self.rev_enable_cb.setChecked(bool(getattr(self.mgr, "reverb_enabled", False)))
+                self.rev_enable_cb.blockSignals(False)
+            if hasattr(self, "echo_enable_cb"):
+                self.echo_enable_cb.blockSignals(True)
+                self.echo_enable_cb.setChecked(bool(getattr(self.mgr, "echo_enabled", False)))
+                self.echo_enable_cb.blockSignals(False)
+
+            # Advanced effects toggles
+            if hasattr(self, "ir_enable_cb"):
+                self.ir_enable_cb.blockSignals(True)
+                self.ir_enable_cb.setChecked(bool(getattr(self.mgr, "ir_reverb_enabled", False)))
+                self.ir_enable_cb.blockSignals(False)
+            if hasattr(self, "peq_enable_cb"):
+                self.peq_enable_cb.blockSignals(True)
+                self.peq_enable_cb.setChecked(bool(getattr(self.mgr, "peq_enabled", False)))
+                self.peq_enable_cb.blockSignals(False)
+            if hasattr(self, "ag_enable_cb"):
+                self.ag_enable_cb.blockSignals(True)
+                self.ag_enable_cb.setChecked(bool(getattr(self.mgr, "autogain_enabled", False)))
+                self.ag_enable_cb.blockSignals(False)
+            if hasattr(self, "tp_enable_cb"):
+                self.tp_enable_cb.blockSignals(True)
+                self.tp_enable_cb.setChecked(bool(getattr(self.mgr, "true_peak_limiter_enabled", False)))
+                self.tp_enable_cb.blockSignals(False)
+            if hasattr(self, "xf_enable_cb"):
+                self.xf_enable_cb.blockSignals(True)
+                self.xf_enable_cb.setChecked(bool(getattr(self.mgr, "crossfeed_enabled", False)))
+                self.xf_enable_cb.blockSignals(False)
+            if hasattr(self, "bm_enable_cb"):
+                self.bm_enable_cb.blockSignals(True)
+                self.bm_enable_cb.setChecked(bool(getattr(self.mgr, "bass_mono_enabled", False)))
+                self.bm_enable_cb.blockSignals(False)
+            if hasattr(self, "dq_enable_cb"):
+                self.dq_enable_cb.blockSignals(True)
+                self.dq_enable_cb.setChecked(bool(getattr(self.mgr, "dynamic_eq_enabled", False)))
+                self.dq_enable_cb.blockSignals(False)
+            if hasattr(self, "sat_enable_cb"):
+                self.sat_enable_cb.blockSignals(True)
+                self.sat_enable_cb.setChecked(bool(getattr(self.mgr, "saturation_enabled", False)))
+                self.sat_enable_cb.blockSignals(False)
+            if hasattr(self, "bd_enable_cb"):
+                self.bd_enable_cb.blockSignals(True)
+                self.bd_enable_cb.setChecked(bool(getattr(self.mgr, "bitdepth_enabled", False)))
+                self.bd_enable_cb.blockSignals(False)
+
+            # Advanced effect params -> sliders/fields
+            if hasattr(self, "ir_path_edit") and self.ir_path_edit is not None:
+                self.ir_path_edit.blockSignals(True)
+                self.ir_path_edit.setText(str(getattr(self.mgr, "ir_reverb_path", "") or ""))
+                self.ir_path_edit.blockSignals(False)
+            for slider_name, val in (
+                ("ir_mix_slider", int(round(float(getattr(self.mgr, "ir_reverb_mix", 0.18)) * 100))),
+                ("ir_pre_slider", int(round(float(getattr(self.mgr, "ir_reverb_predelay_ms", 0.0))))),
+                ("ag_target_slider", int(round(float(getattr(self.mgr, "autogain_target_dbfs", -18.0))))),
+                ("ag_boost_slider", int(round(float(getattr(self.mgr, "autogain_max_boost_db", 12.0))))),
+                ("ag_cut_slider", int(round(float(getattr(self.mgr, "autogain_max_cut_db", 18.0))))),
+                ("tp_ceiling_slider", int(round(float(getattr(self.mgr, "true_peak_ceiling_db", -1.0))))),
+                ("tp_release_slider", int(round(float(getattr(self.mgr, "true_peak_release_ms", 120.0))))),
+                ("xf_amount_slider", int(round(float(getattr(self.mgr, "crossfeed_amount", 0.35)) * 100))),
+                ("xf_cutoff_slider", int(round(float(getattr(self.mgr, "crossfeed_cutoff_hz", 700.0))))),
+                ("bm_cutoff_slider", int(round(float(getattr(self.mgr, "bass_mono_cutoff_hz", 120.0))))),
+                ("bm_amount_slider", int(round(float(getattr(self.mgr, "bass_mono_amount", 1.0)) * 100))),
+                ("sat_drive_slider", int(round(float(getattr(self.mgr, "saturation_drive_db", 6.0))))),
+                ("sat_mix_slider", int(round(float(getattr(self.mgr, "saturation_mix", 0.25)) * 100))),
+                ("bd_bits_slider", int(round(int(getattr(self.mgr, "bitdepth_bits", 16))))),
+            ):
+                s = getattr(self, slider_name, None)
+                if s is None:
+                    continue
+                try:
+                    s.blockSignals(True)
+                    s.setValue(int(val))
+                    s.blockSignals(False)
+                    if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                        s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+                except Exception:
+                    pass
+
+            if hasattr(self, "bd_dither_cb") and self.bd_dither_cb is not None:
+                self.bd_dither_cb.blockSignals(True)
+                self.bd_dither_cb.setChecked(bool(getattr(self.mgr, "dither_enabled", True)))
+                self.bd_dither_cb.blockSignals(False)
+
+            # PEQ bands
+            try:
+                if hasattr(self, "peq_freq_sliders") and hasattr(self.mgr, "peq_freqs_hz"):
+                    for i, s in enumerate(self.peq_freq_sliders):
+                        if i < len(self.mgr.peq_freqs_hz):
+                            s.blockSignals(True)
+                            s.setValue(int(round(float(self.mgr.peq_freqs_hz[i]))))
+                            s.blockSignals(False)
+                            if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                                s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+                if hasattr(self, "peq_q_sliders") and hasattr(self.mgr, "peq_qs"):
+                    for i, s in enumerate(self.peq_q_sliders):
+                        if i < len(self.mgr.peq_qs):
+                            s.blockSignals(True)
+                            s.setValue(int(round(float(self.mgr.peq_qs[i]) * 10)))
+                            s.blockSignals(False)
+                            if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                                s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+                if hasattr(self, "peq_gain_sliders") and hasattr(self.mgr, "peq_gains_db"):
+                    for i, s in enumerate(self.peq_gain_sliders):
+                        if i < len(self.mgr.peq_gains_db):
+                            s.blockSignals(True)
+                            s.setValue(int(round(float(self.mgr.peq_gains_db[i]) * 10)))
+                            s.blockSignals(False)
+                            if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                                s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+            except Exception:
+                pass
+
+            # Dynamic EQ bands
+            try:
+                if hasattr(self, "dq_freq_sliders") and hasattr(self.mgr, "dynamic_eq_freqs_hz"):
+                    for i, s in enumerate(self.dq_freq_sliders):
+                        if i < len(self.mgr.dynamic_eq_freqs_hz):
+                            s.blockSignals(True)
+                            s.setValue(int(round(float(self.mgr.dynamic_eq_freqs_hz[i]))))
+                            s.blockSignals(False)
+                            if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                                s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+                if hasattr(self, "dq_q_sliders") and hasattr(self.mgr, "dynamic_eq_qs"):
+                    for i, s in enumerate(self.dq_q_sliders):
+                        if i < len(self.mgr.dynamic_eq_qs):
+                            s.blockSignals(True)
+                            s.setValue(int(round(float(self.mgr.dynamic_eq_qs[i]) * 10)))
+                            s.blockSignals(False)
+                            if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                                s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+                if hasattr(self, "dq_thr_sliders") and hasattr(self.mgr, "dynamic_eq_threshold_db"):
+                    for i, s in enumerate(self.dq_thr_sliders):
+                        if i < len(self.mgr.dynamic_eq_threshold_db):
+                            s.blockSignals(True)
+                            s.setValue(int(round(float(self.mgr.dynamic_eq_threshold_db[i]))))
+                            s.blockSignals(False)
+                            if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                                s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+                if hasattr(self, "dq_ratio_sliders") and hasattr(self.mgr, "dynamic_eq_ratio"):
+                    for i, s in enumerate(self.dq_ratio_sliders):
+                        if i < len(self.mgr.dynamic_eq_ratio):
+                            s.blockSignals(True)
+                            s.setValue(int(round(float(self.mgr.dynamic_eq_ratio[i]) * 10)))
+                            s.blockSignals(False)
+                            if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                                s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+                if hasattr(self, "dq_range_sliders") and hasattr(self.mgr, "dynamic_eq_range_db"):
+                    for i, s in enumerate(self.dq_range_sliders):
+                        if i < len(self.mgr.dynamic_eq_range_db):
+                            s.blockSignals(True)
+                            s.setValue(int(round(float(self.mgr.dynamic_eq_range_db[i]) * 10)))
+                            s.blockSignals(False)
+                            if hasattr(s, "_fx_value_label") and hasattr(s, "_fx_value_fmt"):
+                                s._fx_value_label.setText(s._fx_value_fmt(s.value()))
+            except Exception:
+                pass
+
+            # Params -> sliders
+            if hasattr(self, "comp_thr_slider"):
+                self.comp_thr_slider.blockSignals(True)
+                self.comp_thr_slider.setValue(int(round(float(getattr(self.mgr, "compressor_threshold_db", -18.0)))))
+                self.comp_thr_slider.blockSignals(False)
+                try:
+                    if hasattr(self.comp_thr_slider, "_fx_value_label") and hasattr(self.comp_thr_slider, "_fx_value_fmt"):
+                        self.comp_thr_slider._fx_value_label.setText(self.comp_thr_slider._fx_value_fmt(self.comp_thr_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "comp_ratio_slider"):
+                self.comp_ratio_slider.blockSignals(True)
+                self.comp_ratio_slider.setValue(int(round(float(getattr(self.mgr, "compressor_ratio", 2.6)) * 10)))
+                self.comp_ratio_slider.blockSignals(False)
+                try:
+                    if hasattr(self.comp_ratio_slider, "_fx_value_label") and hasattr(self.comp_ratio_slider, "_fx_value_fmt"):
+                        self.comp_ratio_slider._fx_value_label.setText(self.comp_ratio_slider._fx_value_fmt(self.comp_ratio_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "comp_makeup_slider"):
+                self.comp_makeup_slider.blockSignals(True)
+                self.comp_makeup_slider.setValue(int(round(float(getattr(self.mgr, "compressor_makeup_db", 2.5)) * 10)))
+                self.comp_makeup_slider.blockSignals(False)
+                try:
+                    if hasattr(self.comp_makeup_slider, "_fx_value_label") and hasattr(self.comp_makeup_slider, "_fx_value_fmt"):
+                        self.comp_makeup_slider._fx_value_label.setText(self.comp_makeup_slider._fx_value_fmt(self.comp_makeup_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "lim_ceiling_slider"):
+                self.lim_ceiling_slider.blockSignals(True)
+                self.lim_ceiling_slider.setValue(int(round(float(getattr(self.mgr, "limiter_ceiling", 0.98)) * 100)))
+                self.lim_ceiling_slider.blockSignals(False)
+                try:
+                    if hasattr(self.lim_ceiling_slider, "_fx_value_label") and hasattr(self.lim_ceiling_slider, "_fx_value_fmt"):
+                        self.lim_ceiling_slider._fx_value_label.setText(self.lim_ceiling_slider._fx_value_fmt(self.lim_ceiling_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "bass_mix_slider"):
+                self.bass_mix_slider.blockSignals(True)
+                self.bass_mix_slider.setValue(int(round(float(getattr(self.mgr, "bass_mix", 0.22)) * 100)))
+                self.bass_mix_slider.blockSignals(False)
+                try:
+                    if hasattr(self.bass_mix_slider, "_fx_value_label") and hasattr(self.bass_mix_slider, "_fx_value_fmt"):
+                        self.bass_mix_slider._fx_value_label.setText(self.bass_mix_slider._fx_value_fmt(self.bass_mix_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "gate_thr_slider"):
+                self.gate_thr_slider.blockSignals(True)
+                self.gate_thr_slider.setValue(int(round(float(getattr(self.mgr, "noise_gate_threshold_db", -55.0)))))
+                self.gate_thr_slider.blockSignals(False)
+                try:
+                    if hasattr(self.gate_thr_slider, "_fx_value_label") and hasattr(self.gate_thr_slider, "_fx_value_fmt"):
+                        self.gate_thr_slider._fx_value_label.setText(self.gate_thr_slider._fx_value_fmt(self.gate_thr_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "gate_floor_slider"):
+                self.gate_floor_slider.blockSignals(True)
+                self.gate_floor_slider.setValue(int(round(float(getattr(self.mgr, "noise_gate_floor_gain", 0.06)) * 100)))
+                self.gate_floor_slider.blockSignals(False)
+                try:
+                    if hasattr(self.gate_floor_slider, "_fx_value_label") and hasattr(self.gate_floor_slider, "_fx_value_fmt"):
+                        self.gate_floor_slider._fx_value_label.setText(self.gate_floor_slider._fx_value_fmt(self.gate_floor_slider.value()))
+                except Exception:
+                    pass
+
+            if hasattr(self, "deess_thr_slider"):
+                self.deess_thr_slider.blockSignals(True)
+                self.deess_thr_slider.setValue(int(round(float(getattr(self.mgr, "deesser_threshold_db", -22.0)))))
+                self.deess_thr_slider.blockSignals(False)
+                try:
+                    if hasattr(self.deess_thr_slider, "_fx_value_label") and hasattr(self.deess_thr_slider, "_fx_value_fmt"):
+                        self.deess_thr_slider._fx_value_label.setText(self.deess_thr_slider._fx_value_fmt(self.deess_thr_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "deess_strength_slider"):
+                self.deess_strength_slider.blockSignals(True)
+                self.deess_strength_slider.setValue(int(round(float(getattr(self.mgr, "deesser_strength", 0.55)) * 100)))
+                self.deess_strength_slider.blockSignals(False)
+                try:
+                    if hasattr(self.deess_strength_slider, "_fx_value_label") and hasattr(self.deess_strength_slider, "_fx_value_fmt"):
+                        self.deess_strength_slider._fx_value_label.setText(self.deess_strength_slider._fx_value_fmt(self.deess_strength_slider.value()))
+                except Exception:
+                    pass
+
+            if hasattr(self, "exc_amount_slider"):
+                self.exc_amount_slider.blockSignals(True)
+                self.exc_amount_slider.setValue(int(round(float(getattr(self.mgr, "exciter_amount", 0.35)) * 100)))
+                self.exc_amount_slider.blockSignals(False)
+                try:
+                    if hasattr(self.exc_amount_slider, "_fx_value_label") and hasattr(self.exc_amount_slider, "_fx_value_fmt"):
+                        self.exc_amount_slider._fx_value_label.setText(self.exc_amount_slider._fx_value_fmt(self.exc_amount_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "exc_mix_slider"):
+                self.exc_mix_slider.blockSignals(True)
+                self.exc_mix_slider.setValue(int(round(float(getattr(self.mgr, "exciter_mix", 0.18)) * 100)))
+                self.exc_mix_slider.blockSignals(False)
+                try:
+                    if hasattr(self.exc_mix_slider, "_fx_value_label") and hasattr(self.exc_mix_slider, "_fx_value_fmt"):
+                        self.exc_mix_slider._fx_value_label.setText(self.exc_mix_slider._fx_value_fmt(self.exc_mix_slider.value()))
+                except Exception:
+                    pass
+
+            if hasattr(self, "wid_width_slider"):
+                self.wid_width_slider.blockSignals(True)
+                self.wid_width_slider.setValue(int(round(float(getattr(self.mgr, "widener_width", 1.35)) * 100)))
+                self.wid_width_slider.blockSignals(False)
+                try:
+                    if hasattr(self.wid_width_slider, "_fx_value_label") and hasattr(self.wid_width_slider, "_fx_value_fmt"):
+                        self.wid_width_slider._fx_value_label.setText(self.wid_width_slider._fx_value_fmt(self.wid_width_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "wid_mix_slider"):
+                self.wid_mix_slider.blockSignals(True)
+                self.wid_mix_slider.setValue(int(round(float(getattr(self.mgr, "widener_mix", 0.35)) * 100)))
+                self.wid_mix_slider.blockSignals(False)
+                try:
+                    if hasattr(self.wid_mix_slider, "_fx_value_label") and hasattr(self.wid_mix_slider, "_fx_value_fmt"):
+                        self.wid_mix_slider._fx_value_label.setText(self.wid_mix_slider._fx_value_fmt(self.wid_mix_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "wid_mono_slider"):
+                self.wid_mono_slider.blockSignals(True)
+                self.wid_mono_slider.setValue(int(round(float(getattr(self.mgr, "widener_mono_safe", 1.0)) * 100)))
+                self.wid_mono_slider.blockSignals(False)
+                try:
+                    if hasattr(self.wid_mono_slider, "_fx_value_label") and hasattr(self.wid_mono_slider, "_fx_value_fmt"):
+                        self.wid_mono_slider._fx_value_label.setText(self.wid_mono_slider._fx_value_fmt(self.wid_mono_slider.value()))
+                except Exception:
+                    pass
+
+            if hasattr(self, "rev_room_slider"):
+                self.rev_room_slider.blockSignals(True)
+                self.rev_room_slider.setValue(int(round(float(getattr(self.mgr, "reverb_room", 0.35)) * 100)))
+                self.rev_room_slider.blockSignals(False)
+                try:
+                    if hasattr(self.rev_room_slider, "_fx_value_label") and hasattr(self.rev_room_slider, "_fx_value_fmt"):
+                        self.rev_room_slider._fx_value_label.setText(self.rev_room_slider._fx_value_fmt(self.rev_room_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "rev_damp_slider"):
+                self.rev_damp_slider.blockSignals(True)
+                self.rev_damp_slider.setValue(int(round(float(getattr(self.mgr, "reverb_damping", 0.35)) * 100)))
+                self.rev_damp_slider.blockSignals(False)
+                try:
+                    if hasattr(self.rev_damp_slider, "_fx_value_label") and hasattr(self.rev_damp_slider, "_fx_value_fmt"):
+                        self.rev_damp_slider._fx_value_label.setText(self.rev_damp_slider._fx_value_fmt(self.rev_damp_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "rev_tone_slider"):
+                self.rev_tone_slider.blockSignals(True)
+                self.rev_tone_slider.setValue(int(round(float(getattr(self.mgr, "reverb_tone", 0.50)) * 100)))
+                self.rev_tone_slider.blockSignals(False)
+                try:
+                    if hasattr(self.rev_tone_slider, "_fx_value_label") and hasattr(self.rev_tone_slider, "_fx_value_fmt"):
+                        self.rev_tone_slider._fx_value_label.setText(self.rev_tone_slider._fx_value_fmt(self.rev_tone_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "rev_mix_slider"):
+                self.rev_mix_slider.blockSignals(True)
+                self.rev_mix_slider.setValue(int(round(float(getattr(self.mgr, "reverb_mix", 0.18)) * 100)))
+                self.rev_mix_slider.blockSignals(False)
+                try:
+                    if hasattr(self.rev_mix_slider, "_fx_value_label") and hasattr(self.rev_mix_slider, "_fx_value_fmt"):
+                        self.rev_mix_slider._fx_value_label.setText(self.rev_mix_slider._fx_value_fmt(self.rev_mix_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "rev_pre_slider"):
+                self.rev_pre_slider.blockSignals(True)
+                self.rev_pre_slider.setValue(int(round(float(getattr(self.mgr, "reverb_predelay_ms", 15.0)))))
+                self.rev_pre_slider.blockSignals(False)
+                try:
+                    if hasattr(self.rev_pre_slider, "_fx_value_label") and hasattr(self.rev_pre_slider, "_fx_value_fmt"):
+                        self.rev_pre_slider._fx_value_label.setText(self.rev_pre_slider._fx_value_fmt(self.rev_pre_slider.value()))
+                except Exception:
+                    pass
+
+            if hasattr(self, "echo_delay_slider"):
+                self.echo_delay_slider.blockSignals(True)
+                self.echo_delay_slider.setValue(int(round(float(getattr(self.mgr, "echo_delay_ms", 240.0)))))
+                self.echo_delay_slider.blockSignals(False)
+                try:
+                    if hasattr(self.echo_delay_slider, "_fx_value_label") and hasattr(self.echo_delay_slider, "_fx_value_fmt"):
+                        self.echo_delay_slider._fx_value_label.setText(self.echo_delay_slider._fx_value_fmt(self.echo_delay_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "echo_pingpong_cb"):
+                self.echo_pingpong_cb.blockSignals(True)
+                self.echo_pingpong_cb.setChecked(bool(getattr(self.mgr, "echo_pingpong", False)))
+                self.echo_pingpong_cb.blockSignals(False)
+            if hasattr(self, "echo_duck_cb"):
+                self.echo_duck_cb.blockSignals(True)
+                self.echo_duck_cb.setChecked(bool(getattr(self.mgr, "echo_duck_enabled", True)))
+                self.echo_duck_cb.blockSignals(False)
+            if hasattr(self, "echo_feedback_slider"):
+                self.echo_feedback_slider.blockSignals(True)
+                self.echo_feedback_slider.setValue(int(round(float(getattr(self.mgr, "echo_feedback", 0.35)) * 100)))
+                self.echo_feedback_slider.blockSignals(False)
+                try:
+                    if hasattr(self.echo_feedback_slider, "_fx_value_label") and hasattr(self.echo_feedback_slider, "_fx_value_fmt"):
+                        self.echo_feedback_slider._fx_value_label.setText(self.echo_feedback_slider._fx_value_fmt(self.echo_feedback_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "echo_mix_slider"):
+                self.echo_mix_slider.blockSignals(True)
+                self.echo_mix_slider.setValue(int(round(float(getattr(self.mgr, "echo_mix", 0.22)) * 100)))
+                self.echo_mix_slider.blockSignals(False)
+                try:
+                    if hasattr(self.echo_mix_slider, "_fx_value_label") and hasattr(self.echo_mix_slider, "_fx_value_fmt"):
+                        self.echo_mix_slider._fx_value_label.setText(self.echo_mix_slider._fx_value_fmt(self.echo_mix_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "echo_tone_slider"):
+                self.echo_tone_slider.blockSignals(True)
+                self.echo_tone_slider.setValue(int(round(float(getattr(self.mgr, "echo_tone", 0.60)) * 100)))
+                self.echo_tone_slider.blockSignals(False)
+                try:
+                    if hasattr(self.echo_tone_slider, "_fx_value_label") and hasattr(self.echo_tone_slider, "_fx_value_fmt"):
+                        self.echo_tone_slider._fx_value_label.setText(self.echo_tone_slider._fx_value_fmt(self.echo_tone_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "echo_duck_thr_slider"):
+                self.echo_duck_thr_slider.blockSignals(True)
+                self.echo_duck_thr_slider.setValue(int(round(float(getattr(self.mgr, "echo_duck_threshold_db", -28.0)))))
+                self.echo_duck_thr_slider.blockSignals(False)
+                try:
+                    if hasattr(self.echo_duck_thr_slider, "_fx_value_label") and hasattr(self.echo_duck_thr_slider, "_fx_value_fmt"):
+                        self.echo_duck_thr_slider._fx_value_label.setText(self.echo_duck_thr_slider._fx_value_fmt(self.echo_duck_thr_slider.value()))
+                except Exception:
+                    pass
+            if hasattr(self, "echo_duck_amt_slider"):
+                self.echo_duck_amt_slider.blockSignals(True)
+                self.echo_duck_amt_slider.setValue(int(round(float(getattr(self.mgr, "echo_duck_amount", 0.70)) * 100)))
+                self.echo_duck_amt_slider.blockSignals(False)
+                try:
+                    if hasattr(self.echo_duck_amt_slider, "_fx_value_label") and hasattr(self.echo_duck_amt_slider, "_fx_value_fmt"):
+                        self.echo_duck_amt_slider._fx_value_label.setText(self.echo_duck_amt_slider._fx_value_fmt(self.echo_duck_amt_slider.value()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         knobs_enabled = self.mgr.smart_audio_enabled
         self.tone_bass_knob.setEnabled(knobs_enabled)
         self.tone_mid_knob.setEnabled(knobs_enabled)
@@ -2888,6 +6739,29 @@ class PopupEqualizerWidget(QDialog):
         self.stereo_knob.setEnabled(knobs_enabled)
         self.acoustic_combo.setEnabled(knobs_enabled)
         self.reset_tone_btn.setEnabled(knobs_enabled)
+
+        # If master DSP is off, disable new-gen toggles too.
+        try:
+            ng_enabled = bool(getattr(self.mgr, "dsp_enabled", True))
+            for w in (getattr(self, "comp_enable_cb", None), getattr(self, "lim_enable_cb", None), getattr(self, "bass_enable_cb", None), getattr(self, "gate_enable_cb", None),
+                      getattr(self, "deess_enable_cb", None), getattr(self, "exc_enable_cb", None),
+                      getattr(self, "wid_enable_cb", None), getattr(self, "rev_enable_cb", None), getattr(self, "echo_enable_cb", None),
+                      getattr(self, "ir_enable_cb", None), getattr(self, "peq_enable_cb", None), getattr(self, "ag_enable_cb", None), getattr(self, "tp_enable_cb", None),
+                      getattr(self, "xf_enable_cb", None), getattr(self, "bm_enable_cb", None), getattr(self, "dq_enable_cb", None), getattr(self, "sat_enable_cb", None), getattr(self, "bd_enable_cb", None),
+                      getattr(self, "comp_default_btn", None), getattr(self, "lim_default_btn", None), getattr(self, "bass_default_btn", None), getattr(self, "gate_default_btn", None),
+                      getattr(self, "deess_default_btn", None), getattr(self, "exc_default_btn", None), getattr(self, "wid_default_btn", None), getattr(self, "rev_default_btn", None), getattr(self, "echo_default_btn", None)):
+                if w is not None:
+                    w.setEnabled(ng_enabled)
+
+            for w in (
+                getattr(self, "ir_default_btn", None), getattr(self, "peq_default_btn", None), getattr(self, "ag_default_btn", None), getattr(self, "tp_default_btn", None),
+                getattr(self, "xf_default_btn", None), getattr(self, "bm_default_btn", None), getattr(self, "dq_default_btn", None), getattr(self, "sat_default_btn", None), getattr(self, "bd_default_btn", None),
+                getattr(self, "ir_path_edit", None), getattr(self, "bd_dither_cb", None),
+            ):
+                if w is not None:
+                    w.setEnabled(ng_enabled)
+        except Exception:
+            pass
 
         self._update_bass_alert()
         self._update_eq_curve()
@@ -2970,7 +6844,7 @@ except ImportError as e:
 
 class SettingsManager:
     """JSON tabanlı ayar kalıcılığı"""
-    def __init__(self, path=os.path.join(os.path.dirname(__file__), 'angolla_settings.json')):
+    def __init__(self, path=os.path.join(os.path.dirname(__file__), 'aurivo_settings.json')):
         self.path = path
         self.data = {
             'trusted_domains': list(TRUSTED_DOMAINS),
@@ -3005,7 +6879,7 @@ class SettingsManager:
 class SettingsDialog(QDialog):
     def __init__(self, manager: SettingsManager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Angolla\nGuvenlik Ayarları")
+        self.setWindowTitle("Aurivo\nGuvenlik Ayarları")
         self.resize(480, 650)  # Standart pencere boyutu
         self.manager = manager
         layout = QVBoxLayout(self)
@@ -3216,7 +7090,7 @@ class BridgeSecurityController(QObject):
 # ÖZEL GÜVENLİ WEB SAYFASI
 # ---------------------------------------------------------------------------
 if QWebEnginePage is not None:
-    class AngollaWebPage(QWebEnginePage):
+    class AurivoWebPage(QWebEnginePage):
         """QWebEnginePage üzerinde güvenlik kısıtlamaları uygular."""
         def __init__(self, profile, parent=None):
             super().__init__(profile, parent)
@@ -3331,7 +7205,7 @@ if QWebEnginePage is not None:
                 pass
 
 else:
-    class AngollaWebPage(object):
+    class AurivoWebPage(object):
         """WebEngine kullanılamadığında fallback sınıf."""
         def __init__(self, profile=None, parent=None):
             pass
@@ -3591,6 +7465,7 @@ TRANSLATIONS = {
 import webbrowser
 import urllib.parse
 import urllib.request
+import shutil
 from secure_storage import (
     atomic_write_json,
     load_json_file,
@@ -3628,10 +7503,17 @@ except Exception:
     SD_AVAILABLE = False
 
 # Sabitler
-PLAYLIST_FILE = "angolla_playlist.json"
-CONFIG_FILE = "angolla_config.json"
-DB_FILE = "angolla_library.db"
-SETTINGS_KEY = "AngollaPlayer/Settings"
+PLAYLIST_FILE = "aurivo_playlist.json"
+CONFIG_FILE = "aurivo_config.json"
+DB_FILE = "aurivo_library.db"
+SETTINGS_KEY = "AurivoPlayer/Settings"
+
+# Geriye dönük uyumluluk (eski uygulama adı: Angolla)
+LEGACY_PLAYLIST_FILE = "angolla_playlist.json"
+LEGACY_CONFIG_FILE = "angolla_config.json"
+LEGACY_DB_FILE = "angolla_library.db"
+LEGACY_SETTINGS_KEY = "AngollaPlayer/Settings"
+LEGACY_SETTINGS_GROUP = "AngollaPlayer"
 
 
 # ---------------------------------------------------------------------------
@@ -3643,6 +7525,12 @@ class LibraryManager:
 
     def __init__(self, db_file=DB_FILE):
         self.db_file = db_file
+        # Eski veritabanı adıyla (Angolla) kalan kullanıcılar için migrate
+        if self.db_file == DB_FILE and not os.path.exists(self.db_file) and os.path.exists(LEGACY_DB_FILE):
+            try:
+                shutil.copy2(LEGACY_DB_FILE, self.db_file)
+            except Exception:
+                pass
         self.conn = None
         self._connect_db()
 
@@ -4056,9 +7944,9 @@ class InfoDisplayWidget(QWidget):
                 self._external_album_label.setPixmap(QPixmap())
 
     def set_external_album_label(self, label: QLabel):
-        """Assign an external QLabel (created by AngollaPlayer) to show album art."""
+        """Assign an external QLabel (created by AurivoPlayer) to show album art."""
         self._external_album_label = label
-        # Apply current visibility (respect the size already set by AngollaPlayer)
+        # Apply current visibility (respect the size already set by AurivoPlayer)
         if label is not None:
             label.setVisible(self._album_art_visible)
 
@@ -4094,7 +7982,7 @@ class InfoDisplayWidget(QWidget):
 class GradientSlider(QSlider):
     def __init__(self, orientation=Qt.Horizontal, parent=None):
         super().__init__(orientation, parent)
-        self.setFixedHeight(20)  # Daha geniş ve net
+        self.setFixedHeight(20)  # Kullanım yerinde inceltilebilir
         self.shift = 0.0
         self._aura_speed = 1.0
         self._aura_base_hue_f = None  # 0..1 (HSV hue fraction)
@@ -4106,9 +7994,39 @@ class GradientSlider(QSlider):
         self._anim_timer.timeout.connect(self._animate_gradient)
         self._anim_timer.start()
         self._is_seeking = False  # Drag state tracking
+
+        # Çizim parametreleri
+        self._track_thickness = 6
+        self._track_padding = 10
         
         # Mouse tracking aktif
         self.setMouseTracking(True)
+
+    def _effective_pad_px(self) -> int:
+        """Handle/glow kesilmesin diye track padding'i dinamik büyüt."""
+        try:
+            base_r = 8.2 if self._is_seeking else 6.2
+            glow_r = base_r + 6.5
+            return max(int(getattr(self, "_track_padding", 10)), int(glow_r) + 2)
+        except Exception:
+            return int(getattr(self, "_track_padding", 10))
+
+    def _value_from_x(self, x: int) -> int:
+        """Tıklama/sürüklemede track padding'ine göre doğru value üret."""
+        try:
+            pad = int(self._effective_pad_px())
+            span = max(1, int(self.width()) - pad * 2)
+            pos = int(max(0, min(span, int(x) - pad)))
+            return int(QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), pos, span))
+        except Exception:
+            return int(self.value())
+
+    def set_track_thickness(self, px: int):
+        try:
+            self._track_thickness = max(3, int(px))
+        except Exception:
+            self._track_thickness = 6
+        self.update()
 
     def set_aura_speed(self, speed: float):
         """Aura akış hızını ayarla (1.0 = normal)."""
@@ -4145,10 +8063,11 @@ class GradientSlider(QSlider):
         """Etkileşimli Süre Çubuğu: Tıklanan yere anında atla"""
         if event.button() == Qt.LeftButton:
             self._is_seeking = True
-            val = QStyle.sliderValueFromPosition(
-                self.minimum(), self.maximum(), 
-                event.x(), self.width()
-            )
+            try:
+                self.setSliderDown(True)
+            except Exception:
+                pass
+            val = self._value_from_x(event.x())
             self.setValue(val)
             self.sliderMoved.emit(val)
             event.accept()
@@ -4158,10 +8077,7 @@ class GradientSlider(QSlider):
     def mouseMoveEvent(self, event):
         """Mouse drag: Sürekli güncelleme"""
         if self._is_seeking and event.buttons() & Qt.LeftButton:
-            val = QStyle.sliderValueFromPosition(
-                self.minimum(), self.maximum(), 
-                event.x(), self.width()
-            )
+            val = self._value_from_x(event.x())
             self.setValue(val)
             self.sliderMoved.emit(val)
             event.accept()
@@ -4172,10 +8088,11 @@ class GradientSlider(QSlider):
         """Mouse release: Seeking tamamlandı"""
         if event.button() == Qt.LeftButton and self._is_seeking:
             self._is_seeking = False
-            val = QStyle.sliderValueFromPosition(
-                self.minimum(), self.maximum(), 
-                event.x(), self.width()
-            )
+            try:
+                self.setSliderDown(False)
+            except Exception:
+                pass
+            val = self._value_from_x(event.x())
             self.setValue(val)
             self.sliderMoved.emit(val)
             self.sliderReleased.emit()
@@ -4210,9 +8127,15 @@ class GradientSlider(QSlider):
         painter.setRenderHint(QPainter.Antialiasing)
         
         rect = self.rect()
+
+        # Handle ölçüleri (pad'i buna göre ayarlıyoruz)
+        base_r = 8.2 if self._is_seeking else 6.2
+        glow_r = base_r + 6.5
         
-        # 1. Groove (Kanal) - Daha geniş ve estetik
-        groove_rect = rect.adjusted(0, 5, 0, -5)
+        # 1. Groove (Kanal) - İnce + kenarlarda padding (nokta kesilmesin)
+        pad = int(self._effective_pad_px())
+        thick = int(getattr(self, "_track_thickness", 6))
+        groove_rect = QRectF(rect.left() + pad, rect.center().y() - thick / 2.0, rect.width() - pad * 2, thick)
         
         # Groove gradient (koyu -> daha koyu)
         groove_grad = QLinearGradient(groove_rect.topLeft(), groove_rect.bottomLeft())
@@ -4220,18 +8143,19 @@ class GradientSlider(QSlider):
         groove_grad.setColorAt(1.0, QColor(26, 35, 39, 250))
         painter.setBrush(QBrush(groove_grad))
         painter.setPen(QPen(QColor(85, 85, 85, 120), 1))
-        painter.drawRoundedRect(groove_rect, 4, 4)  # Daha yuvarlatılmış
+        painter.drawRoundedRect(groove_rect, 4, 4)
         
         # 2. Progress Aura Gradient - Çok daha parlak ve akıcı
-        if self.maximum() > 0:
-            ratio = self.value() / self.maximum()
-        else:
-            ratio = 0
+        rng = float(self.maximum() - self.minimum())
+        ratio = 0.0
+        if rng > 0:
+            ratio = (float(self.value()) - float(self.minimum())) / rng
+            ratio = max(0.0, min(1.0, ratio))
             
-        width = max(0, min(rect.width(), int(rect.width() * ratio)))
-        progress_rect = groove_rect.adjusted(0, 0, width - rect.width(), 0)
+        width = max(0.0, min(groove_rect.width(), groove_rect.width() * ratio))
+        progress_rect = QRectF(groove_rect.left(), groove_rect.top(), width, groove_rect.height())
         
-        if width > 0:
+        if width > 0.5:
             # Çok renkli gradient aura (tema bazlı veya rainbow)
             grad = QLinearGradient(progress_rect.topLeft(), progress_rect.topRight())
             
@@ -4254,34 +8178,433 @@ class GradientSlider(QSlider):
             painter.drawRoundedRect(progress_rect, 4, 4)
         
         # 3. Animasyonlu Nokta (Handle) - Daha büyük ve parlak
-        def _draw_dot(x_pos):
+        def _draw_dot(x_pos: float):
             dot_pos = QPointF(x_pos, groove_rect.center().y())
-            
-            # Glow efekti
-            glow = QRadialGradient(dot_pos, 9)
+
+            # FX tarzı: ring + hole + glow
+            hc = QColor(76, 255, 220)
             if self._aura_base_hue_f is not None:
-                base_col = QColor.fromHsvF(self._aura_base_hue_f, self._aura_saturation_f, self._aura_value_f)
-                glow.setColorAt(0, QColor(base_col.red(), base_col.green(), base_col.blue(), 220))
-                glow.setColorAt(1, QColor(base_col.red(), base_col.green(), base_col.blue(), 0))
-            else:
-                glow.setColorAt(0, QColor(76, 255, 220, 220))
-                glow.setColorAt(1, QColor(76, 255, 220, 0))
-            
+                hc = QColor.fromHsvF(self._aura_base_hue_f, self._aura_saturation_f, self._aura_value_f)
+
+            glow = QRadialGradient(dot_pos, glow_r)
+            glow_col = QColor(hc)
+            glow_col.setAlpha(235 if self._is_seeking else 190)
+            glow.setColorAt(0.0, glow_col)
+            glow.setColorAt(1.0, QColor(glow_col.red(), glow_col.green(), glow_col.blue(), 0))
             painter.setBrush(QBrush(glow))
             painter.setPen(Qt.NoPen)
-            painter.drawEllipse(dot_pos, 9, 9)
-            
-            # İç nokta (beyaz parlak)
-            painter.setBrush(QColor(255, 255, 255, 240))
-            painter.drawEllipse(dot_pos, 4, 4)
-            
-            # Çok küçük merkez parlama
-            painter.setBrush(QColor(255, 255, 255))
-            painter.drawEllipse(dot_pos, 2, 2)
+            painter.drawEllipse(dot_pos, glow_r, glow_r)
+
+            painter.setBrush(QColor(18, 18, 18, 235))
+            painter.setPen(QPen(hc, 3 if self._is_seeking else 2))
+            painter.drawEllipse(dot_pos, base_r, base_r)
+
+            painter.setBrush(QColor(8, 8, 8, 255))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(dot_pos, max(1.0, base_r - 2.8), max(1.0, base_r - 2.8))
+
+            painter.setBrush(QColor(255, 255, 255, 210))
+            painter.drawEllipse(dot_pos + QPointF(-1.4, -1.4), 1.8, 1.8)
 
         # 4. Handle (Sadece progress pozisyonunda)
         progress_x = groove_rect.left() + groove_rect.width() * ratio
         _draw_dot(progress_x)
+
+
+# ---------------------------------------------------------------------------
+# RAINBOW / FREQUENCY SLIDER (FX params)
+# ---------------------------------------------------------------------------
+class RainbowFrequencySlider(QSlider):
+    """Renkli, modern yatay slider: rainbow track + renk-eşleşen handle + değer balonu."""
+
+    def __init__(self, orientation=Qt.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFixedHeight(26)
+
+        self._shift = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(50)
+        self._anim_timer.timeout.connect(self._animate)
+        self._anim_timer.start()
+
+        self._is_dragging = False
+        self._is_hovered = False
+        self._value_formatter = None
+        self._show_bubble_on_hover = False
+
+    def set_value_formatter(self, formatter):
+        """formatter(int)->str"""
+        self._value_formatter = formatter
+        self.update()
+
+    def set_show_bubble_on_hover(self, enabled: bool):
+        self._show_bubble_on_hover = bool(enabled)
+        self.update()
+
+    def _animate(self):
+        self._shift += 0.02
+        if self._shift > 1.0:
+            self._shift -= 1.0
+        # Sadece hover/drag durumunda animasyon hissi
+        if self._is_hovered or self._is_dragging:
+            self.update()
+
+    def _ratio(self) -> float:
+        rng = float(self.maximum() - self.minimum())
+        if rng <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (float(self.value()) - float(self.minimum())) / rng))
+
+    def _color_at_ratio(self, r: float) -> QColor:
+        # Soldan sağa: kırmızı -> mor (0..270°)
+        hue = int(max(0.0, min(270.0, 270.0 * float(r))))
+        return QColor.fromHsv(hue, 220, 255)
+
+    def _format_value(self) -> str:
+        try:
+            if callable(self._value_formatter):
+                return str(self._value_formatter(int(self.value())))
+        except Exception:
+            pass
+        return str(int(self.value()))
+
+    def enterEvent(self, event):
+        self._is_hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._is_hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._is_dragging = True
+            val = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), event.x(), self.width())
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._is_dragging and (event.buttons() & Qt.LeftButton):
+            val = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), event.x(), self.width())
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._is_dragging:
+            self._is_dragging = False
+            val = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), event.x(), self.width())
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            self.sliderReleased.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = self.rect()
+        # Track alanı
+        track_rect = QRectF(rect.left() + 10, rect.center().y() - 4, rect.width() - 20, 8)
+        r = self._ratio()
+        handle_x = track_rect.left() + track_rect.width() * r
+        handle_pos = QPointF(handle_x, track_rect.center().y())
+
+        # Rainbow gradient (tüm track) - daha soluk
+        # Not: Stop pozisyonları MUTLAKA artan sırada olmalı (aksi halde banding/jitter olur).
+        base_grad = QLinearGradient(track_rect.topLeft(), track_rect.topRight())
+        sh = float(self._shift)
+
+        def _build_rainbow(grad: QLinearGradient, alpha: int, sat: int, val: int, hue_span: float = 300.0):
+            # Daha akıcı geçiş için çoklu stop
+            steps = 28
+            for i in range(steps + 1):
+                t = i / float(steps)
+                hue = (sh * 360.0 + t * hue_span) % 360.0
+                c = QColor.fromHsv(int(hue), int(sat), int(val))
+                c.setAlpha(int(alpha))
+                grad.setColorAt(t, c)
+
+        _build_rainbow(base_grad, alpha=90, sat=210, val=255)
+
+        painter.setPen(QPen(QColor(40, 40, 40, 160), 1))
+        painter.setBrush(QBrush(base_grad))
+        painter.drawRoundedRect(track_rect, 4, 4)
+
+        # Dolu kısım: aynı gradient ama daha parlak
+        filled_rect = QRectF(track_rect.left(), track_rect.top(), max(0.0, handle_x - track_rect.left()), track_rect.height())
+        if filled_rect.width() > 0.5:
+            bright_grad = QLinearGradient(track_rect.topLeft(), track_rect.topRight())
+            _build_rainbow(bright_grad, alpha=220, sat=235, val=255)
+            painter.save()
+            painter.setClipRect(filled_rect)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(bright_grad))
+            painter.drawRoundedRect(track_rect, 4, 4)
+            painter.restore()
+
+        # Handle: renk eşleşen glow + border
+        hc = self._color_at_ratio(r)
+        radius = 7
+        if self._is_dragging:
+            radius = 9
+        elif self._is_hovered:
+            radius = 8
+
+        glow = QRadialGradient(handle_pos, radius + 7)
+        glow_col = QColor(hc)
+        glow_col.setAlpha(160)
+        glow.setColorAt(0.0, glow_col)
+        glow.setColorAt(1.0, QColor(glow_col.red(), glow_col.green(), glow_col.blue(), 0))
+        painter.setBrush(QBrush(glow))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(handle_pos, radius + 7, radius + 7)
+
+        # Ana knob
+        painter.setBrush(QColor(18, 18, 18, 235))
+        painter.setPen(QPen(hc, 2))
+        painter.drawEllipse(handle_pos, radius, radius)
+
+        painter.setBrush(QColor(8, 8, 8, 255))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(handle_pos, max(1.0, radius - 2.8), max(1.0, radius - 2.8))
+
+        painter.setBrush(QColor(255, 255, 255, 210))
+        painter.drawEllipse(handle_pos + QPointF(-1.4, -1.4), 1.8, 1.8)
+
+        # Focus border
+        if self.hasFocus():
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#ff8f00"), 2))
+            painter.drawEllipse(handle_pos, radius + 4, radius + 4)
+
+        # İç highlight
+        painter.setBrush(QColor(255, 255, 255, 220))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(handle_pos + QPointF(-1.5, -1.5), max(2, radius // 3), max(2, radius // 3))
+
+        # Değer balonu (varsayılan: sadece drag)
+        show_bubble = bool(self._is_dragging) or (bool(self._is_hovered) and bool(self._show_bubble_on_hover))
+        if show_bubble:
+            text = self._format_value()
+            font = painter.font()
+            font.setPointSize(11)
+            font.setBold(True)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(text)
+            th = fm.height()
+            pad_x, pad_y = 8, 5
+            bw = tw + pad_x * 2
+            bh = th + pad_y * 2
+            bx = max(rect.left() + 6, min(rect.right() - bw - 6, handle_x - bw / 2))
+            by = track_rect.top() - bh - 10
+
+            bubble_rect = QRectF(bx, by, bw, bh)
+
+            # Bubble background
+            bg = QColor(20, 20, 20, 235)
+            painter.setBrush(bg)
+            painter.setPen(QPen(QColor(60, 60, 60, 160), 1))
+            painter.drawRoundedRect(bubble_rect, 8, 8)
+
+            # Bubble accent line
+            painter.setPen(QPen(hc, 2))
+            painter.drawLine(QPointF(bubble_rect.left() + 8, bubble_rect.bottom()), QPointF(bubble_rect.right() - 8, bubble_rect.bottom()))
+
+            # Text
+            painter.setPen(QColor(230, 230, 230))
+            painter.drawText(bubble_rect, Qt.AlignCenter, text)
+
+            # Tail
+            tail = QPolygonF([
+                QPointF(handle_x, track_rect.top() - 6),
+                QPointF(handle_x - 6, track_rect.top() - 12),
+                QPointF(handle_x + 6, track_rect.top() - 12),
+            ])
+            painter.setBrush(bg)
+            painter.setPen(Qt.NoPen)
+            painter.drawPolygon(tail)
+
+
+# ---------------------------------------------------------------------------
+# RAINBOW VERTICAL SLIDER (EQ bands)
+# ---------------------------------------------------------------------------
+class RainbowEQBandSlider(QSlider):
+    """EQ bandları için dikey rainbow slider: parlak dolu kısım + renk-eşleşen handle."""
+
+    def __init__(self, orientation=Qt.Vertical, parent=None):
+        super().__init__(orientation, parent)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        # Hover/drag'da nokta büyüdüğü için genişlik biraz daha büyük olmalı
+        self.setFixedWidth(26)
+        self._is_dragging = False
+        self._is_hovered = False
+
+        # FX slider'daki gibi akıcı renk döngüsü
+        self._shift = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(50)
+        self._anim_timer.timeout.connect(self._animate)
+        self._anim_timer.start()
+
+    def _animate(self):
+        self._shift += 0.02
+        if self._shift > 1.0:
+            self._shift -= 1.0
+        if self._is_hovered or self._is_dragging:
+            self.update()
+
+    def _ratio(self) -> float:
+        rng = float(self.maximum() - self.minimum())
+        if rng <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (float(self.value()) - float(self.minimum())) / rng))
+
+    def _color_at_ratio(self, r: float) -> QColor:
+        # Alttan üste: kırmızı -> mor (0..300°)
+        hue = (self._shift * 360.0 + max(0.0, min(300.0, 300.0 * float(r)))) % 360.0
+        return QColor.fromHsv(int(hue), 220, 255)
+
+    def enterEvent(self, event):
+        self._is_hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._is_hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def _value_from_pos(self, y: int) -> int:
+        pos = max(0, min(self.height(), self.height() - y))
+        return QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), pos, self.height())
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._is_dragging = True
+            val = self._value_from_pos(event.y())
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._is_dragging and (event.buttons() & Qt.LeftButton):
+            val = self._value_from_pos(event.y())
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._is_dragging:
+            self._is_dragging = False
+            val = self._value_from_pos(event.y())
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            self.sliderReleased.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = self.rect()
+        track_rect = QRectF(rect.center().x() - 4, rect.top() + 8, 8, rect.height() - 16)
+        r = self._ratio()
+        handle_y = track_rect.bottom() - track_rect.height() * r
+        handle_pos = QPointF(track_rect.center().x(), handle_y)
+
+        base_grad = QLinearGradient(track_rect.bottomLeft(), track_rect.topLeft())
+        sh = float(self._shift)
+
+        def _build_rainbow(grad: QLinearGradient, alpha: int, sat: int, val: int, hue_span: float = 300.0):
+            steps = 28
+            for i in range(steps + 1):
+                t = i / float(steps)
+                hue = (sh * 360.0 + t * hue_span) % 360.0
+                c = QColor.fromHsv(int(hue), int(sat), int(val))
+                c.setAlpha(int(alpha))
+                grad.setColorAt(t, c)
+
+        _build_rainbow(base_grad, alpha=90, sat=210, val=255)
+
+        painter.setPen(QPen(QColor(40, 40, 40, 160), 1))
+        painter.setBrush(QBrush(base_grad))
+        painter.drawRoundedRect(track_rect, 4, 4)
+
+        filled_rect = QRectF(track_rect.left(), handle_y, track_rect.width(), track_rect.bottom() - handle_y)
+        if filled_rect.height() > 0.5:
+            bright_grad = QLinearGradient(track_rect.bottomLeft(), track_rect.topLeft())
+            _build_rainbow(bright_grad, alpha=220, sat=235, val=255)
+            painter.save()
+            painter.setClipRect(filled_rect)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(bright_grad))
+            painter.drawRoundedRect(track_rect, 4, 4)
+            painter.restore()
+
+        hc = self._color_at_ratio(r)
+        radius = 7
+        if self._is_dragging:
+            radius = 10
+        elif self._is_hovered:
+            radius = 9
+
+        # Glow çok büyürse widget sınırlarında kesilme daha belirgin olur
+        glow = QRadialGradient(handle_pos, radius + 3)
+        glow_col = QColor(hc)
+        glow_alpha = 160
+        if self._is_dragging:
+            glow_alpha = 235
+        elif self._is_hovered:
+            glow_alpha = 205
+        glow_col.setAlpha(glow_alpha)
+        glow.setColorAt(0.0, glow_col)
+        glow.setColorAt(1.0, QColor(glow_col.red(), glow_col.green(), glow_col.blue(), 0))
+        painter.setBrush(QBrush(glow))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(handle_pos, radius + 3, radius + 3)
+
+        painter.setBrush(QColor(18, 18, 18, 235))
+        ring_w = 2
+        if self._is_dragging:
+            ring_w = 3
+        elif self._is_hovered:
+            ring_w = 3
+        painter.setPen(QPen(hc, ring_w))
+        painter.drawEllipse(handle_pos, radius, radius)
+
+        # Inner hole
+        painter.setBrush(QColor(8, 8, 8, 255))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(handle_pos, max(1.0, radius - 2.8), max(1.0, radius - 2.8))
+
+        # Tiny highlight
+        painter.setBrush(QColor(255, 255, 255, 210))
+        painter.drawEllipse(handle_pos + QPointF(-1.4, -1.4), 1.8, 1.8)
+
+        if self.hasFocus():
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#ff8f00"), 2))
+            painter.drawEllipse(handle_pos, radius + 3, radius + 3)
 
 # ---------------------------------------------------------------------------
 # VIDEO DISPLAY WIDGET (Flip & Transform Support)
@@ -4591,6 +8914,46 @@ class SeekSlider(QSlider):
 # ÇALMA LİSTESİ WIDGET
 # ---------------------------------------------------------------------------
 
+# Clementine benzeri oynayan-satır vurgusu için özel rol
+NOW_PLAYING_ROLE = Qt.UserRole + 1001
+
+
+class _NowPlayingPillDelegate(QStyledItemDelegate):
+    """Oynayan satırı mavi, uçları kavisli (pill) olarak çizer."""
+
+    def paint(self, painter, option, index):
+        try:
+            is_now_playing = bool(index.data(NOW_PLAYING_ROLE))
+        except Exception:
+            is_now_playing = False
+
+        if is_now_playing:
+            painter.save()
+            try:
+                painter.setRenderHint(QPainter.Antialiasing)
+                r = option.rect.adjusted(6, 2, -6, -2)
+                rr = QRectF(r)
+                radius = max(6.0, min(rr.height() / 2.0, 14.0))
+
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(64, 196, 255, 210))
+                painter.drawRoundedRect(rr, radius, radius)
+            finally:
+                painter.restore()
+
+            # Default paint ama seçim dikdörtgenini bastır, yazıyı koyulaştır
+            try:
+                opt = QStyleOptionViewItem(option)
+                opt.state &= ~QStyle.State_Selected
+                opt.state &= ~QStyle.State_HasFocus
+                opt.palette.setColor(QPalette.Text, QColor(0, 0, 0))
+                opt.palette.setColor(QPalette.HighlightedText, QColor(0, 0, 0))
+                return super().paint(painter, opt, index)
+            except Exception:
+                pass
+
+        return super().paint(painter, option, index)
+
 class PlaylistListWidget(QListWidget):
     def __init__(self, parent=None, player=None):
         super().__init__(parent)
@@ -4600,6 +8963,14 @@ class PlaylistListWidget(QListWidget):
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QListWidget.InternalMove)
         self.setSelectionMode(QListWidget.ExtendedSelection)
+        try:
+            self.setIconSize(QSize(16, 16))
+        except Exception:
+            pass
+        try:
+            self.setItemDelegate(_NowPlayingPillDelegate(self))
+        except Exception:
+            pass
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -5008,7 +9379,7 @@ class AnimatedVisualizationWidget(QWidget):
     # 🎚️ VİZÜEL YÜKSEKLIK ÖLÇEK FAKTÖRÜ (0.0-1.0)
     # Çubukların maksimum yüksekliğini kontrol eder
     VISUAL_SCALE = 1.0  # %100 yükseklik (eski: 0.25 - çok küçüktü)
-    # Angolla bar analyzer parametreleri (orijinal kColumnWidth, roof sayısı vb.)
+    # Aurivo bar analyzer parametreleri (orijinal kColumnWidth, roof sayısı vb.)
     CLEM_COLUMN_WIDTH = 4
     CLEM_NUM_ROOFS = 16
     CLEM_ROOF_VELOCITY_REDUCTION = 32
@@ -5059,7 +9430,7 @@ class AnimatedVisualizationWidget(QWidget):
         self.mid_intensity = 0.0   # Mid analizi
         self.treble_intensity = 0.0  # Treble analizi
         self.waveform_data = []  # Circular Waveform için
-        # Angolla bar analyzer durum önbelleği
+        # Aurivo bar analyzer durum önbelleği
         self._clem_state = None
         self._clem_turbine_state = None
         self._clem_boom_state = None
@@ -5094,7 +9465,7 @@ class AnimatedVisualizationWidget(QWidget):
         parent = self.parent()
         if isinstance(parent, VisualizationWindow):
             parent = parent.player
-        if isinstance(parent, AngollaPlayer):
+        if isinstance(parent, AurivoPlayer):
             parent._on_visual_mode_changed_external(mode)
 
     def set_vis_config(self, sensitivity: int, color_intensity: int, density: int):
@@ -5143,7 +9514,7 @@ class AnimatedVisualizationWidget(QWidget):
             min(self._cached_bar_color.blue() + 30, 255),
             255
         )
-        # Tema değiştiğinde Angolla cache'lerini yenile
+        # Tema değiştiğinde Aurivo cache'lerini yenile
         self._clem_state = None
         self._clem_turbine_state = None
         self._clem_boom_state = None
@@ -5191,13 +9562,13 @@ class AnimatedVisualizationWidget(QWidget):
 
     def update_sound_data(self, intensity: float, band_data: list):
         """
-        FFT verisini alır, dB dönüşümü ve Angolla-tarzı smoothing uygular.
+        FFT verisini alır, dB dönüşümü ve Aurivo-tarzı smoothing uygular.
         
         İyileştirmeler:
         1. dB ölçeğine dönüşüm (20 * log10)
         2. RMS tabanlı auto-gain normalizasyon
         3. Adaptif ölçekleme (son 30 frame ortalaması)
-        4. Angolla attack/release (hızlı yükseliş, yavaş düşüş)
+        4. Aurivo attack/release (hızlı yükseliş, yavaş düşüş)
         5. Maksimum değer sınırlama (clamp)
         6. Optimize edilmiş performans
         """
@@ -5241,7 +9612,7 @@ class AnimatedVisualizationWidget(QWidget):
             linear_vals = [10.0 ** (db / 20.0) for db in db_data]
             rms = math.sqrt(sum(v * v for v in linear_vals) / len(linear_vals))
             
-            # ========== 3. ADAPTİF ÖLÇEKLENDİRME (Angolla Gain Auto-Normalization) ==========
+            # ========== 3. ADAPTİF ÖLÇEKLENDİRME (Aurivo Gain Auto-Normalization) ==========
             # Son 30 frame'in RMS ortalamasını tut
             if not hasattr(self, 'rms_history'):
                 self.rms_history = deque(maxlen=30)  # Son 30 frame
@@ -5305,15 +9676,15 @@ class AnimatedVisualizationWidget(QWidget):
         if not hasattr(self, "smooth_bands") or len(self.smooth_bands) != n:
             self.smooth_bands = [0.0] * n
 
-        # Per-bar peak caps (Angolla style)
+        # Per-bar peak caps (Aurivo style)
         if not hasattr(self, "bar_caps") or len(self.bar_caps) != n:
             self.bar_caps = [0.0] * n
 
-        # ========== 4. ANGOLLA TARZI SMOOTHING (Seri Hareket Ayarları) ==========
+        # ========== 4. AURIVO TARZI SMOOTHING (Seri Hareket Ayarları) ==========
         parent = self.parent()
         if isinstance(parent, VisualizationWindow):
             parent = parent.player
-        is_web = isinstance(parent, AngollaPlayer) and getattr(parent, "search_mode", "") == "web"
+        is_web = isinstance(parent, AurivoPlayer) and getattr(parent, "search_mode", "") == "web"
 
         # Attack: hızlı yükseliş (Web için çok daha seri: 0.85)
         # Release: kontrollü düşüş (Web için daha hızlı: 0.45)
@@ -5337,7 +9708,7 @@ class AnimatedVisualizationWidget(QWidget):
             
             out[i] = v
 
-            # Caps: Çubuk başı çizgileri (Angolla style peaks)
+            # Caps: Çubuk başı çizgileri (Aurivo style peaks)
             cap_val = self.bar_caps[i]
             if v > cap_val:
                 # Cap yükselişi - anlık (daha zıplayan)
@@ -5519,14 +9890,14 @@ class AnimatedVisualizationWidget(QWidget):
             self._draw_circles_mode(painter, w, h, display_data)
         elif effective_mode == "Spektrum Çubukları":
             self._draw_spectrum_mode(painter, w, h, display_data)
-        elif effective_mode == "Angolla Analyzer":
-            self._draw_angolla_bar_analyzer(painter, w, h, display_data)
-        elif effective_mode == "Angolla Turbine":
-            self._draw_angolla_turbine(painter, w, h, display_data)
-        elif effective_mode == "Angolla Boom":
-            self._draw_angolla_boom(painter, w, h, display_data)
-        elif effective_mode == "Angolla Block":
-            self._draw_angolla_block(painter, w, h, display_data)
+        elif effective_mode == "Aurivo Analyzer":
+            self._draw_aurivo_bar_analyzer(painter, w, h, display_data)
+        elif effective_mode == "Aurivo Turbine":
+            self._draw_aurivo_turbine(painter, w, h, display_data)
+        elif effective_mode == "Aurivo Boom":
+            self._draw_aurivo_boom(painter, w, h, display_data)
+        elif effective_mode == "Aurivo Block":
+            self._draw_aurivo_block(painter, w, h, display_data)
         elif effective_mode == "Enerji Halkaları":
             self._draw_energy_rings_mode(painter, w, h, display_data)
         elif effective_mode == "Dalga Formu":
@@ -5614,31 +9985,31 @@ class AnimatedVisualizationWidget(QWidget):
             self.bar_style_mode = "glass"
         elif mode == "Spektrum Çubukları":  # Default mode için de RGB aktif
             self.bar_style_mode = "solid_with_cap"
-        elif mode == "Angolla Analyzer":
+        elif mode == "Aurivo Analyzer":
             self.bar_style_mode = "solid_with_cap"
-            # Angolla barlar için tek renk döngüsü (orijinal tarza yakın)
+            # Aurivo barlar için tek renk döngüsü (orijinal tarza yakın)
             if self.bar_color_mode == "NORMAL":
                 self.bar_color_mode = "RGB"
             self._clem_state = None  # Renk/ölçek yeniden hesaplansın
-        elif mode == "Angolla Turbine":
+        elif mode == "Aurivo Turbine":
             self.bar_style_mode = "solid_with_cap"
             if self.bar_color_mode == "NORMAL":
                 self.bar_color_mode = "RGB"
             self._clem_turbine_state = None
-        elif mode == "Angolla Boom":
+        elif mode == "Aurivo Boom":
             self.bar_style_mode = "solid_with_cap"
             if self.bar_color_mode == "NORMAL":
                 self.bar_color_mode = "RGB"
             self._clem_boom_state = None
-        elif mode == "Angolla Block":
+        elif mode == "Aurivo Block":
             self.bar_style_mode = "solid_with_cap"
             if self.bar_color_mode == "NORMAL":
                 self.bar_color_mode = "RGB"
             self._clem_block_state = None
 
-    def _ensure_angolla_state(self, w: int, h: int, band_count: int):
+    def _ensure_aurivo_state(self, w: int, h: int, band_count: int):
         """
-        Angolla Bar Analyzer için durum (roof, gradient, mapper) önbelleği.
+        Aurivo Bar Analyzer için durum (roof, gradient, mapper) önbelleği.
         Orijinal kColumnWidth, roof düşüş hızı ve log ölçeklemeyi uygular.
         """
         if w <= 0 or h <= 0 or band_count <= 0:
@@ -5653,7 +10024,7 @@ class AnimatedVisualizationWidget(QWidget):
 
         max_down = -max(1, h // 50)
         max_up = max(1, h // 25)
-        # Log ölçek (Angolla baranalyzer ile aynı yaklaşım)
+        # Log ölçek (Aurivo baranalyzer ile aynı yaklaşım)
         F = (h - 2) / (math.log10(255) * 1.0) if h > 2 else 1.0
         lvl_mapper = [int(F * math.log10(x + 1)) for x in range(256)]
 
@@ -5706,9 +10077,9 @@ class AnimatedVisualizationWidget(QWidget):
         }
         return self._clem_state
 
-    def _draw_angolla_bar_analyzer(self, painter, w, h, data):
+    def _draw_aurivo_bar_analyzer(self, painter, w, h, data):
         """
-        Angolla Bar Analyzer portu:
+        Aurivo Bar Analyzer portu:
         - Log ölçekli amplitude → yükseklik eşlemesi (lvl_mapper)
         - Roof/peak çizgileri ve düşüş hızı
         - Motion blur için roof geçmişi
@@ -5717,7 +10088,7 @@ class AnimatedVisualizationWidget(QWidget):
         if not data:
             return
 
-        state = self._ensure_angolla_state(w, h, len(data))
+        state = self._ensure_aurivo_state(w, h, len(data))
         if not state:
             return
 
@@ -5809,7 +10180,7 @@ class AnimatedVisualizationWidget(QWidget):
                 else:
                     state["roof_velocity"][i] += 1
 
-    def _ensure_angolla_turbine_state(self, w: int, h: int, band_count: int):
+    def _ensure_aurivo_turbine_state(self, w: int, h: int, band_count: int):
         if w <= 0 or h <= 0 or band_count <= 0:
             return None
         fg = QColor(self.primary_color)
@@ -5851,11 +10222,11 @@ class AnimatedVisualizationWidget(QWidget):
         }
         return self._clem_turbine_state
 
-    def _draw_angolla_turbine(self, painter, w, h, data):
+    def _draw_aurivo_turbine(self, painter, w, h, data):
         """
-        Angolla Turbine: merkezden yukarı/aşağı simetrik barlar + tepe çizgileri.
+        Aurivo Turbine: merkezden yukarı/aşağı simetrik barlar + tepe çizgileri.
         """
-        state = self._ensure_angolla_turbine_state(w, h, len(data))
+        state = self._ensure_aurivo_turbine_state(w, h, len(data))
         if not state:
             return
 
@@ -5922,7 +10293,7 @@ class AnimatedVisualizationWidget(QWidget):
             painter.drawLine(x, peak_y_top, x + cw, peak_y_top)
             painter.drawLine(x, peak_y_bottom, x + cw, peak_y_bottom)
 
-    def _ensure_angolla_boom_state(self, w: int, h: int, band_count: int):
+    def _ensure_aurivo_boom_state(self, w: int, h: int, band_count: int):
         if w <= 0 or h <= 0 or band_count <= 0:
             return None
         fg = QColor(self.primary_color)
@@ -5964,11 +10335,11 @@ class AnimatedVisualizationWidget(QWidget):
         }
         return self._clem_boom_state
 
-    def _draw_angolla_boom(self, painter, w, h, data):
+    def _draw_aurivo_boom(self, painter, w, h, data):
         """
-        Angolla Boom: alt hizalı barlar + tepe çizgisi.
+        Aurivo Boom: alt hizalı barlar + tepe çizgisi.
         """
-        state = self._ensure_angolla_boom_state(w, h, len(data))
+        state = self._ensure_aurivo_boom_state(w, h, len(data))
         if not state:
             return
 
@@ -6030,7 +10401,7 @@ class AnimatedVisualizationWidget(QWidget):
             painter.setPen(midlight)
             painter.drawLine(x, peak_y, x + cw, peak_y)
 
-    def _ensure_angolla_block_state(self, w: int, h: int, band_count: int):
+    def _ensure_aurivo_block_state(self, w: int, h: int, band_count: int):
         if w <= 0 or h <= 0 or band_count <= 0:
             return None
         fg = QColor(self.primary_color)
@@ -6065,11 +10436,11 @@ class AnimatedVisualizationWidget(QWidget):
         }
         return self._clem_block_state
 
-    def _draw_angolla_block(self, painter, w, h, data):
+    def _draw_aurivo_block(self, painter, w, h, data):
         """
-        Angolla Block Analyzer: grid üzerinde bar blokları (basitleştirilmiş).
+        Aurivo Block Analyzer: grid üzerinde bar blokları (basitleştirilmiş).
         """
-        state = self._ensure_angolla_block_state(w, h, len(data))
+        state = self._ensure_aurivo_block_state(w, h, len(data))
         if not state:
             return
 
@@ -6194,12 +10565,12 @@ class AnimatedVisualizationWidget(QWidget):
 
     def _draw_spectrum_mode(self, painter, w, h, data):
         """
-        Angolla Tarzı Spektrum Çubukları - Gerçek FFT Tabanlı Görselleştirme
+        Aurivo Tarzı Spektrum Çubukları - Gerçek FFT Tabanlı Görselleştirme
         
         ÖZELLİKLER:
         - 96 bantlı logaritmik frekans spektrumu (20Hz-20kHz)
         - Smooth attack/release ile yumuşak animasyon
-        - Per-bar peak caps (Angolla tarzı tepeler)
+        - Per-bar peak caps (Aurivo tarzı tepeler)
         - Gradient HSV renklendirme (bass: mavi → treble: kırmızı)
         - Anti-aliasing ile pürüzsüz çizim
         - EQ kazançlarına duyarlı
@@ -6232,7 +10603,7 @@ class AnimatedVisualizationWidget(QWidget):
             y = h - bar_h
             
             # Renk hesaplama
-            # 🌈 PSYCHEDELIC COLORS (Angolla tarzı) - TEK RENK DÖNGÜSÜ
+            # 🌈 PSYCHEDELIC COLORS (Aurivo tarzı) - TEK RENK DÖNGÜSÜ
             if getattr(self, 'psychedelic_mode', False) or use_gradient:
                 # Kullanıcı isteği: "Herbir ritim çubuğu için değil, hepsi bir renk efekti olsun"
                 # Yani tüm çubuklar AYNI anda AYNI rengi alarak döngüye girsin.
@@ -6279,7 +10650,7 @@ class AnimatedVisualizationWidget(QWidget):
                 # İnce çubuklar: basit rect
                 painter.drawRect(int(x + gap/2), y, int(actual_bar_w), bar_h)
             
-            # Peak cap (Angolla tarzı tepe çizgisi)
+            # Peak cap (Aurivo tarzı tepe çizgisi)
             if hasattr(self, 'bar_caps') and i < len(self.bar_caps):
                 cap_val = self.bar_caps[i]
                 cap_h = int(cap_val * max_h * sens_multiplier)
@@ -6992,25 +11363,25 @@ class AnimatedVisualizationWidget(QWidget):
 
     def _draw_status_bars(self, painter, w, h, display_data):
         """
-        Angolla tarzı ritim çubukları - basit ve temiz.
+        Aurivo tarzı ritim çubukları - basit ve temiz.
         Tüm ekran alanını dolduruyor. Sağ kenarı garantile.
         """
         if not display_data or w <= 0 or h <= 0:
             return
 
-        # Eğer stil Angolla seçildiyse aynı bar analyzer portunu kullan
+        # Eğer stil Aurivo seçildiyse aynı bar analyzer portunu kullan
         style_mode = getattr(self, "bar_style_mode", "")
-        if style_mode == "angolla":
-            self._draw_angolla_bar_analyzer(painter, w, h, display_data)
+        if style_mode == "aurivo":
+            self._draw_aurivo_bar_analyzer(painter, w, h, display_data)
             return
         if style_mode == "turbin":
-            self._draw_angolla_turbine(painter, w, h, display_data)
+            self._draw_aurivo_turbine(painter, w, h, display_data)
             return
         if style_mode == "boom":
-            self._draw_angolla_boom(painter, w, h, display_data)
+            self._draw_aurivo_boom(painter, w, h, display_data)
             return
         if style_mode == "block":
-            self._draw_angolla_block(painter, w, h, display_data)
+            self._draw_aurivo_block(painter, w, h, display_data)
             return
 
         # Gösterilecek bar sayısı - update_sound_data ile senkronize et
@@ -7249,7 +11620,7 @@ class AnimatedVisualizationWidget(QWidget):
         styles = [
             "solid", "solid_with_cap", "glass", "rounded", "capsule",
             "neon_glow", "luminous", "pixel", "striped", "dots", "hollow",
-            "outline", "gradient", "tri_step", "turbin", "boom", "block", "angolla"
+            "outline", "gradient", "tri_step", "turbin", "boom", "block", "aurivo"
         ]
         style_names = {
             "solid": "⬜ Klasik Düz",
@@ -7269,7 +11640,7 @@ class AnimatedVisualizationWidget(QWidget):
             "turbin": "🌀 Türbin",
             "boom": "💥 Boom",
             "block": "🧱 Block Analyzer",
-            "angolla": "🎵 Angolla (roof + blur)"
+            "aurivo": "🎵 Aurivo (roof + blur)"
         }
         
         for style in styles:
@@ -7486,7 +11857,7 @@ class AnimatedVisualizationWidget(QWidget):
         self.update()
 
     # ------------------------------------------------------------------#
-    # 🎇 YENİ GELİŞMİŞ GÖRSELLEŞTİRME MODLARI (Angolla Tarzı)
+    # 🎇 YENİ GELİŞMİŞ GÖRSELLEŞTİRME MODLARI (Aurivo Tarzı)
     # ------------------------------------------------------------------#
 
     def _spawn_energy_pulse(self):
@@ -8167,7 +12538,7 @@ class AnimatedVisualizationWidget(QWidget):
         menu = QMenu(self)
         app = QApplication.instance()
         from_main = next(
-            (w for w in app.topLevelWidgets() if isinstance(w, AngollaPlayer)),
+            (w for w in app.topLevelWidgets() if isinstance(w, AurivoPlayer)),
             None
         )
         favorites = set(from_main.vis_favorites) if from_main else set()
@@ -8235,7 +12606,7 @@ class AnimatedVisualizationWidget(QWidget):
 class VisualizationWindow(QMainWindow):
     def __init__(self, player):
         super().__init__()
-        self.setWindowTitle("Angolla Görselleştirme")
+        self.setWindowTitle("Aurivo Görselleştirme")
         self.resize(800, 600)
 
         self.player = player
@@ -8281,7 +12652,7 @@ class VisualizationWindow(QMainWindow):
 # ANA OYUNCU
 # ---------------------------------------------------------------------------
 
-class AngollaPlayer(QMainWindow):
+class AurivoPlayer(QMainWindow):
 
     class _VideoOnlyProxyModel(QSortFilterProxyModel):
         """Video panelinde sadece klasörler + video dosyalarını göster."""
@@ -8350,7 +12721,7 @@ class AngollaPlayer(QMainWindow):
         return
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Angolla Music Player - Angolla Tarzı (Gelişmiş)")
+        self.setWindowTitle("Aurivo Music Player - Aurivo Tarzı (Gelişmiş)")
         self.setGeometry(100, 100, 1200, 820)
         self.vis_modes = self._build_visual_modes()
         self.vis_favorites = []
@@ -8428,7 +12799,7 @@ class AngollaPlayer(QMainWindow):
             "Ice": ("#7AD7F0", "#E0F7FA", "#0A1C24"),
         }
 
-        self.vis_mode = "Spektrum Çubukları"  # Varsayılan: Angolla tarzı FFT spektrum
+        self.vis_mode = "Spektrum Çubukları"  # Varsayılan: Aurivo tarzı FFT spektrum
         self.use_projectm = False  # ProjectM kullan/kullanma
         self.is_shuffling = False
         self.is_repeating = False
@@ -8564,7 +12935,7 @@ class AngollaPlayer(QMainWindow):
         base_modes = [
             "Çizgiler", "Daireler", "Spektrum Çubukları",
             "Ayna",
-            "Angolla Analyzer", "Angolla Turbine", "Angolla Boom", "Angolla Block",
+            "Aurivo Analyzer", "Aurivo Turbine", "Aurivo Boom", "Aurivo Block",
             "Enerji Halkaları", "Dalga Formu", "Pulsar", "Spiral", "Volcano",
             "Işın Çakışması", "Çift Spektrum", "Radyal Izgara", "Parıltı Dalgası",
             "Neon Aura", "Kristal Spektrum", "İnferno", "Aurora", "3D Çubuklar",
@@ -8617,11 +12988,11 @@ class AngollaPlayer(QMainWindow):
             return
         
         # Profil
-        profile = QWebEngineProfile("angolla_secure_profile", self)
+        profile = QWebEngineProfile("aurivo_secure_profile", self)
         # Tüm isteklerde allowlist + HTTPS zorunluluğu (mümkünse)
         try:
             if QWebEngineUrlRequestInterceptor is not None and hasattr(profile, "setRequestInterceptor"):
-                profile.setRequestInterceptor(AngollaWebRequestInterceptor(profile))
+                profile.setRequestInterceptor(AurivoWebRequestInterceptor(profile))
         except Exception:
             pass
         try:
@@ -8682,7 +13053,7 @@ class AngollaPlayer(QMainWindow):
         except Exception:
             pass
 
-        self.web_page = AngollaWebPage(profile, self.web_view)
+        self.web_page = AurivoWebPage(profile, self.web_view)
         self.web_view.setPage(self.web_page)
         try:
             self.web_view.settings().setAttribute(QWebEngineSettings.FullScreenSupportEnabled, True)
@@ -8724,7 +13095,7 @@ class AngollaPlayer(QMainWindow):
             globals()['BRIDGE_ALLOWED_SITES'] = bs
         except Exception as e:
             print(f"Whitelist uygulama hatası: {e}")
-        channel.registerObject("AngollaBridge", self.web_bridge)
+        channel.registerObject("AurivoBridge", self.web_bridge)
         try:
             self.web_page.setWebChannel(channel)
         except Exception:
@@ -8789,7 +13160,7 @@ class AngollaPlayer(QMainWindow):
 
         # Başlangıç sayfası
         try:
-            self.web_view.setHtml("<html><body style='background:#111;color:#eee;font-family:sans-serif'>Angolla Güvenli Web Görünümü</body></html>")
+            self.web_view.setHtml("<html><body style='background:#111;color:#eee;font-family:sans-serif'>Aurivo Güvenli Web Görünümü</body></html>")
         except Exception:
             pass
 
@@ -8960,16 +13331,16 @@ class AngollaPlayer(QMainWindow):
         # 2. Ultra-Seri Reklam Geçme (Fast Action Skip)
         ad_skip_js = """
         (function() {
-            console.log('🚀 Angolla Ultra-Seri Ad Skip Active');
-            if (window.__angollaTakInterval) clearInterval(window.__angollaTakInterval);
+            console.log('🚀 Aurivo Ultra-Seri Ad Skip Active');
+            if (window.__aurivoTakInterval) clearInterval(window.__aurivoTakInterval);
 
-            window.__angollaTakInterval = setInterval(function() {
+            window.__aurivoTakInterval = setInterval(function() {
                 try {
                     // Algoritma: Buton oluştuğu milisaniyede tıkla
                     var skipBtn = document.querySelector('.ytp-ad-skip-button-modern, .ytp-ad-skip-button, .ytp-skip-ad-button');
                     if (skipBtn) {
                         skipBtn.click();
-                        console.log('Angolla: Ad Skipped (Click)');
+                        console.log('Aurivo: Ad Skipped (Click)');
                     }
 
                     // Seri Geçiş: 5sn zorunlu reklamlar için 16x hız
@@ -8984,7 +13355,7 @@ class AngollaPlayer(QMainWindow):
             }, 100); // 100ms Watcher (Gözcü)
             
             console.log('✅ Fast Action Skip System ACTIVE');
-            window.angollaAdSkipActive = true;
+            window.aurivoAdSkipActive = true;
         })();
         """
         
@@ -8998,7 +13369,7 @@ class AngollaPlayer(QMainWindow):
     def _inject_ad_skip_js_retry(self):
         """1 saniye sonra tekrar inject et."""
         retry_js = """
-        if (!window.angollaAdSkipActive) {
+        if (!window.aurivoAdSkipActive) {
             console.log('⚠ Ad skip not active, injecting again...');
             // Re-run the full script
             (function() {
@@ -9027,7 +13398,7 @@ class AngollaPlayer(QMainWindow):
                         }
                     });
                 }, 25);
-                window.angollaAdSkipActive = true;
+                window.aurivoAdSkipActive = true;
             })();
         } else {
             console.log('✓ Ad skip already active');
@@ -9270,7 +13641,7 @@ class AngollaPlayer(QMainWindow):
             js_code = web_engine_handler.build_ad_skip_js(250)
 
             js_script = QWebEngineScript()
-            js_script.setName('AngollaJS')
+            js_script.setName('AurivoJS')
             js_script.setSourceCode(js_code)
             js_script.setInjectionPoint(QWebEngineScript.DocumentReady if has_ready else QWebEngineScript.DocumentCreation)
             if hasattr(QWebEngineScript, 'MainWorld'):
@@ -9280,7 +13651,7 @@ class AngollaPlayer(QMainWindow):
             js_script.setRunsOnSubFrames(True)
             ok_js = self.web_page.scripts().insert(js_script)
             print(f"   • JS script inserted: {bool(ok_js)}")
-            print("✅ Angolla TAK TAK TAK (static) prepared for subframes")
+            print("✅ Aurivo TAK TAK TAK (static) prepared for subframes")
         except Exception as e:
             print(f"⚠ Failed enabling static scripts: {e}")
 
@@ -9322,7 +13693,7 @@ class AngollaPlayer(QMainWindow):
             return
         try:
             script = QWebEngineScript()
-            script.setName("AngollaQWebChannel")
+            script.setName("AurivoQWebChannel")
             script.setSourceCode(src)
             if hasattr(QWebEngineScript, 'DocumentCreation'):
                 script.setInjectionPoint(QWebEngineScript.DocumentCreation)
@@ -9359,10 +13730,8 @@ class AngollaPlayer(QMainWindow):
             self.prevButton: "media-skip-backward.png",   # önceki parça
             self.playButton: "media-playback-start.png",  # play
             self.nextButton: "media-skip-forward.png",    # sonraki parça
-            # Not: bazı ikon setlerinde forward/backward dosya yönleri ters olabiliyor;
-            # kullanıcı beklentisi: soldaki sola, sağdaki sağa baksın.
-            self.seekBackwardButton: "media-seek-forward.png",   # 10sn geri (ikon yön düzeltme)
-            self.seekForwardButton: "media-seek-backward.png",   # 10sn ileri (ikon yön düzeltme)
+            self.seekBackwardButton: "seek10_fwd.svg",  # 10sn geri (ikon dosyası yönü ters)
+            self.seekForwardButton: "seek10_back.svg",  # 10sn ileri
         }
         for btn, icon_name in icon_map.items():
             btn.setIcon(QIcon(os.path.join("icons", icon_name)))
@@ -9443,9 +13812,73 @@ class AngollaPlayer(QMainWindow):
         self._aura_timer.start()
 
         # EQ Button (Bottom Bar)
-        self.eqButton = QPushButton("🎛️")
-        self.eqButton.setFixedSize(32, 32)
+        def _make_bordered_icon(kind: str, size: int = 22) -> QIcon:
+            pm = QPixmap(size, size)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+
+            # Border box
+            box = QRectF(1.0, 1.0, size - 2.0, size - 2.0)
+            p.setBrush(QColor(0, 0, 0, 0))
+            p.setPen(QPen(QColor(90, 90, 90, 220), 1.5))
+            p.drawRoundedRect(box, 5, 5)
+
+            fg = QColor(216, 216, 216, 240)
+            accent = QColor(64, 196, 255, 240)
+
+            if kind == "fx":
+                # 3 küçük slider çizgisi
+                p.setPen(QPen(fg, 1.6, Qt.SolidLine, Qt.RoundCap))
+                xs = [size * 0.35, size * 0.50, size * 0.65]
+                ys_top = [size * 0.33, size * 0.28, size * 0.38]
+                ys_bot = [size * 0.72, size * 0.75, size * 0.70]
+                for x, yt, yb in zip(xs, ys_top, ys_bot):
+                    p.drawLine(QPointF(x, yt), QPointF(x, yb))
+                # küçük knoblar
+                p.setBrush(QColor(18, 18, 18, 235))
+                p.setPen(QPen(accent, 1.8))
+                p.drawEllipse(QPointF(xs[0], size * 0.52), 2.6, 2.6)
+                p.drawEllipse(QPointF(xs[1], size * 0.44), 2.6, 2.6)
+                p.drawEllipse(QPointF(xs[2], size * 0.58), 2.6, 2.6)
+
+            elif kind in ("vol", "mute"):
+                # Speaker
+                p.setBrush(fg)
+                p.setPen(Qt.NoPen)
+                bx = size * 0.30
+                by = size * 0.42
+                bw = size * 0.13
+                bh = size * 0.16
+                p.drawRoundedRect(QRectF(bx, by, bw, bh), 1.5, 1.5)
+                horn = QPolygonF([
+                    QPointF(size * 0.43, size * 0.40),
+                    QPointF(size * 0.55, size * 0.33),
+                    QPointF(size * 0.55, size * 0.67),
+                    QPointF(size * 0.43, size * 0.60),
+                ])
+                p.drawPolygon(horn)
+
+                if kind == "mute":
+                    p.setPen(QPen(QColor(255, 70, 70, 240), 2.0, Qt.SolidLine, Qt.RoundCap))
+                    p.drawLine(QPointF(size * 0.63, size * 0.36), QPointF(size * 0.78, size * 0.64))
+                    p.drawLine(QPointF(size * 0.78, size * 0.36), QPointF(size * 0.63, size * 0.64))
+                else:
+                    # Waves
+                    p.setBrush(Qt.NoBrush)
+                    p.setPen(QPen(accent, 1.6, Qt.SolidLine, Qt.RoundCap))
+                    p.drawArc(QRectF(size * 0.56, size * 0.36, size * 0.22, size * 0.28), -35 * 16, 70 * 16)
+                    p.setPen(QPen(accent, 1.2, Qt.SolidLine, Qt.RoundCap))
+                    p.drawArc(QRectF(size * 0.58, size * 0.40, size * 0.16, size * 0.20), -35 * 16, 70 * 16)
+
+            p.end()
+            return QIcon(pm)
+
+        self.eqButton = QPushButton("")
+        self.eqButton.setFixedSize(38, 38)
         self.eqButton.setToolTip("DSP Equalizer")
+        self.eqButton.setIcon(QIcon(os.path.join("icons", "audio_effects.svg")))
+        self.eqButton.setIconSize(QSize(26, 26))
         self.eqButton.setStyleSheet("""
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -9486,11 +13919,14 @@ class AngollaPlayer(QMainWindow):
         # Volume Slider - Modern gradient efektli
         self.volumeSlider = GradientSlider(Qt.Horizontal)
         self.volumeSlider.setMinimumWidth(100)
-        self.volumeSlider.setFixedHeight(16)  # Biraz daha ince
+        self.volumeSlider.setFixedHeight(20)  # Handle kesilmesin (track yine ince)
+        self.volumeSlider.set_track_thickness(6)
         self.volumeSlider.setRange(0, 100)
         self.volumeSlider.setValue(70)
 
         self.positionSlider = GradientSlider(Qt.Horizontal)
+        self.positionSlider.setFixedHeight(20)  # Handle kesilmesin (track yine ince)
+        self.positionSlider.set_track_thickness(5)
         self.lblCurrentTime = QLabel("00:00")
         self.lblCurrentTime.setStyleSheet("color: #40C4FF; font-weight: bold; font-family: 'Segoe UI', sans-serif; font-size: 13px;")
         self.lblCurrentTime.setFixedWidth(50)
@@ -9553,16 +13989,17 @@ class AngollaPlayer(QMainWindow):
         self._web_fullscreen_window = None
         # Etkinleştir: özel bağlam menüsü için politika
         self.playlistWidget.setContextMenuPolicy(Qt.CustomContextMenu)
-        # Ayarlar menüsü
-        settings_action = QAction("⚙️ Ayarlar", self)
-        settings_action.triggered.connect(self._open_settings_dialog)
+        # Üst toolbar (gerekli olabilir: fullscreen/visibility kontrolü için)
         if not self.toolbar:
             self.toolbar = QToolBar("Ana Toolbar", self)
             self.toolbar.setMovable(False)
             self.toolbar.setFloatable(False)
             self.toolbar.setAllowedAreas(Qt.TopToolBarArea)
             self.addToolBar(Qt.TopToolBarArea, self.toolbar)
-        self.toolbar.addAction(settings_action)
+        try:
+            self.toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        except Exception:
+            pass
 
         # Playlist sürükle-bırak & çoklu seçim aktif
         self.playlistWidget.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -9642,6 +14079,26 @@ class AngollaPlayer(QMainWindow):
             f = _HoverOpacityFilter(w)
             w.installEventFilter(f)
 
+        # Volume icon (mute toggle) - bordered icon
+        self._volume_before_mute = int(self.volumeSlider.value())
+        self.volumeMuteButton = QPushButton("")
+        self.volumeMuteButton.setCheckable(True)
+        self.volumeMuteButton.setFixedSize(38, 38)
+        self._vol_icon_on = QIcon(os.path.join("icons", "volume_on.svg"))
+        self._vol_icon_off = QIcon(os.path.join("icons", "volume_off.svg"))
+        self.volumeMuteButton.setIcon(self._vol_icon_on)
+        self.volumeMuteButton.setIconSize(QSize(26, 26))
+        self.volumeMuteButton.setToolTip("Sesi Aç/Kapat")
+        self.volumeMuteButton.setCursor(Qt.PointingHandCursor)
+        self.volumeMuteButton.setStyleSheet(self.eqButton.styleSheet())
+        self.volumeMuteButton.toggled.connect(self._toggle_master_mute)
+
+        # Slider değişince mute ikonunu otomatik güncelle
+        try:
+            self.volumeSlider.valueChanged.connect(self._on_volume_slider_for_mute)
+        except Exception:
+            pass
+
     def _open_settings_dialog(self):
         """Ayarlar dialog'unu aç ve whitelist'i güncelle."""
         dlg = SettingsDialog(self.settingsManager, self)
@@ -9704,6 +14161,60 @@ class AngollaPlayer(QMainWindow):
 
             # Start hide timer
             video_widget.hide_controls_timer.start()
+
+    def _set_engine_force_mute(self, muted: bool):
+        try:
+            if hasattr(self, "audio_engine") and self.audio_engine is not None:
+                if hasattr(self.audio_engine, "set_force_mute"):
+                    self.audio_engine.set_force_mute(bool(muted))
+        except Exception:
+            pass
+
+    def _toggle_master_mute(self, checked: bool):
+        muted = bool(checked)
+        if not hasattr(self, "volumeSlider"):
+            return
+
+        if muted:
+            try:
+                cur = int(self.volumeSlider.value())
+                if cur > 0:
+                    self._volume_before_mute = cur
+            except Exception:
+                pass
+            self._set_engine_force_mute(True)
+            self.volumeMuteButton.setIcon(getattr(self, "_vol_icon_off", self.volumeMuteButton.icon()))
+            self.volumeSlider.setValue(0)
+        else:
+            self._set_engine_force_mute(False)
+            self.volumeMuteButton.setIcon(getattr(self, "_vol_icon_on", self.volumeMuteButton.icon()))
+            restore = int(getattr(self, "_volume_before_mute", 70) or 70)
+            restore = max(1, min(100, restore))
+            self.volumeSlider.setValue(restore)
+
+    def _on_volume_slider_for_mute(self, v: int):
+        try:
+            v = int(v)
+        except Exception:
+            return
+
+        if v <= 0:
+            # Slider 0 ise mute açık kalsın
+            if hasattr(self, "volumeMuteButton") and not self.volumeMuteButton.isChecked():
+                self.volumeMuteButton.blockSignals(True)
+                self.volumeMuteButton.setChecked(True)
+                self.volumeMuteButton.blockSignals(False)
+                self.volumeMuteButton.setIcon(getattr(self, "_vol_icon_off", self.volumeMuteButton.icon()))
+            self._set_engine_force_mute(True)
+        else:
+            # Slider >0 ise mute kapansın
+            self._volume_before_mute = v
+            if hasattr(self, "volumeMuteButton") and self.volumeMuteButton.isChecked():
+                self.volumeMuteButton.blockSignals(True)
+                self.volumeMuteButton.setChecked(False)
+                self.volumeMuteButton.blockSignals(False)
+                self.volumeMuteButton.setIcon(getattr(self, "_vol_icon_on", self.volumeMuteButton.icon()))
+            self._set_engine_force_mute(False)
 
     def _on_video_tree_double_click(self, index):
         """Video ağacından çift tıklama ile oynat"""
@@ -12326,7 +16837,7 @@ class AngollaPlayer(QMainWindow):
         st['subtitle_items'] = [(0, 10 * 60 * 1000, text)]
         st['subtitle_index'] = 0
         st['subtitle_path'] = None
-        st['subtitle_loaded_path'] = f"__angolla_template__:{lang_key}"
+        st['subtitle_loaded_path'] = f"__aurivo_template__:{lang_key}"
         self._video_settings_state = st
 
         try:
@@ -12381,8 +16892,8 @@ class AngollaPlayer(QMainWindow):
 
         if picked is not None:
             lbl, p = picked
-            # Eğer template dosyasıysa (.angolla_sub_) Whisper çalıştır
-            if '.angolla_sub_' in os.path.basename(p):
+            # Eğer template dosyasıysa (.aurivo_sub_) Whisper çalıştır
+            if '.aurivo_sub_' in os.path.basename(p):
                 try:
                     import whisper
                     # Whisper varsa otomatik transkripsiyon başlat
@@ -12431,7 +16942,7 @@ class AngollaPlayer(QMainWindow):
     def _video_get_temp_subtitle_template_paths(self, base_no_ext: str):
         """Bu video için gizli temp altyazı şablon yollarını üret.
 
-        Format: <klasör>/.angolla_sub_<videoAdı>.<dil>.vtt
+        Format: <klasör>/.aurivo_sub_<videoAdı>.<dil>.vtt
         """
         try:
             base_no_ext = str(base_no_ext or '')
@@ -12445,7 +16956,7 @@ class AngollaPlayer(QMainWindow):
             return []
         out = []
         for key in ('turkce', 'ingilizce', 'fransizca', 'ispanyolca', 'arapca'):
-            fn = f".angolla_sub_{base_name}.{key}.vtt"
+            fn = f".aurivo_sub_{base_name}.{key}.vtt"
             out.append((key, os.path.join(folder, fn)))
         return out
 
@@ -12490,7 +17001,7 @@ class AngollaPlayer(QMainWindow):
                 ap = os.path.abspath(str(p))
                 fn = os.path.basename(ap)
                 # Güvenlik: sadece bizim isim şablonumuza uyanları sil
-                if not (fn.startswith('.angolla_sub_') and fn.lower().endswith('.vtt')):
+                if not (fn.startswith('.aurivo_sub_') and fn.lower().endswith('.vtt')):
                     keep.append(ap)
                     continue
                 if os.path.exists(ap) and os.path.isfile(ap):
@@ -12557,7 +17068,7 @@ class AngollaPlayer(QMainWindow):
 
         # Özel Aura Progress Dialog
         progress = QDialog(self)
-        progress.setWindowTitle('🎙️ Angolla Otomatik Altyazı')
+        progress.setWindowTitle('🎙️ Aurivo Otomatik Altyazı')
         progress.setModal(True)
         progress.setFixedSize(460, 140)  # Sabit boyut
         progress.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
@@ -12851,8 +17362,8 @@ class AngollaPlayer(QMainWindow):
 
         base_name = os.path.basename(base_no_ext)
         for key, content in templates.items():
-            # Gizli temp: .angolla_sub_<videoAdı>.<dil>.vtt
-            p = os.path.join(folder, f".angolla_sub_{base_name}.{key}.vtt")
+            # Gizli temp: .aurivo_sub_<videoAdı>.<dil>.vtt
+            p = os.path.join(folder, f".aurivo_sub_{base_name}.{key}.vtt")
             try:
                 if not os.path.exists(p):
                     with open(p, 'w', encoding='utf-8') as f:
@@ -14528,7 +19039,7 @@ class AngollaPlayer(QMainWindow):
     # ==========================================================
     def _create_side_panel(self):
         """
-        🎨 ANGOLLA SIDEBAR (Icon Menu + Content)
+        🎨 AURIVO SIDEBAR (Icon Menu + Content)
         ┌───┬──────────────┐
         │🏠 │ Kütüphane    │
         │📁 │ Dosyalar     │
@@ -14754,12 +19265,27 @@ class AngollaPlayer(QMainWindow):
         internet_page = QWidget()
         internet_layout = QVBoxLayout(internet_page)
         internet_layout.setContentsMargins(8, 8, 8, 8)
-        header_web = QLabel(f"🌐 {self._tr('internet_header')}")
-        header_web.setStyleSheet("font-weight: bold; padding: 8px; background-color: #333;")
-        internet_layout.addWidget(header_web)
+        # Internet başlığını kaldır: yerine ortalanmış Güvenlik ikonu koy
+        security_header = QWidget()
+        security_header.setStyleSheet("background-color: #333;")
+        sh_layout = QHBoxLayout(security_header)
+        sh_layout.setContentsMargins(8, 8, 8, 8)
+        sh_layout.setSpacing(0)
+        sh_layout.addStretch(1)
+        self._internet_security_btn = QToolButton()
+        self._internet_security_btn.setAutoRaise(True)
+        self._internet_security_btn.setIcon(QIcon(os.path.join("icons", "security_shield.svg")))
+        self._internet_security_btn.setIconSize(QSize(64, 64))
+        self._internet_security_btn.setFixedSize(64, 64)
+        self._internet_security_btn.setToolTip("Güvenlik")
+        self._internet_security_btn.setCursor(Qt.PointingHandCursor)
+        self._internet_security_btn.clicked.connect(self._open_settings_dialog)
+        sh_layout.addWidget(self._internet_security_btn, 0, Qt.AlignCenter)
+        sh_layout.addStretch(1)
+        internet_layout.addWidget(security_header)
         web_buttons = [
             ("YouTube Music", "https://music.youtube.com/", "youtube_music", "youtube_music.svg"),
-            ("YouTube", "https://www.youtube.com/", "youtube", "youtube.svg"),
+            ("YouTube", "https://www.youtube.com/", "youtube", "youtube_modern.svg"),
             ("Spotify", "https://open.spotify.com/", "spotify", "spotify.svg"),
             ("Deezer", "https://www.deezer.com/", "deezer", "deezer.svg"),
             ("SoundCloud", "https://soundcloud.com/", "soundcloud", "soundcloud.svg"),
@@ -14985,7 +19511,7 @@ class AngollaPlayer(QMainWindow):
 
     def _create_main_content(self):
         """
-        🎨 ANGOLLA LAYOUT + TOOLBAR
+        🎨 AURIVO LAYOUT + TOOLBAR
         ┌────────────────────────────────────────┐
         │ 🔙🔜📁🔄 [Toolbar] [Search Bar]      │
         ├──────────┬─────────────────────────────┤
@@ -14997,7 +19523,7 @@ class AngollaPlayer(QMainWindow):
         """
         
         # ═══════════════════════════════════════════════════════════
-        # 1. TOOLBAR (Angolla Tarzı)
+        # 1. TOOLBAR (Aurivo Tarzı)
         # ═══════════════════════════════════════════════════════════
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
@@ -15011,7 +19537,8 @@ class AngollaPlayer(QMainWindow):
         def _mk_tool_button(icon, tooltip, callback):
             btn = QToolButton()
             btn.setIcon(icon)
-            btn.setIconSize(QSize(20, 20))
+            btn.setIconSize(QSize(16, 16))
+            btn.setFixedSize(28, 28)
             btn.setToolTip(tooltip)
             btn.setAutoRaise(True)
             btn.clicked.connect(callback)
@@ -15020,31 +19547,24 @@ class AngollaPlayer(QMainWindow):
                     background-color: #2f3b46;
                     border: 1px solid #555;
                     border-radius: 6px;
-                    padding: 6px;
+                    padding: 2px;
                 }
                 QToolButton:pressed { background-color: #456071; }
             """)
             return btn
 
-        # Web Gezinme Butonları
-        self.webBackBtn = QToolButton()
-        self.webBackBtn.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
-        self.webBackBtn.clicked.connect(self._web_back)
-
-        self.webForwardBtn = QToolButton()
-        self.webForwardBtn.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
-        self.webForwardBtn.clicked.connect(self._web_forward)
-        
-        self.webHomeBtn = QToolButton()
-        self.webHomeBtn.setIcon(self.style().standardIcon(QStyle.SP_DirHomeIcon))
-        self.webHomeBtn.clicked.connect(self._web_home)
+        # Web Gezinme Butonları (küçük + modern)
+        self.webBackBtn = _mk_tool_button(QIcon(os.path.join("icons", "ui_back.svg")), self._tr("back"), self._web_back)
+        self.webForwardBtn = _mk_tool_button(QIcon(os.path.join("icons", "ui_forward.svg")), self._tr("forward"), self._web_forward)
+        self.webHomeBtn = _mk_tool_button(self.style().standardIcon(QStyle.SP_DirHomeIcon), self._tr("home"), self._web_home)
         
         
         # Web Adres Çubuğu
         self.webUrlBar = QLineEdit()
         self.webUrlBar.setPlaceholderText("URL veya Arama...")
         self.webUrlBar.returnPressed.connect(self._web_load_url)
-        self.webUrlBar.setFixedWidth(200)
+        self.webUrlBar.setFixedWidth(160)
+        self.webUrlBar.setFixedHeight(28)
 
         # Web Kontrolleri Listesi (Toplu gizle/göster için)
         self.web_controls = [
@@ -15057,9 +19577,13 @@ class AngollaPlayer(QMainWindow):
             w.setVisible(False)
 
         style = self.style()
-        backBtn = _mk_tool_button(style.standardIcon(QStyle.SP_ArrowBack), self._tr("back"), self._nav_back)
-        forwardBtn = _mk_tool_button(style.standardIcon(QStyle.SP_ArrowForward), self._tr("forward"), self._nav_forward)
-        refreshBtn = _mk_tool_button(style.standardIcon(QStyle.SP_BrowserReload), self._tr("refresh_library"), self.scan_library)
+        backBtn = _mk_tool_button(QIcon(os.path.join("icons", "ui_back.svg")), self._tr("back"), self._nav_back)
+        forwardBtn = _mk_tool_button(QIcon(os.path.join("icons", "ui_forward.svg")), self._tr("forward"), self._nav_forward)
+        refreshBtn = _mk_tool_button(QIcon(os.path.join("icons", "ui_refresh.svg")), self._tr("refresh_library"), self.scan_library)
+
+        # Dosya gezgini ileri/geri butonlarını sonradan enable/disable edebilmek için sakla
+        self.fileNavBackBtn = backBtn
+        self.fileNavForwardBtn = forwardBtn
         backBtn.setCursor(Qt.PointingHandCursor)
         forwardBtn.setCursor(Qt.PointingHandCursor)
         refreshBtn.setCursor(Qt.PointingHandCursor)
@@ -15085,8 +19609,8 @@ class AngollaPlayer(QMainWindow):
             QToolBar {
                 background-color: #263238;
                 border-bottom: 1px solid #444;
-                spacing: 4px;
-                padding: 4px;
+                spacing: 2px;
+                padding: 2px;
             }
             QPushButton {
                 background-color: #37474F;
@@ -15100,6 +19624,12 @@ class AngollaPlayer(QMainWindow):
                 background-color: #40C4FF;
             }
         """)
+
+        # İlk durum: ileri geçmişi yoksa ileri butonu pasif
+        try:
+            self._update_file_nav_buttons()
+        except Exception:
+            pass
         
         self.addToolBar(toolbar)
         
@@ -15405,21 +19935,6 @@ class AngollaPlayer(QMainWindow):
         seekLayout.setContentsMargins(20, 2, 20, 0) # Reduced margins for thinner bar
         seekLayout.setSpacing(8)
         
-        ctrlLayout = QHBoxLayout()
-        ctrlLayout.setSpacing(12)
-        ctrlLayout.addWidget(self.shuffleButton)
-        ctrlLayout.addWidget(self.prevButton)
-        ctrlLayout.addWidget(self.playButton)
-        ctrlLayout.addWidget(self.nextButton)
-        ctrlLayout.addWidget(self.repeatButton)
-        
-        # Volume Area: [EQ] [VolLabel] [Slider]
-        volLayout = QHBoxLayout()
-        volLayout.setSpacing(8)
-        volLayout.addWidget(self.eqButton) # ADDED HERE
-        volLayout.addWidget(self.volumeLabel)
-        volLayout.addWidget(self.volumeSlider)
-        
         # Ana Alt Layout
         # [CLEANUP] Redundant layouts removed to fix parenting issues
         # seekLayout and controlBar will be added to bottomContainer directly below.
@@ -15433,16 +19948,15 @@ class AngollaPlayer(QMainWindow):
         # Böylece (Sol Boşluk) > (Sağ Boşluk) yaparak butonları sağa itiyoruz.
         controlBar.addStretch(2)  # Sol boşluk (2 kat)
         
-        # Volume controls
-        # EQ Button (Ses Efektleri) - Already added, ensure tooltip
+        # EQ Button (Ses Efektleri)
         self.eqButton.setToolTip("Ses Efektleri (DSP)")
-        
+
         controlBar.addWidget(self.shuffleButton)
-        # controlBar.addWidget(self.seekBackwardButton)  # REMOVED: Moved to Video HUD
         controlBar.addWidget(self.prevButton)
+        controlBar.addWidget(self.seekBackwardButton)
         controlBar.addWidget(self.playButton)
+        controlBar.addWidget(self.seekForwardButton)
         controlBar.addWidget(self.nextButton)
-        # controlBar.addWidget(self.seekForwardButton)  # REMOVED: Moved to Video HUD
         controlBar.addWidget(self.repeatButton)
         
         controlBar.addStretch(1)  # Sağ boşluk (1 kat)
@@ -15456,8 +19970,8 @@ class AngollaPlayer(QMainWindow):
         # controlBar.addSpacing(15)
         
         # Volume controls (aynı satırın sağ ucunda)
-        controlBar.addWidget(self.eqButton) # EQ Button (Ses Efektleri) - FIXED VISIBILITY
-        controlBar.addWidget(QLabel(f"🔊 {self._tr('volume')}:"))
+        controlBar.addWidget(self.eqButton)
+        controlBar.addWidget(self.volumeMuteButton)
         controlBar.addWidget(self.volumeSlider)
         controlBar.addWidget(self.volumeLabel)
         
@@ -16126,7 +20640,15 @@ class AngollaPlayer(QMainWindow):
                     p = self.file_model.filePath(idx)
                     if os.path.isdir(p) and len(indexes) == 1:
                         # Tek klasör seçiliyse içine gir
+                        try:
+                            self._dir_forward_stack = []
+                        except Exception:
+                            pass
                         self.file_tree.setRootIndex(idx)
+                        try:
+                            self._update_file_nav_buttons()
+                        except Exception:
+                            pass
                         return True
                     elif os.path.isfile(p):
                         paths.append(p)
@@ -16388,8 +20910,8 @@ class AngollaPlayer(QMainWindow):
 
         js = f"""
         (() => {{
-          if (window.__angollaSetWebVolume) {{
-            window.__angollaSetWebVolume({vol_to_set});
+          if (window.__aurivoSetWebVolume) {{
+            window.__aurivoSetWebVolume({vol_to_set});
             return;
           }}
           const setVol = (v) => {{
@@ -16970,6 +21492,7 @@ class AngollaPlayer(QMainWindow):
             )
             if self.search_mode != "web":
                 self._set_visualizer_paused(False, fade=False)
+            self._update_now_playing_row_indicator()
         
         elif state == QMediaPlayer.PausedState:
             self.update_play_button_state(False, source="local")
@@ -16980,6 +21503,7 @@ class AngollaPlayer(QMainWindow):
             if self.search_mode != "web":
                 self._set_visualizer_paused(True, fade=True)
             self._stop_fallback_visualizer()
+            self._update_now_playing_row_indicator()
                 
         elif state == QMediaPlayer.StoppedState:
             self.update_play_button_state(False, source="local")
@@ -16987,6 +21511,7 @@ class AngollaPlayer(QMainWindow):
             if self.search_mode != "web":
                 self._set_visualizer_paused(True, fade=True)
             self._stop_fallback_visualizer()
+            self._update_now_playing_row_indicator()
     
     # _check_probe_status removed as it's obsolete.
 
@@ -17081,14 +21606,16 @@ class AngollaPlayer(QMainWindow):
         """Video pozisyonu değişince (Video sekmesi aktifse) ana slider'ı güncelle."""
         # Main slider update (if video tab active)
         if self.mainContentStack.currentIndex() == 1: # Video Tab
-            if not self.positionSlider.isSliderDown():
+            if (not self.positionSlider.isSliderDown()) and (not bool(getattr(self.positionSlider, "_is_seeking", False))):
                 self.positionSlider.setValue(position)
             
             # Update labels
             total_duration = self.videoPlayer.duration()
             if total_duration > 0:
-                current_time = self._format_time(position)
-                self.lblCurrentTime.setText(current_time)
+                # Sürükleme sırasında label'ları ezme (önizleme görünür kalsın)
+                if not self._is_main_seek_dragging():
+                    current_time = self._format_time(position)
+                    self.lblCurrentTime.setText(current_time)
         
         # Tam ekran kontrollerini güncelle
         if getattr(self, '_in_video_fullscreen', False):
@@ -17120,15 +21647,17 @@ class AngollaPlayer(QMainWindow):
                 self.lblTotalTime.setText(total_time)
 
     def position_changed(self, position):
-        if not self.positionSlider.isSliderDown():
+        if (not self.positionSlider.isSliderDown()) and (not bool(getattr(self.positionSlider, "_is_seeking", False))):
             self.positionSlider.setValue(position)
 
         total_duration = self.audio_engine.media_player.duration()
         if total_duration > 0:
-            current_time = self._format_time(position)
-            total_time = self._format_time(total_duration)
-            self.lblCurrentTime.setText(current_time)
-            self.lblTotalTime.setText(total_time)
+            # Slider sürüklenirken sağ label önizleme gösterir; burada ezmeyelim.
+            if not self._is_main_seek_dragging():
+                current_time = self._format_time(position)
+                total_time = self._format_time(total_duration)
+                self.lblCurrentTime.setText(current_time)
+                self.lblTotalTime.setText(total_time)
 
             # Auto Crossfade Trigger (yeni sistem)
             cf_ms = int(getattr(self, "_pb_crossfade_ms", 0) or 0)
@@ -17174,19 +21703,50 @@ class AngollaPlayer(QMainWindow):
         else: # Audio Tab
             if self.audio_engine:
                 self.audio_engine.media_player.setPosition(val)
+
+        # Bırakınca: sağ label'ı tekrar toplam süreye döndür
+        try:
+            self._seek_preview_active = False
+        except Exception:
+            pass
+        try:
+            total_ms = self._get_main_total_duration_ms()
+            if total_ms and total_ms > 0:
+                self.lblTotalTime.setText(self._format_time(int(total_ms)))
+        except Exception:
+            pass
             
     def _set_position_safely_moved(self, val):
-        """Slider sürüklenirken label'ı güncelle."""
-        # Web modunda mevcut duruma göre güncelle
-        if self.search_mode == "web" and self.web_duration_ms > 0:
-            self.lblCurrentTime.setText(self._format_time(val))
-            self.lblTotalTime.setText(self._format_time(self.web_duration_ms))
-        elif self.mainContentStack.currentIndex() == 1: # Video Tab
-             self.lblCurrentTime.setText(self._format_time(val))
-        else:
-            self.lblCurrentTime.setText(self._format_time(val))
-            # Keep total as previous or ...
-            self.lblTotalTime.setText("...")
+        """Slider sürüklenirken sağdaki label'da hedef zamanı (önizleme) göster."""
+        try:
+            self._seek_preview_active = True
+        except Exception:
+            pass
+
+        try:
+            # Kullanıcı talebi: sağdaki (toplam süre) alanı sürükleme sırasında hedef zamana çevir.
+            self.lblTotalTime.setText(self._format_time(int(val)))
+        except Exception:
+            pass
+
+    def _is_main_seek_dragging(self) -> bool:
+        try:
+            return bool(self.positionSlider.isSliderDown()) or bool(getattr(self.positionSlider, "_is_seeking", False))
+        except Exception:
+            return False
+
+    def _get_main_total_duration_ms(self) -> int:
+        """Ana seek slider'ın bağlı olduğu içeriğin toplam süresi (ms)."""
+        try:
+            if self.search_mode == "web":
+                return int(getattr(self, "web_duration_ms", 0) or 0)
+            if hasattr(self, "mainContentStack") and self.mainContentStack.currentIndex() == 1 and hasattr(self, "videoPlayer"):
+                return int(self.videoPlayer.duration() or 0)
+            if hasattr(self, "audio_engine") and self.audio_engine:
+                return int(self.audio_engine.media_player.duration() or 0)
+        except Exception:
+            return 0
+        return 0
 
     def play_pause(self):
         """Oynat/Duraklat (Context Aware)."""
@@ -17387,6 +21947,7 @@ class AngollaPlayer(QMainWindow):
                 self.vis_widget_main_window.reset_visualizer()
             self._update_info_panels(None, None, None, None)
             self._apply_album_color_theme(None)
+            self._update_now_playing_row_indicator(clear=True)
             return
 
         url = self.playlist.media(index).request().url()
@@ -17398,11 +21959,22 @@ class AngollaPlayer(QMainWindow):
         self._update_info_panels(title, artist, album, self.current_file_path)
         self._apply_album_color_theme(self.current_file_path)
 
-        for i in range(self.playlistWidget.count()):
-            item = self.playlistWidget.item(i)
-            item.setSelected(i == index)
+        # Clementine tarzı: oynayan satırı ayrı bir işaret ile göster;
+        # kullanıcı seçimini zorla değiştirme.
         if 0 <= index < self.playlistWidget.count():
-            self.playlistWidget.setCurrentRow(index)
+            item = self.playlistWidget.item(index)
+            try:
+                self.playlistWidget.scrollToItem(item)
+            except Exception:
+                pass
+            try:
+                from PyQt5.QtCore import QItemSelectionModel
+                self.playlistWidget.setCurrentItem(item, QItemSelectionModel.NoUpdate)
+            except Exception:
+                try:
+                    self.playlistWidget.setCurrentRow(index)
+                except Exception:
+                    pass
 
         # Trigger Play in Engine (manual/auto crossfade kontrolü)
         if hasattr(self, 'audio_engine'):
@@ -17421,6 +21993,82 @@ class AngollaPlayer(QMainWindow):
             self._track_change_reason = None
             QTimer.singleShot(0, lambda: self.audio_engine.play_file(self.current_file_path))
             self.playButton.setIcon(QIcon(os.path.join("icons", "media-playback-pause.png")))
+        self._update_now_playing_row_indicator()
+
+    def _update_now_playing_row_indicator(self, clear: bool = False):
+        """Clementine benzeri 'şu an çalan' satır işareti: mavi satır + play/pause ikonu."""
+        try:
+            if not hasattr(self, "playlistWidget") or self.playlistWidget is None:
+                return
+            if not hasattr(self, "playlist") or self.playlist is None:
+                return
+
+            # İkonları bir kez oluştur
+            if not hasattr(self, "_np_icon_play"):
+                self._np_icon_play = QIcon(os.path.join("icons", "media-playback-start.png"))
+                self._np_icon_pause = QIcon(os.path.join("icons", "media-playback-pause.png"))
+
+            prev = getattr(self, "_now_playing_row_index", None)
+
+            def _clear_row(row: int):
+                if row is None:
+                    return
+                if row < 0 or row >= self.playlistWidget.count():
+                    return
+                it = self.playlistWidget.item(row)
+                if it is None:
+                    return
+                it.setIcon(QIcon())
+                try:
+                    it.setData(NOW_PLAYING_ROLE, False)
+                except Exception:
+                    pass
+                it.setBackground(QBrush())
+                it.setForeground(QBrush())
+
+            if clear:
+                _clear_row(prev)
+                self._now_playing_row_index = None
+                return
+
+            idx = int(self.playlist.currentIndex())
+            if idx < 0 or idx >= self.playlistWidget.count():
+                _clear_row(prev)
+                self._now_playing_row_index = None
+                return
+
+            # Önceki satırı temizle (index değiştiyse)
+            if prev is not None and prev != idx:
+                _clear_row(prev)
+
+            # Duruma göre ikon seç
+            state = None
+            try:
+                state = self.audio_engine.media_player.state() if hasattr(self, "audio_engine") else None
+            except Exception:
+                state = None
+
+            if state not in (QMediaPlayer.PlayingState, QMediaPlayer.PausedState):
+                _clear_row(idx)
+                self._now_playing_row_index = None
+                return
+
+            it = self.playlistWidget.item(idx)
+            if it is None:
+                return
+
+            it.setIcon(self._np_icon_play if state == QMediaPlayer.PlayingState else self._np_icon_pause)
+            try:
+                it.setData(NOW_PLAYING_ROLE, True)
+            except Exception:
+                pass
+            # Arka planı delegate çizecek; burada sadece metni okunur tut.
+            it.setForeground(QColor(0, 0, 0))
+
+            self._now_playing_row_index = idx
+        except Exception:
+            # UI indikasyonu hata verirse oynatmayı etkilemesin
+            pass
 
     def _play_index(self, index):
         count = self.playlist.mediaCount()
@@ -17815,7 +22463,16 @@ class AngollaPlayer(QMainWindow):
     def file_tree_double_clicked(self, index):
         path = self.file_model.filePath(index)
         if self.file_model.isDir(index):
+            # Yeni bir klasöre girildi: "ileri" (redo) yığını artık geçersiz.
+            try:
+                self._dir_forward_stack = []
+            except Exception:
+                pass
             self.file_tree.setRootIndex(index)
+            try:
+                self._update_file_nav_buttons()
+            except Exception:
+                pass
         else:
             self._add_files_to_playlist([path])
             try:
@@ -17827,11 +22484,35 @@ class AngollaPlayer(QMainWindow):
     def _go_up_directory(self):
         current_index = self.file_tree.rootIndex()
         parent_index = self.file_model.parent(current_index)
-        if parent_index.isValid() and \
-                self.file_model.filePath(current_index) != QDir.homePath():
-            self.file_tree.setRootIndex(parent_index)
-        elif self.file_model.filePath(current_index) != QDir.homePath():
-            self.file_tree.setRootIndex(self.file_model.index(QDir.homePath()))
+        try:
+            current_path = self.file_model.filePath(current_index)
+        except Exception:
+            current_path = ""
+
+        # Hedef kökü belirle (gerçekten değişecekse stack'e yaz)
+        target_index = None
+        try:
+            if parent_index.isValid() and self.file_model.filePath(current_index) != QDir.homePath():
+                target_index = parent_index
+            elif self.file_model.filePath(current_index) != QDir.homePath():
+                target_index = self.file_model.index(QDir.homePath())
+        except Exception:
+            target_index = None
+
+        try:
+            if target_index is not None and target_index.isValid() and target_index != current_index:
+                if not hasattr(self, "_dir_forward_stack"):
+                    self._dir_forward_stack = []
+                if current_path:
+                    self._dir_forward_stack.append(current_path)
+                self.file_tree.setRootIndex(target_index)
+        except Exception:
+            pass
+
+        try:
+            self._update_file_nav_buttons()
+        except Exception:
+            pass
 
     def _open_current_folder(self):
         """Çalan parçanın klasörünü dosya gezgininde aç."""
@@ -17844,10 +22525,50 @@ class AngollaPlayer(QMainWindow):
             pass
 
     def _go_home_directory(self):
-        """Dosya ağacını ev klasörüne getir (ileri butonu)."""
+        """Dosya ağacını ev klasörüne getir."""
 
         try:
+            # Ev'e gitmek yeni bir navigation sayılır; "ileri" yığınını temizle.
+            self._dir_forward_stack = []
             self.file_tree.setRootIndex(self.file_model.index(QDir.homePath()))
+        except Exception:
+            pass
+
+        try:
+            self._update_file_nav_buttons()
+        except Exception:
+            pass
+
+    def _go_forward_directory(self):
+        """Dosya gezgininde "ileri": son "geri/üst" adımını geri al (önceki klasöre dön)."""
+        try:
+            if not hasattr(self, "_dir_forward_stack"):
+                self._dir_forward_stack = []
+            # Stack'te geçersiz path kalmış olabilir; bulana kadar dene
+            while self._dir_forward_stack:
+                target_path = self._dir_forward_stack.pop()
+                if not target_path:
+                    continue
+                idx = self.file_model.index(target_path)
+                if idx.isValid():
+                    self.file_tree.setRootIndex(idx)
+                    break
+        except Exception:
+            pass
+
+        try:
+            self._update_file_nav_buttons()
+        except Exception:
+            pass
+
+    def _update_file_nav_buttons(self):
+        """Dosya gezgini ileri butonunu, ileri geçmişine göre enable/disable et."""
+        try:
+            fwd_btn = getattr(self, "fileNavForwardBtn", None)
+            if not fwd_btn:
+                return
+            stack = getattr(self, "_dir_forward_stack", [])
+            fwd_btn.setEnabled(bool(stack))
         except Exception:
             pass
 
@@ -17901,8 +22622,8 @@ class AngollaPlayer(QMainWindow):
             text = cb.text().strip()
             if not text:
                 # gizle
-                if hasattr(self, 'angollaDownloadBtn') and self.angollaDownloadBtn:
-                    self.angollaDownloadBtn.setVisible(False)
+                if hasattr(self, 'aurivoDownloadBtn') and self.aurivoDownloadBtn:
+                    self.aurivoDownloadBtn.setVisible(False)
                 self.clipboard_last_text = ""
                 return
             if text == self.clipboard_last_text:
@@ -17910,15 +22631,15 @@ class AngollaPlayer(QMainWindow):
             self.clipboard_last_text = text
             # Basit YouTube URL tespiti
             if ("youtube.com/watch" in text) or ("youtu.be/" in text) or ("music.youtube.com" in text):
-                if hasattr(self, 'angollaDownloadBtn') and self.angollaDownloadBtn:
-                    self.angollaDownloadBtn.setVisible(True)
+                if hasattr(self, 'aurivoDownloadBtn') and self.aurivoDownloadBtn:
+                    self.aurivoDownloadBtn.setVisible(True)
                     # Eğer otomatik açma açıksa, yeni URL için format dialogunu otomatik aç
                     if getattr(self, '_auto_open_format_dialog', False) and text != getattr(self, '_clipboard_auto_handled', ''):
                         self._clipboard_auto_handled = text
                         QTimer.singleShot(700, self._on_clipboard_download_clicked)
             else:
-                if hasattr(self, 'angollaDownloadBtn') and self.angollaDownloadBtn:
-                    self.angollaDownloadBtn.setVisible(False)
+                if hasattr(self, 'aurivoDownloadBtn') and self.aurivoDownloadBtn:
+                    self.aurivoDownloadBtn.setVisible(False)
         except Exception:
             pass
 
@@ -18039,7 +22760,7 @@ class AngollaPlayer(QMainWindow):
             except Exception as e:
                 print(f"⚠ [NAV_FORWARD] Web ileri hatası: {e}")
         else:
-            self._go_home_directory()
+            self._go_forward_directory()
 
     def keyPressEvent(self, event):
         """Genel kısayollar (özellikle web tam ekran ESC çıkışı)."""
@@ -18534,10 +23255,10 @@ class AngollaPlayer(QMainWindow):
         js = f"""
         (function() {{
             try {{
-                if (window.__angollaSetMuteWebAudio) {{
-                    window.__angollaSetMuteWebAudio({mval});
+                if (window.__aurivoSetMuteWebAudio) {{
+                    window.__aurivoSetMuteWebAudio({mval});
                 }} else {{
-                    window.__angollaMuteWebAudio = {mval};
+                    window.__aurivoMuteWebAudio = {mval};
 
             elif mode == 'web':
                 # Web modunda görselleştirme ana widget üzerinden çalışır
@@ -18546,24 +23267,24 @@ class AngollaPlayer(QMainWindow):
                         self.bottom_vis_stack.setCurrentIndex(0)
                 except Exception:
                     pass
-                    if (window.__angollaOutputGain) {{
-                        window.__angollaOutputGain.gain.value = {0.0 if muted else 1.0};
+                    if (window.__aurivoOutputGain) {{
+                        window.__aurivoOutputGain.gain.value = {0.0 if muted else 1.0};
                     }}
-                    if (!window.__angollaOutputGain) {{
+                    if (!window.__aurivoOutputGain) {{
                         try {{
                             var els = document.querySelectorAll('video, audio');
                             for (var i = 0; i < els.length; i++) {{
                                 var el = els[i];
                                 if ({mval}) {{
-                                    if (typeof el.__angollaPrevVolume !== 'number') {{
-                                        el.__angollaPrevVolume = el.volume;
+                                    if (typeof el.__aurivoPrevVolume !== 'number') {{
+                                        el.__aurivoPrevVolume = el.volume;
                                     }}
                                     el.muted = true;
                                     el.volume = 0;
                                 }} else {{
                                     el.muted = false;
-                                    if (typeof el.__angollaPrevVolume === 'number') {{
-                                        el.volume = el.__angollaPrevVolume;
+                                    if (typeof el.__aurivoPrevVolume === 'number') {{
+                                        el.volume = el.__aurivoPrevVolume;
                                     }}
                                 }}
                             }}
@@ -18602,10 +23323,10 @@ class AngollaPlayer(QMainWindow):
         js = """
         (function() {
             try {
-                window.__angollaUserGestureTS = Date.now();
-                window.__angollaAllowPlayUntil = Date.now() + 6000;
-                if (window.__angollaInitAudioFromGesture) {
-                    window.__angollaInitAudioFromGesture();
+                window.__aurivoUserGestureTS = Date.now();
+                window.__aurivoAllowPlayUntil = Date.now() + 6000;
+                if (window.__aurivoInitAudioFromGesture) {
+                    window.__aurivoInitAudioFromGesture();
                 }
             } catch (e) {}
             var v = document.querySelector('video') || document.querySelector('audio');
@@ -18846,7 +23567,7 @@ class AngollaPlayer(QMainWindow):
         """
         script = f"""
         (() => {{
-            const id = '__angolla_web_theme';
+            const id = '__aurivo_web_theme';
             let style = document.getElementById(id);
             if ({str(dark).lower()}) {{
                 if (!style) {{
@@ -19007,9 +23728,9 @@ class AngollaPlayer(QMainWindow):
         from PyQt5.QtWidgets import QMessageBox
         QMessageBox.information(
             self,
-            "Angolla Music Player",
-            "🎵 Angolla Music Player\n\n"
-            "Angolla ilhamlı gelişmiş PyQt5 müzik oynatıcı.\n"
+            "Aurivo Music Player",
+            "🎵 Aurivo Music Player\n\n"
+            "Aurivo ilhamlı gelişmiş PyQt5 müzik oynatıcı.\n"
             "Geliştirici: Muhammet Dali\n"
             "Sürüm: 1.0\n\n"
             "🎹 Kısayollar:\n"
@@ -19418,9 +24139,17 @@ class AngollaPlayer(QMainWindow):
             print(f"Çalma listesi kaydetme hatası: {e}")
 
     def load_playlist(self):
-        # JSON yoksa, eski pickle playlist varsa migrate dene
+        # JSON yoksa, eski JSON veya pickle playlist varsa migrate dene
         if not os.path.exists(PLAYLIST_FILE):
-            for pkl_name in ("angolla_playlist.pkl", "playlist.pkl"):
+            legacy_json = load_json_file(LEGACY_PLAYLIST_FILE)
+            if isinstance(legacy_json, dict):
+                try:
+                    atomic_write_json(PLAYLIST_FILE, legacy_json)
+                except Exception:
+                    pass
+
+        if not os.path.exists(PLAYLIST_FILE):
+            for pkl_name in ("aurivo_playlist.pkl", "angolla_playlist.pkl", "playlist.pkl"):
                 if os.path.exists(pkl_name):
                     try:
                         migrate_pickle_playlist_to_json(pkl_name, PLAYLIST_FILE)
@@ -19491,7 +24220,7 @@ class AngollaPlayer(QMainWindow):
             print(f"Ayar kaydetme hatası (JSON dosya): {e}")
 
         # Geriye dönük uyumluluk: QSettings içinde de JSON string tut (pickle yok)
-        settings = QSettings(SETTINGS_KEY, "AngollaPlayer")
+        settings = QSettings(SETTINGS_KEY, "AurivoPlayer")
         try:
             settings.setValue("config_json", json.dumps(self.config_data))
         except Exception:
@@ -19505,9 +24234,19 @@ class AngollaPlayer(QMainWindow):
         else:
             self.config_data = {}
 
+        # 1b) Yeni config yoksa: eski (Angolla) JSON config'i migrate et
+        if not self.config_data:
+            legacy_cfg = load_json_file(LEGACY_CONFIG_FILE)
+            if isinstance(legacy_cfg, dict):
+                self.config_data = legacy_cfg
+                try:
+                    atomic_write_json(CONFIG_FILE, self.config_data)
+                except Exception:
+                    pass
+
         # 2) Dosya yoksa: QSettings JSON'dan migrate et
         if not self.config_data:
-            settings = QSettings(SETTINGS_KEY, "AngollaPlayer")
+            settings = QSettings(SETTINGS_KEY, "AurivoPlayer")
             try:
                 val = settings.value("config_json")
                 if val and isinstance(val, str):
@@ -19521,9 +24260,37 @@ class AngollaPlayer(QMainWindow):
             except Exception:
                 pass
 
+        # 2b) Hâlâ yoksa: eski (Angolla) QSettings JSON'dan migrate et
+        if not self.config_data:
+            legacy_settings = QSettings(LEGACY_SETTINGS_KEY, LEGACY_SETTINGS_GROUP)
+            try:
+                val = legacy_settings.value("config_json")
+                if val and isinstance(val, str):
+                    migrated = json.loads(val)
+                    if isinstance(migrated, dict):
+                        self.config_data = migrated
+                        try:
+                            atomic_write_json(CONFIG_FILE, self.config_data)
+                        except Exception:
+                            pass
+                        try:
+                            # Yeni anahtara da yaz
+                            settings = QSettings(SETTINGS_KEY, "AurivoPlayer")
+                            settings.setValue("config_json", json.dumps(self.config_data))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         # 3) Eski pickle dosyaları varsa (lokal) güvenli migrate dene
         if not self.config_data:
-            for pkl_name in ("angolla_config.pkl", "angolla_settings.pkl", "config.pkl"):
+            for pkl_name in (
+                "aurivo_config.pkl",
+                "aurivo_settings.pkl",
+                "angolla_config.pkl",
+                "angolla_settings.pkl",
+                "config.pkl",
+            ):
                 if os.path.exists(pkl_name):
                     try:
                         if migrate_pickle_config_to_json(pkl_name, CONFIG_FILE):
@@ -19788,9 +24555,9 @@ class AngollaPlayer(QMainWindow):
 # ---------------------------------------------------------------------------
 
 class PreferencesDialog(QDialog):
-    def __init__(self, parent: AngollaPlayer):
+    def __init__(self, parent: AurivoPlayer):
         super().__init__(parent)
-        self.setWindowTitle("Angolla Ayarları")
+        self.setWindowTitle("Aurivo Ayarları")
         self.parent = parent
         self.setFixedSize(900, 650)
         self._preview_dirty = False
@@ -19997,7 +24764,7 @@ class PreferencesDialog(QDialog):
         self.visModeCombo = QComboBox(); self.visModeCombo.addItems([
             "Çubuklar", "Çizgiler", "Daireler", "Spektrum Çubukları",
             "Ayna",
-            "Angolla Analyzer", "Angolla Turbine", "Angolla Boom", "Angolla Block",
+            "Aurivo Analyzer", "Aurivo Turbine", "Aurivo Boom", "Aurivo Block",
             "Enerji Halkaları", "Dalga Formu",
             "Pulsar", "Spiral", "Volcano", "Energy Ring", "Circular Waveform", "3D Swirl", "Pulse Explosion", "Tunnel Mode"
         ])
@@ -20323,8 +25090,8 @@ class PreferencesDialog(QDialog):
 def main():
     # Video için iki profil:
     #  - Varsayılan: Yazılım GL + GPU kapalı (siyah ekranı çözer)
-    #  - ANGOLLA_HW_VIDEO=1 ise donanım hızlandırma (başarırsak daha akıcı)
-    use_hw = os.environ.get("ANGOLLA_HW_VIDEO", "0") == "1"
+    #  - AURIVO_HW_VIDEO=1 ise donanım hızlandırma (başarırsak daha akıcı)
+    use_hw = os.environ.get("AURIVO_HW_VIDEO", "0") == "1"
     if use_hw:
         chrome_flags = [
             "--ignore-gpu-blocklist",
@@ -20377,7 +25144,7 @@ def main():
     app = QApplication(sys.argv)
     app.setFont(QFont("Ubuntu", 10))
     
-    window = AngollaPlayer()
+    window = AurivoPlayer()
     window.show()
     sys.exit(app.exec_())
 

@@ -4,7 +4,7 @@ import numpy as np
 
 
 class LiveDSPBridge:
-    def __init__(self, lib_path="./angolla_dsp.so"):
+    def __init__(self, lib_path="./aurivo_dsp.so"):
         if not os.path.exists(lib_path):
             raise FileNotFoundError(f"DSP Library not found: {lib_path}")
 

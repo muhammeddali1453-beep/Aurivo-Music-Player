@@ -1,7 +1,7 @@
-# 🎬 Angolla TURBO Reklam Geçiş Sistemi
+# 🎬 Aurivo TURBO Reklam Geçiş Sistemi
 
 ## Genel Bakış
-Angolla Music Player'da web platformalarında (YouTube, Spotify vb.) reklam **ultra hızlı** ve otomatik olarak geçilir. Sistem güvenli QWebChannel bridge'i üzerinden çalışır.
+Aurivo Music Player'da web platformalarında (YouTube, Spotify vb.) reklam **ultra hızlı** ve otomatik olarak geçilir. Sistem güvenli QWebChannel bridge'i üzerinden çalışır.
 
 ## 🚀 Turbo Özellikler
 
@@ -35,25 +35,25 @@ Angolla Music Player'da web platformalarında (YouTube, Spotify vb.) reklam **ul
 #### `skip_ad_safe(site_name: str)`
 Güvenli reklam geçiş isteği yapar.
 ```javascript
-window.AngollaBridge.skip_ad_safe('youtube');
+window.AurivoBridge.skip_ad_safe('youtube');
 ```
 
 #### `seek_safe(site_name: str, seconds: int)`
 0-120 saniye aralığında başlama konumu değiştirir.
 ```javascript
-window.AngollaBridge.seek_safe('youtube', 30);
+window.AurivoBridge.seek_safe('youtube', 30);
 ```
 
 #### `toggle_play_safe(site_name: str, should_play: bool)`
 Oynatma/durdurma kontrolü.
 ```javascript
-window.AngollaBridge.toggle_play_safe('youtube', true);
+window.AurivoBridge.toggle_play_safe('youtube', true);
 ```
 
 #### `volume_safe(site_name: str, volume: int)`
 0-100 aralığında ses kontrolü.
 ```javascript
-window.AngollaBridge.volume_safe('youtube', 75);
+window.AurivoBridge.volume_safe('youtube', 75);
 ```
 
 ### Whitelist Konfigürasyonu
@@ -73,7 +73,7 @@ BRIDGE_ALLOWED_SITES = {
 }
 ```
 
-**Kalıcı Ayarlar** (`angolla_settings.json`):
+**Kalıcı Ayarlar** (`aurivo_settings.json`):
 ```json
 {
   "trusted_domains": ["localhost", "127.0.0.1"],
@@ -84,7 +84,7 @@ BRIDGE_ALLOWED_SITES = {
 ## Kullanım
 
 ### Web Tarayıcıda
-1. Angolla uygulamasını başlatın
+1. Aurivo uygulamasını başlatın
 2. Web tarayıcısı bölümüne YouTube/Spotify linkini girin
 3. Reklamlar otomatik olarak geçilecektir
 
@@ -129,7 +129,7 @@ Konsol çıktısında şu mesajları görebilirsiniz:
 ```
 ✓ Reklam geçiş scripti yüklendi (QWebEngineScript)
 🔄 Otomatik reklam geçişi başlatıldı
-✓ Reklam geçildi (Angolla) #1
+✓ Reklam geçildi (Aurivo) #1
 ⌨️ Klavye komutu (Shift+S) tetiklendi
 ```
 
@@ -163,7 +163,7 @@ Konsol çıktısında şu mesajları görebilirsiniz:
 | `main.py` | Ana uygulama (Bridge, script inject) |
 | `config.py` | Whitelist konfigürasyonu |
 | `ad_skip_demo.html` | Test ve demo sayfası |
-| `angolla_settings.json` | Kalıcı ayarlar |
+| `aurivo_settings.json` | Kalıcı ayarlar |
 
 ## Kaynaklar
 

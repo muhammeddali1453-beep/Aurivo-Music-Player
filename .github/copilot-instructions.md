@@ -1,7 +1,7 @@
-# Angolla Music Player - AI Aracı Talimatları
+# Aurivo Music Player - AI Aracı Talimatları
 
 ## Proje Özeti
-**Angolla**, Clementine tarafından ilham alınan PyQt5 tabanlı tek dosyalı bir müzik oynatıcısıdır. Çevrimdışı çalışan masaüstü uygulaması (~3000+ satır) entegre ses görselleştirme (11 mod), gelişmiş ekolayzır ve kütüphane yönetimi ile beraber gelir. Türkçe arayüz ve gerçek FFT spektrumu analizi içerir.
+**Aurivo**, Clementine tarafından ilham alınan PyQt5 tabanlı tek dosyalı bir müzik oynatıcısıdır. Çevrimdışı çalışan masaüstü uygulaması (~3000+ satır) entegre ses görselleştirme (11 mod), gelişmiş ekolayzır ve kütüphane yönetimi ile beraber gelir. Türkçe arayüz ve gerçek FFT spektrumu analizi içerir.
 
 ## Mimari Yapı
 
@@ -17,7 +17,7 @@ LibraryManager (SQLite DB yönetimi)
   - LibraryTableWidget (sıralanabilir parça tablosu)
   - PlaylistListWidget (sürükle-bırak)
   ↓
-AngollaPlayer (QMainWindow)
+AurivoPlayer (QMainWindow)
   ↓
 main() → QApplication
 ```
@@ -71,7 +71,7 @@ Tüm modlar `AnimatedVisualizationWidget`'da `_draw_*_mode()` olarak uygulanır:
 ## Yapılandırma & Depolama
 
 ```python
-SETTINGS_KEY = "AngollaPlayer/Settings"
+SETTINGS_KEY = "AurivoPlayer/Settings"
 
 save_config() → pickle.dumps(config_data):
   - volume, shuffle_mode, repeat_mode
@@ -205,7 +205,7 @@ pip install PyQt5 mutagen numpy
 - **Satırlar 900-1100**: PlaylistListWidget
 - **Satırlar 1100-2100**: AnimatedVisualizationWidget (11 mod)
 - **Satırlar 2100-2200**: VisualizationWindow
-- **Satırlar 2200-2400**: AngollaPlayer.__init__ + layout
+- **Satırlar 2200-2400**: AurivoPlayer.__init__ + layout
 - **Satırlar 2400-2600**: Audio işleme (FFT, spektrum)
 - **Satırlar 2600-2750**: Config/playlist depolama
 - **Satırlar 2750-2850**: PreferencesDialog + main()

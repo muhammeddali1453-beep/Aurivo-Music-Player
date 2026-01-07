@@ -4,7 +4,7 @@
 
 1. **Repository Ayarlarına Git**
    ```
-   https://github.com/muhammeddali1453-beep/Angolla-Music-Player/settings
+   https://github.com/muhammeddali1453-beep/Aurivo-Music-Player/settings
    ```
 
 2. **En Alta Kaydır** → "Danger Zone" bölümüne git
@@ -13,7 +13,7 @@
 
 4. **"Make private"** seç
 
-5. **Repository adını yazarak onayla**: `muhammeddali1453-beep/Angolla-Music-Player`
+5. **Repository adını yazarak onayla**: `muhammeddali1453-beep/Aurivo-Music-Player`
 
 6. **"I understand, make this repository private"** butonuna tıkla
 
@@ -48,8 +48,8 @@ Settings → Collaborators → Add people
 Eğer hem release'leri paylaşmak hem de kaynak kodunu gizlemek istiyorsan:
 
 1. **İki Repo Oluştur**:
-   - `Angolla-Music-Player` (public) → Sadece README, INSTALL, releases
-   - `Angolla-Music-Player-Source` (private) → Kaynak kod
+   - `Aurivo-Music-Player` (public) → Sadece README, INSTALL, releases
+   - `Aurivo-Music-Player-Source` (private) → Kaynak kod
 
 2. **Public Repo İçeriği**:
    ```
@@ -68,13 +68,13 @@ Eğer hem release'leri paylaşmak hem de kaynak kodunu gizlemek istiyorsan:
 
 ```bash
 # Repository durumunu kontrol et
-gh repo view muhammeddali1453-beep/Angolla-Music-Player --json visibility
+gh repo view muhammeddali1453-beep/Aurivo-Music-Player --json visibility
 
 # Private yap (gh cli ile)
-gh repo edit muhammeddali1453-beep/Angolla-Music-Player --visibility private
+gh repo edit muhammeddali1453-beep/Aurivo-Music-Player --visibility private
 
 # Public yap
-gh repo edit muhammeddali1453-beep/Angolla-Music-Player --visibility public
+gh repo edit muhammeddali1453-beep/Aurivo-Music-Player --visibility public
 ```
 
 ## Lisans ve Private Repo

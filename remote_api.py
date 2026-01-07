@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Angolla Music Player - Uzaktan Kumanda API Modülü
+Aurivo Music Player - Uzaktan Kumanda API Modülü
 Güvenlik: Kimlik Doğrulama + CORS + CSRF Koruması
 """
 
@@ -396,7 +396,7 @@ class SecureAPIHandler(BaseHTTPRequestHandler):
         """Sağlık kontrolü"""
         self._send_json_response({
             "status": "healthy",
-            "service": "Angolla Remote API",
+            "service": "Aurivo Remote API",
             "version": "1.0.0",
             "success": True
         })
@@ -623,7 +623,7 @@ class RemoteAPIServer:
     def __init__(self, player=None, port: int = None, bind_address: str = "127.0.0.1"):
         """
         Args:
-            player: AngollaPlayer instance
+            player: AurivoPlayer instance
             port: API port numarası
             bind_address: Bağlanılacak adres (güvenlik için varsayılan localhost)
         """
@@ -750,7 +750,7 @@ def create_api_server(player=None, port: int = None) -> RemoteAPIServer:
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Angolla Remote API - Güvenlik Test Modu")
+    print("Aurivo Remote API - Güvenlik Test Modu")
     print("=" * 60)
     
     # Test sunucusu başlat

@@ -4,25 +4,25 @@ from PyQt5.QtCore import QObject, pyqtSlot, pyqtSignal
 def build_web_audio_capture_js():
     return r"""
 (function() {
-    if (window.__angollaCaptureInstalled) return;
-    window.__angollaCaptureInstalled = true;
-    window.__angollaLastPlaying = null;
-    window.__angollaPendingPlay = false;
-    window.__angollaBridgeReady = false;
-    window.__angollaQueuedPlaying = null;
-    window.__angollaListenersInstalled = false;
-    window.__angollaPlayKickTimer = null;
-    window.__angollaUserGestureTS = 0;
-    window.__angollaAllowPlayUntil = 0;
-    window.__angollaMuteWebAudio = false;
-    window.__angollaPcmEnabled = true;
-    window.__angollaHasGesture = false;
-    window.__angollaAudioReady = false;
+    if (window.__aurivoCaptureInstalled) return;
+    window.__aurivoCaptureInstalled = true;
+    window.__aurivoLastPlaying = null;
+    window.__aurivoPendingPlay = false;
+    window.__aurivoBridgeReady = false;
+    window.__aurivoQueuedPlaying = null;
+    window.__aurivoListenersInstalled = false;
+    window.__aurivoPlayKickTimer = null;
+    window.__aurivoUserGestureTS = 0;
+    window.__aurivoAllowPlayUntil = 0;
+    window.__aurivoMuteWebAudio = false;
+    window.__aurivoPcmEnabled = true;
+    window.__aurivoHasGesture = false;
+    window.__aurivoAudioReady = false;
 
     function initBridge(callback) {
         try {
-            if (window.AngollaBridge) {
-                callback(window.AngollaBridge);
+            if (window.AurivoBridge) {
+                callback(window.AurivoBridge);
                 return;
             }
             if (!window.qt || !window.qt.webChannelTransport) {
@@ -35,9 +35,9 @@ def build_web_audio_capture_js():
                     return;
                 }
                 new QWebChannel(qt.webChannelTransport, function(channel) {
-                    window.AngollaBridge = channel.objects.AngollaBridge;
-                    window.bridge = window.AngollaBridge;
-                    callback(window.AngollaBridge);
+                    window.AurivoBridge = channel.objects.AurivoBridge;
+                    window.bridge = window.AurivoBridge;
+                    callback(window.AurivoBridge);
                 });
             }
             if (typeof QWebChannel === 'undefined') {
@@ -78,7 +78,7 @@ def build_web_audio_capture_js():
 
     function applyMediaMute(muted) {
         try {
-            if (window.__angollaAudioCtx && window.__angollaOutputGain) {
+            if (window.__aurivoAudioCtx && window.__aurivoOutputGain) {
                 // Use WebAudio gain; muting element can silence PCM capture.
                 return;
             }
@@ -86,36 +86,36 @@ def build_web_audio_capture_js():
             for (var i = 0; i < els.length; i++) {
                 var el = els[i];
                 if (muted) {
-                    if (typeof el.__angollaPrevVolume !== 'number') {
-                        el.__angollaPrevVolume = el.volume;
+                    if (typeof el.__aurivoPrevVolume !== 'number') {
+                        el.__aurivoPrevVolume = el.volume;
                     }
                     el.muted = true;
                     el.volume = 0;
                 } else {
                     el.muted = false;
-                    if (typeof el.__angollaPrevVolume === 'number') {
-                        el.volume = el.__angollaPrevVolume;
+                    if (typeof el.__aurivoPrevVolume === 'number') {
+                        el.volume = el.__aurivoPrevVolume;
                     }
                 }
             }
         } catch (e) {}
     }
 
-    window.__angollaSetMuteWebAudio = function(muted) {
-        window.__angollaMuteWebAudio = !!muted;
-        applyMediaMute(window.__angollaMuteWebAudio);
-        if (window.__angollaOutputGain) {
+    window.__aurivoSetMuteWebAudio = function(muted) {
+        window.__aurivoMuteWebAudio = !!muted;
+        applyMediaMute(window.__aurivoMuteWebAudio);
+        if (window.__aurivoOutputGain) {
             try {
-                window.__angollaOutputGain.gain.value = muted ? 0.0 : 1.0;
+                window.__aurivoOutputGain.gain.value = muted ? 0.0 : 1.0;
             } catch (e) {}
         }
     };
 
-    window.__angollaSetPcmEnabled = function(enabled) {
-        window.__angollaPcmEnabled = !!enabled;
+    window.__aurivoSetPcmEnabled = function(enabled) {
+        window.__aurivoPcmEnabled = !!enabled;
     };
 
-    window.__angollaSetWebVolume = function(vol) {
+    window.__aurivoSetWebVolume = function(vol) {
         var v = Math.max(0.0, Math.min(1.0, Number(vol) || 0));
         try {
             var els = document.querySelectorAll('video, audio');
@@ -130,25 +130,25 @@ def build_web_audio_capture_js():
     function markUserGesture(evt) {
         if (evt && evt.isTrusted === false) return;
         var now = Date.now();
-        window.__angollaUserGestureTS = now;
-        window.__angollaHasGesture = true;
+        window.__aurivoUserGestureTS = now;
+        window.__aurivoHasGesture = true;
         initAudioFromGesture();
         if (evt && isExplicitPlayTarget(evt.target)) {
-            window.__angollaAllowPlayUntil = now + 6000;
+            window.__aurivoAllowPlayUntil = now + 6000;
         }
     }
 
     function tryResumeAudioContext() {
-        if (!window.__angollaAudioCtx) return;
+        if (!window.__aurivoAudioCtx) return;
         try {
-            if (window.__angollaAudioCtx.state === 'suspended') {
-                window.__angollaAudioCtx.resume();
+            if (window.__aurivoAudioCtx.state === 'suspended') {
+                window.__aurivoAudioCtx.resume();
             }
         } catch (e) {}
     }
 
     function userGestureAllowed() {
-        return Date.now() <= window.__angollaAllowPlayUntil;
+        return Date.now() <= window.__aurivoAllowPlayUntil;
     }
 
     function isExplicitPlayTarget(target) {
@@ -199,14 +199,14 @@ def build_web_audio_capture_js():
     }
 
     function sendPlaying(playing, force) {
-        if (!force && window.__angollaLastPlaying === playing) return;
-        window.__angollaLastPlaying = playing;
-        var bridge = window.AngollaBridge;
+        if (!force && window.__aurivoLastPlaying === playing) return;
+        window.__aurivoLastPlaying = playing;
+        var bridge = window.AurivoBridge;
         if (!bridge) {
-            window.__angollaQueuedPlaying = playing;
+            window.__aurivoQueuedPlaying = playing;
             return;
         }
-        window.__angollaQueuedPlaying = null;
+        window.__aurivoQueuedPlaying = null;
         if (typeof bridge.report_video_playing === 'function') {
             bridge.report_video_playing(playing);
         }
@@ -236,67 +236,67 @@ def build_web_audio_capture_js():
     }
 
     function ensureContext() {
-        if (!window.__angollaAudioCtx) return false;
+        if (!window.__aurivoAudioCtx) return false;
         tryResumeAudioContext();
 
-        if (!window.__angollaOutputGain) {
-            window.__angollaOutputGain = window.__angollaAudioCtx.createGain();
-            window.__angollaOutputGain.gain.value = window.__angollaMuteWebAudio ? 0.0 : 1.0;
+        if (!window.__aurivoOutputGain) {
+            window.__aurivoOutputGain = window.__aurivoAudioCtx.createGain();
+            window.__aurivoOutputGain.gain.value = window.__aurivoMuteWebAudio ? 0.0 : 1.0;
         }
 
-        if (!window.__angollaFreqData ||
-            window.__angollaFreqData.length !== window.__angollaAnalyser.frequencyBinCount) {
-            window.__angollaFreqData = new Uint8Array(
-                window.__angollaAnalyser.frequencyBinCount
+        if (!window.__aurivoFreqData ||
+            window.__aurivoFreqData.length !== window.__aurivoAnalyser.frequencyBinCount) {
+            window.__aurivoFreqData = new Uint8Array(
+                window.__aurivoAnalyser.frequencyBinCount
             );
         }
-        if (!window.__angollaTimeData ||
-            window.__angollaTimeData.length !== window.__angollaAnalyser.fftSize) {
-            window.__angollaTimeData = new Uint8Array(
-                window.__angollaAnalyser.fftSize
+        if (!window.__aurivoTimeData ||
+            window.__aurivoTimeData.length !== window.__aurivoAnalyser.fftSize) {
+            window.__aurivoTimeData = new Uint8Array(
+                window.__aurivoAnalyser.fftSize
             );
         }
         return true;
     }
 
     function initAudioFromGesture() {
-        if (!window.__angollaHasGesture) return false;
-        if (!window.__angollaAudioCtx) {
+        if (!window.__aurivoHasGesture) return false;
+        if (!window.__aurivoAudioCtx) {
             var AudioCtx = window.AudioContext || window.webkitAudioContext;
             if (!AudioCtx) return false;
             try {
-                window.__angollaAudioCtx = new AudioCtx({ sampleRate: 48000 });
+                window.__aurivoAudioCtx = new AudioCtx({ sampleRate: 48000 });
             } catch (e) {
-                window.__angollaAudioCtx = new AudioCtx();
+                window.__aurivoAudioCtx = new AudioCtx();
             }
-            window.__angollaAnalyser = window.__angollaAudioCtx.createAnalyser();
-            window.__angollaAnalyser.fftSize = 2048;
-            window.__angollaAnalyser.smoothingTimeConstant = 0.05; // 0.10 -> 0.05 (Saf ham ses, sıfıra yakın gecikme)
+            window.__aurivoAnalyser = window.__aurivoAudioCtx.createAnalyser();
+            window.__aurivoAnalyser.fftSize = 2048;
+            window.__aurivoAnalyser.smoothingTimeConstant = 0.05; // 0.10 -> 0.05 (Saf ham ses, sıfıra yakın gecikme)
         }
         tryResumeAudioContext();
-        window.__angollaAudioReady = window.__angollaAudioCtx &&
-            window.__angollaAudioCtx.state === 'running';
-        if (!window.__angollaOutputGain && window.__angollaAudioCtx) {
-            window.__angollaOutputGain = window.__angollaAudioCtx.createGain();
-            window.__angollaOutputGain.gain.value = window.__angollaMuteWebAudio ? 0.0 : 1.0;
+        window.__aurivoAudioReady = window.__aurivoAudioCtx &&
+            window.__aurivoAudioCtx.state === 'running';
+        if (!window.__aurivoOutputGain && window.__aurivoAudioCtx) {
+            window.__aurivoOutputGain = window.__aurivoAudioCtx.createGain();
+            window.__aurivoOutputGain.gain.value = window.__aurivoMuteWebAudio ? 0.0 : 1.0;
         }
         ensureProcessor();
-        return window.__angollaAudioReady;
+        return window.__aurivoAudioReady;
     }
 
-    window.__angollaInitAudioFromGesture = initAudioFromGesture;
+    window.__aurivoInitAudioFromGesture = initAudioFromGesture;
 
     function ensureProcessor() {
-        if (window.__angollaProcessor) return;
-        if (!window.__angollaAudioCtx) return;
+        if (window.__aurivoProcessor) return;
+        if (!window.__aurivoAudioCtx) return;
         var bufferSize = 1024;
         try {
-            window.__angollaProcessor = window.__angollaAudioCtx.createScriptProcessor(
+            window.__aurivoProcessor = window.__aurivoAudioCtx.createScriptProcessor(
                 bufferSize, 2, 2
             );
         } catch (e) {
             try {
-                window.__angollaProcessor = window.__angollaAudioCtx.createScriptProcessor(
+                window.__aurivoProcessor = window.__aurivoAudioCtx.createScriptProcessor(
                     2048, 2, 2
                 );
                 bufferSize = 2048;
@@ -304,10 +304,10 @@ def build_web_audio_capture_js():
                 return;
             }
         }
-        window.__angollaProcessor.onaudioprocess = function(evt) {
+        window.__aurivoProcessor.onaudioprocess = function(evt) {
             try {
-                if (!window.__angollaPcmEnabled) return;
-                var bridge = window.AngollaBridge;
+                if (!window.__aurivoPcmEnabled) return;
+                var bridge = window.AurivoBridge;
                 if (!bridge || typeof bridge.send_web_audio_pcm !== 'function') return;
                 var input = evt.inputBuffer;
                 if (!input || input.length === 0) return;
@@ -319,13 +319,13 @@ def build_web_audio_capture_js():
                     interleaved[i * 2] = ch0[i];
                     interleaved[i * 2 + 1] = ch1[i];
                 }
-                bridge.send_web_audio_pcm(interleaved, input.sampleRate || window.__angollaAudioCtx.sampleRate, 2);
+                bridge.send_web_audio_pcm(interleaved, input.sampleRate || window.__aurivoAudioCtx.sampleRate, 2);
             } catch (e) {}
         };
     }
 
     function reportState(media) {
-        var bridge = window.AngollaBridge;
+        var bridge = window.AurivoBridge;
         if (!bridge || typeof bridge.report_playback_state !== 'function') return;
         var paused = !!media.paused;
         var ended = !!media.ended;
@@ -338,12 +338,12 @@ def build_web_audio_capture_js():
 
     function attachMedia(media) {
         if (!media) return;
-        window.__angollaCurrentMedia = media;
+        window.__aurivoCurrentMedia = media;
 
-        if (!media.__angollaEventsAttached) {
-            media.__angollaEventsAttached = true;
+        if (!media.__aurivoEventsAttached) {
+            media.__aurivoEventsAttached = true;
             var onPlay = function() {
-                if (!window.__angollaAudioCtx && window.__angollaHasGesture) {
+                if (!window.__aurivoAudioCtx && window.__aurivoHasGesture) {
                     initAudioFromGesture();
                 } else {
                     tryResumeAudioContext();
@@ -373,45 +373,45 @@ def build_web_audio_capture_js():
         }
         ensureProcessor();
 
-        if (window.__angollaSource &&
-            window.__angollaSource.__angollaMedia === media) {
+        if (window.__aurivoSource &&
+            window.__aurivoSource.__aurivoMedia === media) {
             reportState(media);
             return;
         }
 
         try {
-            if (window.__angollaSource) {
-                window.__angollaSource.disconnect();
+            if (window.__aurivoSource) {
+                window.__aurivoSource.disconnect();
             }
-            if (window.__angollaAnalyser) {
-                window.__angollaAnalyser.disconnect();
+            if (window.__aurivoAnalyser) {
+                window.__aurivoAnalyser.disconnect();
             }
-            if (window.__angollaProcessor) {
-                window.__angollaProcessor.disconnect();
+            if (window.__aurivoProcessor) {
+                window.__aurivoProcessor.disconnect();
             }
-            if (window.__angollaOutputGain) {
-                window.__angollaOutputGain.disconnect();
+            if (window.__aurivoOutputGain) {
+                window.__aurivoOutputGain.disconnect();
             }
         } catch (e) {}
 
         try {
-            var src = window.__angollaAudioCtx.createMediaElementAudioSource(media);
-            src.__angollaMedia = media;
-            src.connect(window.__angollaAnalyser);
-            if (window.__angollaProcessor) {
-                window.__angollaAnalyser.connect(window.__angollaProcessor);
-                window.__angollaProcessor.connect(window.__angollaOutputGain);
-                window.__angollaOutputGain.connect(window.__angollaAudioCtx.destination);
+            var src = window.__aurivoAudioCtx.createMediaElementAudioSource(media);
+            src.__aurivoMedia = media;
+            src.connect(window.__aurivoAnalyser);
+            if (window.__aurivoProcessor) {
+                window.__aurivoAnalyser.connect(window.__aurivoProcessor);
+                window.__aurivoProcessor.connect(window.__aurivoOutputGain);
+                window.__aurivoOutputGain.connect(window.__aurivoAudioCtx.destination);
             } else {
-                window.__angollaAnalyser.connect(window.__angollaOutputGain);
-                window.__angollaOutputGain.connect(window.__angollaAudioCtx.destination);
+                window.__aurivoAnalyser.connect(window.__aurivoOutputGain);
+                window.__aurivoOutputGain.connect(window.__aurivoAudioCtx.destination);
             }
-            window.__angollaSource = src;
+            window.__aurivoSource = src;
         } catch (e) {}
 
-        if (window.__angollaMuteWebAudio) {
-            if (window.__angollaOutputGain) {
-                window.__angollaOutputGain.gain.value = 0.0;
+        if (window.__aurivoMuteWebAudio) {
+            if (window.__aurivoOutputGain) {
+                window.__aurivoOutputGain.gain.value = 0.0;
             }
         }
 
@@ -419,14 +419,14 @@ def build_web_audio_capture_js():
     }
 
     function sendFrame() {
-        var bridge = window.AngollaBridge;
-        var media = window.__angollaCurrentMedia;
+        var bridge = window.AurivoBridge;
+        var media = window.__aurivoCurrentMedia;
         if (!bridge || typeof bridge.send_web_audio !== 'function' || !media) return;
 
         if (!ensureContext()) return;
-        var analyser = window.__angollaAnalyser;
-        var timeData = window.__angollaTimeData;
-        var freqData = window.__angollaFreqData;
+        var analyser = window.__aurivoAnalyser;
+        var timeData = window.__aurivoTimeData;
+        var freqData = window.__aurivoFreqData;
 
         var adActive = isAdActive();
         var paused = !!media.paused;
@@ -453,11 +453,11 @@ def build_web_audio_capture_js():
     }
 
     function startLoops() {
-        if (!window.__angollaCaptureLoop) {
-            window.__angollaCaptureLoop = setInterval(sendFrame, 16); // 20ms -> 16ms (60 FPS - Yerel mod ile aynı)
+        if (!window.__aurivoCaptureLoop) {
+            window.__aurivoCaptureLoop = setInterval(sendFrame, 16); // 20ms -> 16ms (60 FPS - Yerel mod ile aynı)
         }
-        if (!window.__angollaStateLoop) {
-            window.__angollaStateLoop = setInterval(function() {
+        if (!window.__aurivoStateLoop) {
+            window.__aurivoStateLoop = setInterval(function() {
                 var media = pickActiveMedia();
                 if (media) {
                     attachMedia(media);
@@ -468,10 +468,10 @@ def build_web_audio_capture_js():
     }
 
     function watchForVideo() {
-        if (window.__angollaObserver) return;
+        if (window.__aurivoObserver) return;
         var root = document.documentElement || document.body;
         if (!root) return;
-        window.__angollaObserver = new MutationObserver(function() {
+        window.__aurivoObserver = new MutationObserver(function() {
             var list = getMediaElements();
             for (var i = 0; i < list.length; i++) {
                 attachMedia(list[i]);
@@ -479,7 +479,7 @@ def build_web_audio_capture_js():
             var media = pickActiveMedia();
             if (media) notifyPlaying(media);
         });
-        window.__angollaObserver.observe(root, {
+        window.__aurivoObserver.observe(root, {
             childList: true,
             subtree: true,
             attributes: true,
@@ -488,32 +488,32 @@ def build_web_audio_capture_js():
     }
 
     function kickPlayDetection() {
-        if (window.__angollaPlayKickTimer) return;
+        if (window.__aurivoPlayKickTimer) return;
         var attempts = 0;
-        window.__angollaPlayKickTimer = setInterval(function() {
+        window.__aurivoPlayKickTimer = setInterval(function() {
             attempts += 1;
             var media = pickActiveMedia();
             if (media) {
                 attachMedia(media);
                 notifyPlaying(media, true);
-                clearInterval(window.__angollaPlayKickTimer);
-                window.__angollaPlayKickTimer = null;
-                window.__angollaPendingPlay = false;
+                clearInterval(window.__aurivoPlayKickTimer);
+                window.__aurivoPlayKickTimer = null;
+                window.__aurivoPendingPlay = false;
                 setTimeout(function() { notifyPlaying(media); }, 1200);
                 return;
             }
             if (attempts >= 12) {
-                clearInterval(window.__angollaPlayKickTimer);
-                window.__angollaPlayKickTimer = null;
-                window.__angollaPendingPlay = false;
+                clearInterval(window.__aurivoPlayKickTimer);
+                window.__aurivoPlayKickTimer = null;
+                window.__aurivoPendingPlay = false;
                 sendPlaying(false, true);
             }
         }, 150);
     }
 
     function installListeners() {
-        if (window.__angollaListenersInstalled) return;
-        window.__angollaListenersInstalled = true;
+        if (window.__aurivoListenersInstalled) return;
+        window.__aurivoListenersInstalled = true;
         document.addEventListener('play', function(evt) {
             var target = evt.target;
             if (target && (target.tagName === 'VIDEO' || target.tagName === 'AUDIO')) {
@@ -533,10 +533,10 @@ def build_web_audio_capture_js():
                 return;
             }
             if (isExplicitPlayTarget(evt.target)) {
-                window.__angollaPendingPlay = true;
+                window.__aurivoPendingPlay = true;
                 initAudioFromGesture();
-                if (window.__angollaCurrentMedia) {
-                    attachMedia(window.__angollaCurrentMedia);
+                if (window.__aurivoCurrentMedia) {
+                    attachMedia(window.__aurivoCurrentMedia);
                 }
                 sendPlaying(true, true);
                 kickPlayDetection();
@@ -551,7 +551,7 @@ def build_web_audio_capture_js():
     watchForVideo();
 
     initBridge(function() {
-        window.__angollaBridgeReady = true;
+        window.__aurivoBridgeReady = true;
         ensureContext();
         var media = pickActiveMedia();
         if (media) {
@@ -562,8 +562,8 @@ def build_web_audio_capture_js():
         for (var i = 0; i < allMedia.length; i++) {
             attachMedia(allMedia[i]);
         }
-        if (window.__angollaQueuedPlaying !== null) {
-            sendPlaying(window.__angollaQueuedPlaying, true);
+        if (window.__aurivoQueuedPlaying !== null) {
+            sendPlaying(window.__aurivoQueuedPlaying, true);
         }
         watchForVideo();
         startLoops();
@@ -578,7 +578,7 @@ def build_web_audio_capture_js():
                 }
                 return 'maybe';
             };
-            console.log("✓ Angolla: YouTube JS Codec forcing active.");
+            console.log("✓ Aurivo: YouTube JS Codec forcing active.");
         }
     } catch(e) {}
 
@@ -589,13 +589,13 @@ def build_web_audio_capture_js():
 def build_web_playback_state_js():
     return r"""
 (function() {
-    if (window.__angollaPlaybackInstalled) return;
-    window.__angollaPlaybackInstalled = true;
+    if (window.__aurivoPlaybackInstalled) return;
+    window.__aurivoPlaybackInstalled = true;
 
     function initBridge(callback) {
         try {
-            if (window.AngollaBridge) {
-                callback(window.AngollaBridge);
+            if (window.AurivoBridge) {
+                callback(window.AurivoBridge);
                 return;
             }
             if (!window.qt || !window.qt.webChannelTransport) {
@@ -608,9 +608,9 @@ def build_web_playback_state_js():
                     return;
                 }
                 new QWebChannel(qt.webChannelTransport, function(channel) {
-                    window.AngollaBridge = channel.objects.AngollaBridge;
-                    window.bridge = window.AngollaBridge;
-                    callback(window.AngollaBridge);
+                    window.AurivoBridge = channel.objects.AurivoBridge;
+                    window.bridge = window.AurivoBridge;
+                    callback(window.AurivoBridge);
                 });
             }
             if (typeof QWebChannel === 'undefined') {
@@ -638,7 +638,7 @@ def build_web_playback_state_js():
     }
 
     function reportState() {
-        var bridge = window.AngollaBridge;
+        var bridge = window.AurivoBridge;
         if (!bridge || typeof bridge.report_playback_state !== 'function') return;
         var media = document.querySelector('video, audio');
         var paused = true;
@@ -665,8 +665,8 @@ def build_ad_skip_js(interval_ms=250):
     return f"""
 (function(){{
     try {{
-        if (window.__angollaAdSkipInstalled) return;
-        window.__angollaAdSkipInstalled = true;
+        if (window.__aurivoAdSkipInstalled) return;
+        window.__aurivoAdSkipInstalled = true;
         setInterval(function(){{
             try {{
                 var btn = document.querySelector(
@@ -682,7 +682,7 @@ def build_ad_skip_js(interval_ms=250):
 """
 
 
-class AngollaBridge(QObject):
+class AurivoBridge(QObject):
     playbackStateChanged = pyqtSignal(bool, bool, bool, bool, int)  # paused, ended, loading, adActive, videoCount
     videoPlaying = pyqtSignal(bool)
     webAudioData = pyqtSignal(list)
@@ -710,11 +710,11 @@ class AngollaBridge(QObject):
 
 
 def setup_web_channel(page, main_window):
-    """QWebChannel köprüsünü kur ve AngollaBridge'i bağla."""
+    """QWebChannel köprüsünü kur ve AurivoBridge'i bağla."""
     from PyQt5.QtWebChannel import QWebChannel
-    bridge = AngollaBridge()
+    bridge = AurivoBridge()
     channel = QWebChannel()
-    channel.registerObject('AngollaBridge', bridge)
+    channel.registerObject('AurivoBridge', bridge)
     page.setWebChannel(channel)
     bridge.playbackStateChanged.connect(main_window._on_web_playback_state)
     if hasattr(main_window, "_on_web_video_playing"):

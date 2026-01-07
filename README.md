@@ -1,8 +1,8 @@
-# 🎵 Angolla Music Player
+# 🎵 Aurivo Music Player
 
 <div align="center">
 
-![Angolla Logo](icons/media-playback-start.png)
+![Aurivo Logo](icons/aurivo.png)
 
 **Clementine'den ilham alan güçlü, hafif ve görsel açıdan zengin müzik çalar**
 
@@ -54,7 +54,7 @@
 - **Clementine Tarzı Animasyon**: Attack/release yumuşatma, cap heights
 
 ### 🎛️ Ses İşleme
-- **10 Bantlı Ekolayzır**: Tam kontrol edilebilir frekans bantları
+- **32 Bant Ana EQ + Hazır Ayarlar**: Yüzlerce preset, arama, seçili preset göstergesi
 - **DSP Efektleri** (C++ motoru):
   - Compressor
   - Limiter
@@ -62,6 +62,13 @@
   - Stereo Widener
   - Bass Boost
 - **Crossfade**: Parçalar arası geçiş efekti
+
+## 🆕 Yeni Sürüm (Aurivo)
+
+Bu sürümde uygulama adı **Angolla → Aurivo** olarak yeniden markalandı.
+- Paketleme/kurulum dosyaları ve launcher adı **aurivo** olacak şekilde güncellendi
+- İkon seti **Aurivo** adıyla üretildi ve bağlandı
+- Eski kullanıcı verileri için (playlist/config) geriye dönük taşıma mantığı korunur
 
 ### 📚 Kütüphane Yönetimi
 - **SQLite Veritabanı**: Hızlı tarama ve arama
@@ -85,18 +92,18 @@
 ### İndirme ve Kurulum
 ```bash
 # 1. Son sürümü indirin
-wget https://github.com/KULLANICI_ADI/Angolla-Music-Player/releases/latest/download/Angolla-Linux-v1.0.tar.gz
+wget https://github.com/KULLANICI_ADI/Aurivo-Music-Player/releases/latest/download/Aurivo-Linux-v1.0.tar.gz
 
 # 2. Sistem bağımlılıklarını kurun
 sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav  # Arch
 # sudo apt install gstreamer1.0-plugins-* gstreamer1.0-libav  # Ubuntu
 
 # 3. Paketi çıkartın
-tar -xzf Angolla-Linux-v1.0.tar.gz
-cd angolla
+tar -xzf Aurivo-Linux-v2.0.tar.gz
+cd aurivo
 
 # 4. Çalıştırın
-./angolla
+./aurivo
 ```
 
 Detaylı kurulum talimatları için [INSTALL.md](INSTALL.md) dosyasına bakın.
@@ -136,7 +143,7 @@ Detaylı kurulum talimatları için [INSTALL.md](INSTALL.md) dosyasına bakın.
 - **Tek Dosya Yapısı**: ~3000+ satır monolitik Python kodu
 - **PyQt5 GUI**: QMainWindow, QMediaPlayer, QAudioProbe
 - **C++ Bileşenler**:
-  - `angolla_dsp.so`: Ses efektleri motoru
+  - `aurivo_dsp.so`: Ses efektleri motoru
   - `subtitle_engine.so`: Altyazı işleme (pybind11)
 - **FFT Pipeline**: QAudioProbe → NumPy → 96-band spektrum → Görselleştirme
 
@@ -157,8 +164,8 @@ QMediaPlayer → QAudioProbe → process_audio_buffer()
 
 ```bash
 # 1. Repository'yi klonlayın
-git clone https://github.com/KULLANICI_ADI/Angolla-Music-Player.git
-cd Angolla-Music-Player
+git clone https://github.com/KULLANICI_ADI/Aurivo-Music-Player.git
+cd Aurivo-Music-Player
 
 # 2. Python bağımlılıklarını kurun
 pip install PyQt5 mutagen numpy soundfile Pillow
@@ -204,7 +211,7 @@ Bu proje GPL-3.0 lisansı altında dağıtılmaktadır. Detaylar için [LICENSE]
 
 Hata bulduysanız veya özellik önerisi yapmak istiyorsanız:
 - [GitHub Issues](../../issues) üzerinden hata bildirin
-- Terminal çıktısını ekleyin (`./angolla` ile çalıştırın)
+- Terminal çıktısını ekleyin (`./aurivo` ile çalıştırın)
 - Sistem bilgilerinizi paylaşın (distro, Python versiyonu)
 
 ## 🙏 Teşekkürler
@@ -219,8 +226,8 @@ Hata bulduysanız veya özellik önerisi yapmak istiyorsanız:
 
 <div align="center">
 
-**Angolla ile müziğinizin tadını çıkarın! 🎶**
+**Aurivo ile müziğinizin tadını çıkarın! 🎶**
 
-[⬆ Başa Dön](#-angolla-music-player)
+[⬆ Başa Dön](#-aurivo-music-player)
 
 </div>

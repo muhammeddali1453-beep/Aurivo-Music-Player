@@ -1,4 +1,4 @@
-# Angolla Security Configuration
+# Aurivo Security Configuration
 # Easily manage trusted domains and bridge-allowed site list here.
 
 # Domains considered trusted for the embedded Web tab.

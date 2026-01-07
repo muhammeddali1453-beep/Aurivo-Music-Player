@@ -115,7 +115,7 @@ public:
     projectM::Settings settings;
     settings.meshX = 32;
     settings.meshY = 24;
-    settings.fps = 60; // Daha yüksek varsayılan (Angolla 35, biz 60)
+    settings.fps = 60; // Daha yüksek varsayılan (Aurivo 35, biz 60)
     settings.textureSize = 512;
     settings.windowWidth = width;
     settings.windowHeight = height;

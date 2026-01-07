@@ -1,4 +1,4 @@
-# Angolla Music Player - Kurulum Rehberi
+# Aurivo Music Player - Kurulum Rehberi
 
 ## ⚠️ DİKKAT
 
@@ -13,17 +13,17 @@
 ### GitHub Releases'tan İndirme
 1. [Releases sayfasına](../../releases) gidin
 2. En son sürümü bulun (örn: v1.0)
-3. **Assets** bölümünden `Angolla-Linux-v1.0.tar.gz` dosyasını indirin (203 MB)
+3. **Assets** bölümünden `Aurivo-Linux-v1.0.tar.gz` dosyasını indirin (203 MB)
 
 ### Komut satırından indirme (opsiyonel)
 ```bash
-wget https://github.com/KULLANICI_ADI/Angolla-Music-Player/releases/latest/download/Angolla-Linux-v1.0.tar.gz
+wget https://github.com/KULLANICI_ADI/Aurivo-Music-Player/releases/latest/download/Aurivo-Linux-v1.0.tar.gz
 ```
 
 ## 🚀 Kurulum (Linux)
 
 ### 1. Sistem Gereksinimleri
-Angolla çalışmak için şu sistem paketlerine ihtiyaç duyar:
+Aurivo çalışmak için şu sistem paketlerine ihtiyaç duyar:
 
 ```bash
 # Arch Linux / Manjaro
@@ -40,13 +40,13 @@ sudo dnf install gstreamer1-plugins-base gstreamer1-plugins-good \
 
 ### 2. Paketi Çıkartma
 ```bash
-tar -xzf Angolla-Linux-v1.0.tar.gz
-cd angolla
+tar -xzf Aurivo-Linux-v1.0.tar.gz
+cd aurivo
 ```
 
 ### 3. Çalıştırma
 ```bash
-./angolla
+./aurivo
 ```
 
 ### 4. Masaüstü Kısayolu Oluşturma (Opsiyonel)
@@ -54,17 +54,37 @@ Uygulama menüsünden başlatmak için:
 
 ```bash
 # Desktop dosyasını kopyalayın
-cp angolla.desktop ~/.local/share/applications/
+cp aurivo.desktop ~/.local/share/applications/
 
-# Icon'u kopyalayın
+# Icon'u kopyalayın (Icon=aurivo)
 mkdir -p ~/.local/share/icons/hicolor/48x48/apps/
-cp angolla.png ~/.local/share/icons/hicolor/48x48/apps/
+cp icons/media-playback-start.png ~/.local/share/icons/hicolor/48x48/apps/aurivo.png
 
 # Desktop veritabanını güncelleyin
 update-desktop-database ~/.local/share/applications/
 ```
 
-Artık uygulama menünüzde "Angolla Music Player" görünecektir.
+Artık uygulama menünüzde "Aurivo Music Player" görünecektir.
+
+### 5. Sistem Geneline Kurulum (Tüm Kullanıcılar)
+Tüm kullanıcılar için (menü + ikon + komut) kurmak isterseniz:
+
+```bash
+chmod +x ./install_systemwide.sh
+
+# Binary yolunu siz verin (örn: release paketinden ./aurivo)
+sudo ./install_systemwide.sh --bin ./aurivo
+
+# Alternatif: build çıktınız farklıysa
+# sudo ./install_systemwide.sh --bin ./build/aurivo_linux/aurivo
+```
+
+Kurulumdan sonra menüde görünmüyorsa oturumu kapat/aç yapın veya:
+
+```bash
+update-desktop-database /usr/local/share/applications/ || true
+gtk-update-icon-cache -f /usr/local/share/icons/hicolor || true
+```
 
 ## 🎵 İlk Kullanım
 
@@ -95,14 +115,14 @@ Dahili C++ DSP motoru ile:
 - Stereo Widener
 - Bass Boost
 
-Efektler otomatik olarak yüklenir (angolla_dsp.so).
+Efektler otomatik olarak yüklenir (aurivo_dsp.so).
 
 ## ⚙️ Ayarlar ve Yapılandırma
 
 Ayarlar otomatik olarak şurada saklanır:
-- Yapılandırma: `~/.config/Angolla/angolla_config.json`
-- Çalma listeleri: `~/.config/Angolla/angolla_playlist.json`
-- Altyazılar: `~/.local/share/angolla/subtitles/`
+- Yapılandırma: `~/.config/Aurivo/aurivo_config.json`
+- Çalma listeleri: `~/.config/Aurivo/aurivo_playlist.json`
+- Altyazılar: `~/.local/share/aurivo/subtitles/`
 
 ## 🐛 Sorun Giderme
 
@@ -118,8 +138,8 @@ sudo apt install gstreamer1.0-libav  # Ubuntu
 
 ### Ses çıkmıyor
 - Sistem ses ayarlarını kontrol edin
-- Angolla içindeki ses seviyesini kontrol edin
-- Terminal'den `./angolla` çalıştırıp hata mesajlarını kontrol edin
+- Aurivo içindeki ses seviyesini kontrol edin
+- Terminal'den `./aurivo` çalıştırıp hata mesajlarını kontrol edin
 
 ### Görselleştirme çalışmıyor
 - NumPy kurulu olduğundan emin olun: `pip install numpy`
@@ -148,7 +168,7 @@ Yeni sürüm için:
 1. [Releases sayfasından](../../releases) yeni sürümü indirin
 2. Eski klasörü silin veya yeniden adlandırın
 3. Yeni paketi çıkartın
-4. Ayarlarınız otomatik olarak korunur (~/.config/Angolla/)
+4. Ayarlarınız otomatik olarak korunur (~/.config/Aurivo/)
 
 ## 📝 Lisans
 

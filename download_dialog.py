@@ -221,7 +221,7 @@ class DownloadDialog(QDialog):
         v_layout.setSpacing(15) # Match AudioFrame spacing
 
         # Branding & Title for Video (Consistency)
-        lbl_v_brand = QLabel("Angolla Player")
+        lbl_v_brand = QLabel("Aurivo Player")
         lbl_v_brand.setAlignment(Qt.AlignCenter)
         lbl_v_brand.setStyleSheet("font-size: 24px; font-weight: 900; color: #FFFFFF; margin-bottom: 5px; letter-spacing: 1px;")
         v_layout.addWidget(lbl_v_brand)
@@ -278,7 +278,7 @@ class DownloadDialog(QDialog):
         af_layout.setSpacing(15)
         
         # Branding
-        lbl_af_brand = QLabel("Angolla Player")
+        lbl_af_brand = QLabel("Aurivo Player")
         lbl_af_brand.setAlignment(Qt.AlignCenter)
         lbl_af_brand.setStyleSheet("font-size: 24px; font-weight: 900; color: #FFFFFF; margin-bottom: 5px; letter-spacing: 1px;")
         af_layout.addWidget(lbl_af_brand)
@@ -494,7 +494,7 @@ def resolve_yt_dlp_command():
     return None
 
 # ---------------------------------------------------------
-# Merged DownloadWorker (Moved from angolla_downloader.py)
+# Merged DownloadWorker (Moved from aurivo_downloader.py)
 # ---------------------------------------------------------
 from PyQt5.QtCore import QThread, pyqtSignal
 

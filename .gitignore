@@ -1,0 +1,66 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+venv*/
+pyqt_venv/
+env/
+ENV/
+.Python
+
+# Build artifacts
+build/
+dist/
+*.tar.gz
+*.zip
+*.AppImage
+
+# Local native binaries (generated)
+aurivo_dsp.so
+subtitle_engine.cpython-*.so
+viz_engine.cpython-*.so
+
+# Local recovery / backup files
+main.py.clean
+main_recovered.py
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Tooling folders
+.cache/
+.continue/
+.roo/
+.claude/
+
+# User/runtime data (Aurivo)
+aurivo_config.json
+aurivo_config.pkl
+aurivo_playlist.json
+aurivo_playlist.pkl
+aurivo_playlists_collection.json
+aurivo_playlists_collection.pkl
+aurivo_playlists_collection.pkl.bak
+aurivo_library.db
+
+# User/runtime data (legacy Angolla)
+angolla_config.json
+angolla_config.pkl
+angolla_playlist.json
+angolla_playlist.pkl
+angolla_playlists_collection.json
+angolla_playlists_collection.pkl
+angolla_playlists_collection.pkl.bak
+angolla_library.db

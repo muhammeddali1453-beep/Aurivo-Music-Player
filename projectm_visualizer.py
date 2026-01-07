@@ -3,6 +3,7 @@ import random # YENİ: Random eklendi
 import os
 import platform
 import psutil
+import collections
 from PyQt5.QtWidgets import (
     QWidget, QMenu, QAction, QOpenGLWidget, QDialog, QVBoxLayout, 
     QHBoxLayout, QListWidget, QPushButton, QLineEdit, QLabel, QAbstractItemView,
@@ -197,7 +198,7 @@ class SwirlParticle:
 
 class PyQtGraphVisualizer(QWidget):
     """
-    Angolla Music Player - Gelişmiş Spektrum Görselleştirici (Python-Native)
+    Aurivo Music Player - Gelişmiş Spektrum Görselleştirici (Python-Native)
     Tam Özellikli:
     - Çoklu Modlar: Çubuklar, Çizgiler, Dalga, Daire
     - Renk Temaları: Mavi, Yeşil, Mor, Ateş, Beyaz
@@ -225,7 +226,7 @@ class PyQtGraphVisualizer(QWidget):
         self.target_data = np.zeros(self.target_size)
         self.smoothing_alpha = 0.20  # Seri tepki için artırıldı
         self.visual_gain = 1.6       # Orta seviye yükseklik (ses sonuna kadar dolmasın)
-        # Adaptif seviye tahmini (Angolla benzeri sabit hedef)
+        # Adaptif seviye tahmini (Aurivo benzeri sabit hedef)
         self.level_est = 0.55
         self.target_level = 0.6
         self.agc_attack = 0.18   # daha hızlı yükseliş tepkisi
@@ -293,7 +294,7 @@ class PyQtGraphVisualizer(QWidget):
             "fire":   (QColor(255, 200, 0), QColor(255, 20, 0)),   # Ateş
             "white":  (QColor(255, 255, 255), QColor(100, 100, 100)), # Siyah/Beyaz
             
-            # --- Angolla Temalar (Ana Uygulama ile Uyumlu) ---
+            # --- Aurivo Temalar (Ana Uygulama ile Uyumlu) ---
             "AURA Mavi":       (QColor("#40C4FF"), QColor("#0091EA")),
             "Zümrüt Yeşil":    (QColor("#00E676"), QColor("#00600F")),
             "Güneş Turuncusu": (QColor("#FF9800"), QColor("#E65100")),
@@ -313,14 +314,14 @@ class PyQtGraphVisualizer(QWidget):
             "rgb_aura":       (QColor(0,0,0), QColor(0,0,0)) # Kod içinde dinamik hesaplanacak
         }
 
-        # Angolla Physics Vars (TÜM MODLAR için roof physics)
-        self.clem_band_count = 96  # 64 → 96 (Angolla'a yakın yoğunluk)
+        # Aurivo Physics Vars (TÜM MODLAR için roof physics)
+        self.clem_band_count = 96  # 64 → 96 (Aurivo'a yakın yoğunluk)
         self.clem_bars = np.zeros(self.clem_band_count, dtype=float)
         self.clem_roofs = np.zeros(self.clem_band_count, dtype=float)
         self.clem_roof_velocity = np.zeros(self.clem_band_count, dtype=float)
         self.clem_roof_hold = np.zeros(self.clem_band_count, dtype=int) # Kaç frame tuttuğunu sayar
         
-        # Angolla roof physics constants (tüm modlar için)
+        # Aurivo roof physics constants (tüm modlar için)
         # Peak çizgileri: KISA hold + HIZLI düşüş (yerçekimi tarzı)
         self.roof_hold_frames = 24  # 64 → 24 (çizgiler yukarıda kalmasın, hızlı düşsün)
         self.roof_fall_accel = 0.008  # 0.002 → 0.008 (daha güçlü yerçekimi)
@@ -362,7 +363,7 @@ class PyQtGraphVisualizer(QWidget):
         # 90) bazı sistemlerde Qt/SIP yeniden çizim baskısı ile kararlılık sorunlarına yol açabiliyor.
         # Bu nedenle üst sınırı 90 FPS'e çekiyoruz ve minimum intervali 10ms yapıyoruz.
         fps_raw = int(getattr(self, "vis_fps", 60))
-        # Üst sınırı 120 FPS; minimum 20 FPS (Angolla seçenekleriyle uyumlu)
+        # Üst sınırı 120 FPS; minimum 20 FPS (Aurivo seçenekleriyle uyumlu)
         fps = max(20, min(fps_raw, 120))
         self.vis_fps = fps
 
@@ -403,11 +404,11 @@ class PyQtGraphVisualizer(QWidget):
         # 1. Resize/Resample
         # 1. Dynamic Resize: Gelen veri boyutuna göre buffer'ları güncelle
         # Bu sayede main.py'den 96 veya 128 gelmesi fark etmez, adapte olur.
-        if self.mode == "angolla":
-             self._update_angolla_physics(y)
+        if self.mode == "aurivo":
+             self._update_aurivo_physics(y)
              return
         
-        # Diğer modlar için standart işleme + ANGOLLA ROOF PHYSICS
+        # Diğer modlar için standart işleme + AURIVO ROOF PHYSICS
         # Hedef veriyi güncelle (Smooth transition için)
         if len(y) != self.target_size:
             # Buffer boyutu uyuşmazsa yeniden ayarla
@@ -430,7 +431,7 @@ class PyQtGraphVisualizer(QWidget):
 
         # 3. AGC (Auto Gain Control) - ADAPTİF HIZLI İYİLEŞME
         if self.agc_enabled:
-            # Angolla-benzeri: 85. persentil seviyeyi takip edip sabit hedefe yaklaştır
+            # Aurivo-benzeri: 85. persentil seviyeyi takip edip sabit hedefe yaklaştır
             current_level = float(np.percentile(y_log, 85))
             if current_level < 0.05:
                 self.silence_timer += 1
@@ -630,7 +631,7 @@ class PyQtGraphVisualizer(QWidget):
         act_mirror.setChecked(self.mirror_mode)
         act_mirror.triggered.connect(lambda chk: self.set_option("mirror", chk))
 
-        # FPS Seçimi (Angolla tarzı etiketlerle)
+        # FPS Seçimi (Aurivo tarzı etiketlerle)
         fps_menu = menu.addMenu("⏱️ FPS")
         fps_options = [
             ("Düşük (20 fps)", 20),
@@ -680,7 +681,7 @@ class PyQtGraphVisualizer(QWidget):
         self.preset_hard_cut = bool(val)
 
     def toggle_mode(self):
-        modes = ["bars", "pyramid_bars", "mirror_bars", "round_bars", "energy_ring", "swirl_3d", "wave", "angolla"]
+        modes = ["bars", "pyramid_bars", "mirror_bars", "round_bars", "energy_ring", "swirl_3d", "wave", "aurivo"]
         try:
             current_idx = modes.index(self.mode)
             self.mode = modes[(current_idx + 1) % len(modes)]
@@ -755,7 +756,7 @@ class PyQtGraphVisualizer(QWidget):
         self.bar_phase += 0.5
 
         # Çizim Verisi Hazırla
-        if self.mode == "angolla":
+        if self.mode == "aurivo":
             draw_data = self.clem_bars
             draw_peaks = self.clem_roofs
         else:
@@ -768,8 +769,8 @@ class PyQtGraphVisualizer(QWidget):
             draw_peaks = np.concatenate((draw_peaks[::-1], draw_peaks))
 
         # Mod Çizimi Çağır
-        if self.mode == "angolla":
-             self._draw_angolla_bars(painter)
+        if self.mode == "aurivo":
+             self._draw_aurivo_bars(painter)
         elif self.mode in ["bars", "pyramid_bars", "mirror_bars", "round_bars"]:
             self._draw_bars(painter, draw_data, draw_peaks)
         elif self.mode == "lines":
@@ -871,7 +872,7 @@ class PyQtGraphVisualizer(QWidget):
 
     def _draw_3d_swirl(self, painter, w, h, data):
         """
-        3D Swirl / Galaxy Mode (Ported from Angolla Visual)
+        3D Swirl / Galaxy Mode (Ported from Aurivo Visual)
         - FFT verilerine göre dönen parçacık sistemi
         - Parçacıkların rengi bass + mid + treble'a göre değişir
         - 3D derinlik efekti (Z-axis simulation)
@@ -991,7 +992,7 @@ class PyQtGraphVisualizer(QWidget):
              pass
 
         bar_w = w / count
-        # ⚡ Angolla rendering: bar 85% → 95% (daha geniş, gap minimum)
+        # ⚡ Aurivo rendering: bar 85% → 95% (daha geniş, gap minimum)
         bar_width_ratio = 0.95  # Gap minimize edildi
         
         c1, c2 = self._get_colors()
@@ -1034,22 +1035,22 @@ class PyQtGraphVisualizer(QWidget):
             else:
                 p.drawRect(rect)
 
-            # Hayalet Çizgi (Peak) - Angolla tarzı (1px)
+            # Hayalet Çizgi (Peak) - Aurivo tarzı (1px)
             if self.ghost_effect:
                 peak_h = display_peaks[i] * h
                 if self.mode == "mirror_bars":
                     # Mirror peak: üstte ve altta çizgi
                     peak_y = h - peak_h
-                    # Angolla tarzı ince peak çizgi (1px)
+                    # Aurivo tarzı ince peak çizgi (1px)
                     p.fillRect(QRectF(x, peak_y - 1, bar_w * bar_width_ratio, 1), QColor(255, 255, 255, 220))
                 else:
                     # Normal mode peak (1px)
                     peak_y = h - peak_h
                     p.fillRect(QRectF(x, peak_y - 1, bar_w * bar_width_ratio, 1), QColor(255, 255, 255, 220))
 
-    def _update_angolla_physics(self, raw_data):
+    def _update_aurivo_physics(self, raw_data):
         """
-        Angolla kaynak kodundan port edilmiş fizik motoru.
+        Aurivo kaynak kodundan port edilmiş fizik motoru.
         Mantık:
         1. Logaritmik scale (Low volume detail)
         2. Lineer yerçekimi (Sabit hızda düşüş)
@@ -1066,11 +1067,11 @@ class PyQtGraphVisualizer(QWidget):
             raw_data
         )
 
-        # Fizik parametreleri (Angolla kaynak kodundan uyarlı)
+        # Fizik parametreleri (Aurivo kaynak kodundan uyarlı)
         # Hız ayarları (lineer düşüş tabanı)
         max_down = 0.060
 
-        # Peak (Roof) parametreleri (Angolla benzeri)
+        # Peak (Roof) parametreleri (Aurivo benzeri)
         # kRoofHoldTime = 48; kRoofVelocityReductionFactor = 32
         roof_hold_frames = 24
         roof_fall_accel = 0.010
@@ -1136,9 +1137,9 @@ class PyQtGraphVisualizer(QWidget):
                         self.clem_roofs[i] = 0.0
                         self.clem_roof_velocity[i] = 0.0
 
-    def _draw_angolla_bars(self, p):
+    def _draw_aurivo_bars(self, p):
         """
-        Angolla tarzı çizim.
+        Aurivo tarzı çizim.
         Referans: Koyu Mavi -> Açık Cyan Gradient
         Kayıp (Gap): Çok ince (1px)
         """
@@ -1274,7 +1275,7 @@ class PyQtGraphVisualizer(QWidget):
 
 
 # ============================================================================
-# PROJECTM PRESET SELECTION DIALOG (ANGOLLA STYLE)
+# PROJECTM PRESET SELECTION DIALOG (AURIVO STYLE)
 # ============================================================================
 
 class PresetSelectionDialog(QDialog):
@@ -1283,7 +1284,7 @@ class PresetSelectionDialog(QDialog):
         self.visualizer = visualizer
         self.setWindowTitle("Görsel seç")
         self.resize(600, 500)
-        # Daha parlak, daha belirgin stiller (Angolla benzeri)
+        # Daha parlak, daha belirgin stiller (Aurivo benzeri)
         self.setStyleSheet("""
             QDialog { background-color: #353535; color: #f0f0f0; font-family: Segoe UI, sans-serif; }
             QListWidget { 
@@ -1380,7 +1381,11 @@ class PresetSelectionDialog(QDialog):
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list_widget.setAlternatingRowColors(True)
-        # ÖNEMLİ: Seçim değişince önizleme yap
+        # ÖNEMLİ: Seçim değişince önizleme yap (debounce ile; ProjectM'e spam atma)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._do_preview)
+        self._pending_preview_index = None
         self.list_widget.itemClicked.connect(self.preview_preset)
         layout.addWidget(self.list_widget)
 
@@ -1443,7 +1448,7 @@ class PresetSelectionDialog(QDialog):
         # Selected Items
         selected_indices = cfg.get("selected_indices", set())
         
-        # Eğer config boşsa (ilk açılış), hepsini seçili yap (Angolla mantığı)
+        # Eğer config boşsa (ilk açılış), hepsini seçili yap (Aurivo mantığı)
         if not cfg:
             self.select_all()
         else:
@@ -1467,10 +1472,21 @@ class PresetSelectionDialog(QDialog):
             item = self.list_widget.currentItem()
         if item:
             idx = item.data(Qt.UserRole)
-            print(f"👁 Önizleme: Index {idx}")
-            self.visualizer.set_preset(idx)
+            self._pending_preview_index = idx
+            # Çok hızlı tıklamalarda sadece son seçimi uygula
+            self._preview_timer.start(90)
         else:
             print("✗ Önizleme: Item bulunamadı")
+
+    def _do_preview(self):
+        try:
+            idx = self._pending_preview_index
+            if idx is None:
+                return
+            self._pending_preview_index = None
+            self.visualizer.set_preset(int(idx))
+        except Exception:
+            pass
 
     def accept_config(self):
         # Ayarları topla ve Visualizer'a kaydet
@@ -1527,6 +1543,26 @@ class ProjectMVisualizer(QOpenGLWidget):
         # Otomatik döngü timer'ı
         self.pm_cycle_timer = QTimer(self)
         self.pm_cycle_timer.timeout.connect(self._pm_random)
+
+        # PCM queue (main thread -> render loop). Keep bounded to avoid latency growth.
+        self._pcm_queue = collections.deque()
+        self._pcm_queue_samples = 0  # int16 sample count (interleaved)
+        self._pcm_queue_max_samples = 2 * 1024 * 10  # ~10 blocks @1024 frames stereo
+
+        # Preset state / UX
+        self._current_preset_index = None
+        self._preset_change_in_flight = False
+        self._status_overlay = QLabel(self)
+        self._status_overlay.setVisible(False)
+        self._status_overlay.setAlignment(Qt.AlignCenter)
+        self._status_overlay.setWordWrap(True)
+        self._status_overlay.setStyleSheet(
+            "QLabel { background: rgba(0,0,0,170); color: white; padding: 10px 14px; "
+            "border: 1px solid rgba(255,255,255,70); border-radius: 10px; font-weight: bold; }"
+        )
+        self._status_hide_timer = QTimer(self)
+        self._status_hide_timer.setSingleShot(True)
+        self._status_hide_timer.timeout.connect(self._hide_status_overlay)
         
         # Preset dizini kontrolü
         if not os.path.exists(self.preset_dir):
@@ -1548,7 +1584,7 @@ class ProjectMVisualizer(QOpenGLWidget):
         print(f"📁 ProjectM Preset dizini: {self.preset_dir}")
         print(f"📁 Font dizini: {self.font_dir}")
 
-        # --- YENİ: Angolla Tarzı Otomatik Döngü (Auto-Cycle) ---
+        # --- YENİ: Aurivo Tarzı Otomatik Döngü (Auto-Cycle) ---
         self.preset_config = {
             "mode_index": 0,    # 0: Listeden, 1: Rastgele, 2: Sabit
             "delay": 15,        # Saniye
@@ -1674,6 +1710,42 @@ class ProjectMVisualizer(QOpenGLWidget):
                 self.projectm_engine.window_resize(w, h)
             except Exception as e:
                 print(f"✗ ProjectM resize hatası: {e}")
+        try:
+            self._reposition_status_overlay()
+        except Exception:
+            pass
+
+    def _reposition_status_overlay(self):
+        try:
+            if not hasattr(self, "_status_overlay") or self._status_overlay is None:
+                return
+            pad = 18
+            w = max(320, int(self.width() * 0.60))
+            h = 70
+            x = (self.width() - w) // 2
+            y = max(pad, int(self.height() * 0.06))
+            self._status_overlay.setGeometry(x, y, w, h)
+        except Exception:
+            pass
+
+    def _show_status_overlay(self, text: str, ms: int = 1400):
+        try:
+            if not hasattr(self, "_status_overlay") or self._status_overlay is None:
+                return
+            self._status_overlay.setText(str(text or ""))
+            self._reposition_status_overlay()
+            self._status_overlay.setVisible(True)
+            self._status_overlay.raise_()
+            self._status_hide_timer.start(max(400, int(ms)))
+        except Exception:
+            pass
+
+    def _hide_status_overlay(self):
+        try:
+            if hasattr(self, "_status_overlay") and self._status_overlay:
+                self._status_overlay.setVisible(False)
+        except Exception:
+            pass
     
     def paintGL(self):
         """Her frame'de çağrılır - ProjectM render"""
@@ -1681,6 +1753,12 @@ class ProjectMVisualizer(QOpenGLWidget):
             try:
                 # Performans monitörü
                 self.performance_monitor.start_frame()
+
+                # Feed queued PCM before rendering (keeps timing consistent)
+                try:
+                    self._drain_pcm_queue(max_frames=2048)
+                except Exception:
+                    pass
                 
                 # Hızlı çağrılarda frame skip (koruma)
                 if not hasattr(self, '_last_paint_time'):
@@ -1717,6 +1795,62 @@ class ProjectMVisualizer(QOpenGLWidget):
             if HAS_OPENGL:
                 glClearColor(0.0, 0.0, 0.0, 1.0)
                 glClear(GL_COLOR_BUFFER_BIT)
+
+    def _enqueue_pcm(self, pcm_array: np.ndarray):
+        """Enqueue int16 interleaved stereo samples."""
+        try:
+            arr = np.asarray(pcm_array, dtype=np.int16)
+        except Exception:
+            return
+        if arr.size <= 0:
+            return
+
+        # Ensure even sample count
+        if (arr.size % 2) != 0:
+            arr = arr[:-1]
+            if arr.size <= 0:
+                return
+
+        # Bound queue size (drop oldest)
+        self._pcm_queue.append(arr)
+        self._pcm_queue_samples += int(arr.size)
+        excess = int(self._pcm_queue_samples) - int(self._pcm_queue_max_samples)
+        while excess > 0 and self._pcm_queue:
+            old = self._pcm_queue.popleft()
+            try:
+                self._pcm_queue_samples -= int(old.size)
+            except Exception:
+                self._pcm_queue_samples = max(0, int(self._pcm_queue_samples) - int(excess))
+            excess = int(self._pcm_queue_samples) - int(self._pcm_queue_max_samples)
+
+    def _drain_pcm_queue(self, max_frames: int = 2048):
+        """Drain a limited amount of queued PCM into ProjectM per frame."""
+        if not self.projectm_engine or not self.engine_ready:
+            return
+        if max_frames <= 0:
+            return
+
+        remaining_frames = int(max_frames)
+        while remaining_frames > 0 and self._pcm_queue:
+            arr = self._pcm_queue[0]
+            if arr is None or arr.size <= 0:
+                self._pcm_queue.popleft()
+                continue
+
+            frames = int(arr.size // 2)
+            if frames <= remaining_frames:
+                self._pcm_queue.popleft()
+                self._pcm_queue_samples -= int(arr.size)
+                self.projectm_engine.pcm_add_short(arr, frames)
+                remaining_frames -= frames
+            else:
+                take_frames = remaining_frames
+                take_samples = take_frames * 2
+                chunk = arr[:take_samples]
+                self._pcm_queue[0] = arr[take_samples:]
+                self._pcm_queue_samples -= int(chunk.size)
+                self.projectm_engine.pcm_add_short(chunk, take_frames)
+                remaining_frames = 0
     
     def update_audio_buffer(self, audio_data: np.ndarray):
         """
@@ -1768,9 +1902,6 @@ class ProjectMVisualizer(QOpenGLWidget):
         PCM ses verisi besle (16-bit stereo veya mono)
         pcm_data: bytes veya numpy array (int16)
         """
-        if not self.projectm_engine or not self.engine_ready:
-            return
-        
         try:
             # Bytes ise numpy array'e çevir
             if isinstance(pcm_data, bytes):
@@ -1790,13 +1921,13 @@ class ProjectMVisualizer(QOpenGLWidget):
                 # Mono -> Stereo
                 mono = pcm_array
                 pcm_array = np.column_stack((mono, mono)).flatten()
-            
-            # ProjectM'e besle
-            frames = len(pcm_array) // 2  # Stereo frames
-            self.projectm_engine.pcm_add_short(pcm_array, frames)
-            
+
+            # Engine'e doğrudan basmak yerine kuyruğa ekle (render döngüsü besler)
+            self._enqueue_pcm(pcm_array)
+
             if self._consume_count <= 5:
-                print(f"  ✓ ProjectM'e {frames} stereo frames gönderildi")
+                frames = len(pcm_array) // 2
+                print(f"  ✓ ProjectM PCM kuyruğa alındı: {frames} stereo frames")
         except Exception as e:
             if not hasattr(self, '_consume_error_logged'):
                 print(f"✗ consume_audio_data hatası: {e}")
@@ -1889,15 +2020,55 @@ class ProjectMVisualizer(QOpenGLWidget):
         if not self.engine_ready:
             print("✗ set_preset: Engine henüz hazır değil")
             return
+
+        try:
+            index = int(index)
+        except Exception:
+            return
+
+        # Redundant reload guard (tıklayınca daha akıcı hissiyat)
+        if self._current_preset_index == index:
+            return
+
+        # Index doğrulama
+        try:
+            total = int(self.projectm_engine.get_playlist_size())
+        except Exception:
+            total = -1
+        if total >= 0 and (index < 0 or index >= total):
+            self._show_status_overlay("Geçersiz görsel index")
+            return
         
         try:
-            preset_name = self.projectm_engine.get_preset_name(index)
-            print(f"🎨 Preset değiştiriliyor: [{index}] {preset_name}")
+            preset_name = ""
+            try:
+                preset_name = self.projectm_engine.get_preset_name(index)
+            except Exception:
+                preset_name = f"#{index}"
+
+            # Çok hızlı ardışık seçimlerde re-entrancy'yi önle
+            if getattr(self, "_preset_change_in_flight", False):
+                return
+            self._preset_change_in_flight = True
+
             self.projectm_engine.select_preset(index)
+            self._current_preset_index = index
             self.update()  # Hemen render et
-            print(f"✓ Preset başarıyla yüklendi: {preset_name}")
+
+            # Kısa bilgi (çok intrusive değil)
+            self._show_status_overlay(f"🎨 {preset_name}", ms=650)
         except Exception as e:
             print(f"✗ Preset seçim hatası [{index}]: {e}")
+            # Bozuk preset olabiliyor: siyah ekran yerine otomatik fallback
+            self._show_status_overlay("Bu görsel yüklenemedi, rastgele seçiliyor…", ms=1200)
+            try:
+                self.projectm_engine.preset_random(True)
+                self._current_preset_index = None
+                self.update()
+            except Exception:
+                pass
+        finally:
+            self._preset_change_in_flight = False
 
     def _pm_random(self):
         if self.projectm_engine and self.engine_ready:
