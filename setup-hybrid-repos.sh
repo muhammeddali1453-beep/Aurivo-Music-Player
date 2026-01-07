@@ -66,7 +66,7 @@ cat > README.md << 'EOFREADME'
 
 ![Aurivo Logo](https://raw.githubusercontent.com/muhammeddali1453-beep/Aurivo-Music-Player/main/icons/media-playback-start.png)
 
-**Clementine'den ilham alan güçlü, hafif ve görsel açıdan zengin müzik çalar**
+**Güçlü, hafif ve görsel açıdan zengin müzik çalar**
 
 [![Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)](https://github.com)
 [![Downloads](https://img.shields.io/github/downloads/muhammeddali1453-beep/Aurivo-Music-Player/total)](https://github.com/muhammeddali1453-beep/Aurivo-Music-Player/releases)

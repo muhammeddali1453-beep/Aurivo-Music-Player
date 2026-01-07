@@ -1,8 +1,9 @@
+#!/usr/bin/env xdg-open
 [Desktop Entry]
 Type=Application
 Name=Aurivo Music Player
 GenericName=Music Player
-Comment=Clementine-inspired music player with advanced visualization
+Comment=Güçlü, hafif ve görsel açıdan zengin müzik çalar
 TryExec=aurivo
 Exec=aurivo
 Icon=aurivo

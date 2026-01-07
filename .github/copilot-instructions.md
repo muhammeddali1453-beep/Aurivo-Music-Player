@@ -1,7 +1,7 @@
 # Aurivo Music Player - AI Aracı Talimatları
 
 ## Proje Özeti
-**Aurivo**, Clementine tarafından ilham alınan PyQt5 tabanlı tek dosyalı bir müzik oynatıcısıdır. Çevrimdışı çalışan masaüstü uygulaması (~3000+ satır) entegre ses görselleştirme (11 mod), gelişmiş ekolayzır ve kütüphane yönetimi ile beraber gelir. Türkçe arayüz ve gerçek FFT spektrumu analizi içerir.
+**Aurivo**, PyQt5 tabanlı tek dosyalı bir müzik oynatıcısıdır. Çevrimdışı çalışan masaüstü uygulaması (~3000+ satır) entegre ses görselleştirme (11 mod), gelişmiş ekolayzır ve kütüphane yönetimi ile beraber gelir. Türkçe arayüz ve gerçek FFT spektrumu analizi içerir.
 
 ## Mimari Yapı
 

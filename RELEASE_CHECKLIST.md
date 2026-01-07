@@ -13,7 +13,7 @@
 ### Repository Ayarları
 1. GitHub'da repository oluştur: `https://github.com/KULLANICI_ADINIZ/Aurivo-Music-Player`
 2. Repository ayarları:
-   - **Description**: "🎵 Clementine-inspired music player with 11 visualizations, DSP effects, and video subtitle support"
+  - **Description**: "🎵 Aurivo: güçlü, hafif ve görsel açıdan zengin müzik çalar — 11 görselleştirme modu, DSP efektleri ve video altyazı desteği"
    - **Topics**: `music-player`, `pyqt5`, `linux`, `audio-visualization`, `gstreamer`, `fft`, `dsp`
    - **Website**: (varsa)
 
@@ -100,7 +100,7 @@ git push -u origin main
 ### 🎨 Görselleştirme
 - 11 farklı görselleştirme modu (FFT tabanlı)
 - Tam ekran desteği
-- Clementine tarzı animasyonlar
+- Akıcı animasyonlar
 
 ### 🎛️ Ses İşleme
 - 10 bantlı ekolayzır

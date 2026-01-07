@@ -4,7 +4,7 @@
 
 ![Aurivo Logo](icons/aurivo.png)
 
-**Clementine'den ilham alan güçlü, hafif ve görsel açıdan zengin müzik çalar**
+**Güçlü, hafif ve görsel açıdan zengin müzik çalar**
 
 [![Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)](https://github.com)
 [![Python](https://img.shields.io/badge/Python-3.11+-green.svg)](https://python.org)
@@ -51,7 +51,7 @@
 - **11 Farklı Mod**: Çizgiler, Daireler, Spektrum, Enerji Halkaları, Dalga, Pulsar, Spiral, Volcano, Işın, Çift Spektrum, Radyal Grid
 - **Gerçek Zamanlı FFT Analizi**: NumPy tabanlı 96-band frekans spektrumu
 - **Tam Ekran Desteği**: Ayrı pencerede veya ana ekran altında
-- **Clementine Tarzı Animasyon**: Attack/release yumuşatma, cap heights
+- **Akıcı Bar Animasyonu**: Attack/release yumuşatma, cap heights
 
 ### 🎛️ Ses İşleme
 - **32 Bant Ana EQ + Hazır Ayarlar**: Yüzlerce preset, arama, seçili preset göstergesi
@@ -216,7 +216,6 @@ Hata bulduysanız veya özellik önerisi yapmak istiyorsanız:
 
 ## 🙏 Teşekkürler
 
-- **Clementine**: İlham kaynağı
 - **PyQt5**: GUI framework
 - **NumPy**: FFT analizi
 - **GStreamer**: Multimedia pipeline
