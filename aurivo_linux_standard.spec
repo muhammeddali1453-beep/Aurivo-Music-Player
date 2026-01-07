@@ -3,6 +3,7 @@
 # Whisper ve PyTorch DAHİL DEĞİL (küçük boyut ~150-200MB)
 
 import sys
+import glob
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
@@ -41,13 +42,17 @@ excludes = [
     'scipy',
 ]
 
+# Native binaries'i glob ile bul (Python versiyonundan bağımsız)
+extra_binaries = []
+for pattern in ['subtitle_engine*.so', 'aurivo_dsp.so']:
+    matches = glob.glob(pattern)
+    for match in matches:
+        extra_binaries.append((match, '.'))
+
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[
-        ('subtitle_engine.cpython-313-x86_64-linux-gnu.so', '.'),  # C++ altyazı modülü
-        ('aurivo_dsp.so', '.'),  # C++ DSP efekt modülü
-    ],
+    binaries=extra_binaries,
     datas=[
         ('icons', 'icons'),  # Icon klasörünü dahil et
         ('aurivo.desktop', '.'),  # Desktop dosyası
@@ -88,3 +93,4 @@ coll = COLLECT(
     upx_exclude=[],
     name='aurivo-standard',
 )
+
