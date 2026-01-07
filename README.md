@@ -187,6 +187,13 @@ For detailed installation instructions, see [INSTALL.md](INSTALL.md).
   <p><em>Tam ekran mod ve çoklu dil altyazı desteği / Fullscreen & multi-language subtitles</em></p>
 </div>
 
+### Ek Ekran Görüntüleri / Extra Screenshots
+<div align="center">
+  <img src="screenshots/09-extra.png" alt="Ek Ekran Görüntüsü 1" width="32%">
+  <img src="screenshots/10-extra.png" alt="Ek Ekran Görüntüsü 2" width="32%">
+  <img src="screenshots/11-extra.png" alt="Ek Ekran Görüntüsü 3" width="32%">
+</div>
+
 ## 🔮 Gelecek Özellikler / Future Plans
 
 ### 🇹🇷 Türkçe
