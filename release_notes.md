@@ -1,4 +1,4 @@
-# 🎉 Aurivo Music Player v2.0
+# 🎉 Aurivo Music Player v2.0.0
 
 Bu sürüm, uygulamanın **Angolla → Aurivo** yeniden markalanmasını ve 32 bant EQ için Poweramp benzeri **Hazır Ayarlar (preset)** deneyimini getirir.
 
@@ -32,6 +32,10 @@ Bu sürüm, uygulamanın **Angolla → Aurivo** yeniden markalanmasını ve 32 b
 ## 🧩 Notlar / Bilinen Noktalar
 - Video/codec ve bazı medya türleri için GStreamer eklentileri gerekir (distro’ya göre paket adları değişebilir).
 - Bazı sistemlerde QtWebEngine/OpenSSL uyumluluğu uyarıları görülebilir; bu durum dağıtımın OpenSSL/Qt paketleriyle ilişkilidir.
+
+## 🪟 Windows 10/11 (Build Notu)
+- Windows paketinde DSP motoru `aurivo_dsp.dll` olarak gelir.
+- `build_windows.bat` artık `aurivo_dsp.dll` ve `subtitle_engine*.pyd` üretmeyi dener; bunun için **Visual Studio Build Tools (MSVC)** veya **MinGW-w64** gerekir.
 
 ---
 
