@@ -6,12 +6,18 @@
 
 **Güçlü, hafif ve görsel açıdan zengin müzik çalar**
 
+**A powerful, lightweight, and visualization-rich music player**
+
+[![Version](https://img.shields.io/github/v/release/muhammeddali1453-beep/Aurivo-Music-Player?display_name=tag&sort=semver)](../../releases)
+[![License](https://img.shields.io/github/license/muhammeddali1453-beep/Aurivo-Music-Player)](LICENSE)
+[![Issues](https://img.shields.io/github/issues/muhammeddali1453-beep/Aurivo-Music-Player)](../../issues)
+[![Stars](https://img.shields.io/github/stars/muhammeddali1453-beep/Aurivo-Music-Player)](../../stargazers)
+
 [![Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)](https://github.com)
 [![Python](https://img.shields.io/badge/Python-3.11+-green.svg)](https://python.org)
 [![PyQt5](https://img.shields.io/badge/GUI-PyQt5-orange.svg)](https://riverbankcomputing.com/software/pyqt/)
-[![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 
-[📥 İndir](../../releases) | [📖 Kurulum](INSTALL.md) | [🐛 Hata Bildir](../../issues) | [💬 Tartışmalar](../../discussions)
+[📥 İndir / Download](../../releases) | [📖 Kurulum / Install](INSTALL.md) | [🐛 Hata / Bug](../../issues/new/choose) | [💡 Öneri / Feature](../../issues/new/choose) | [💬 Discussions / Tartışmalar](../../discussions)
 
 </div>
 
@@ -47,11 +53,19 @@
 
 ## ✨ Özellikler
 
+## ✨ Features
+
 ### 🎨 Görselleştirme
 - **11 Farklı Mod**: Çizgiler, Daireler, Spektrum, Enerji Halkaları, Dalga, Pulsar, Spiral, Volcano, Işın, Çift Spektrum, Radyal Grid
 - **Gerçek Zamanlı FFT Analizi**: NumPy tabanlı 96-band frekans spektrumu
 - **Tam Ekran Desteği**: Ayrı pencerede veya ana ekran altında
 - **Akıcı Bar Animasyonu**: Attack/release yumuşatma, cap heights
+
+### 🎨 Visualizations
+- **11 Modes**: Lines, Circles, Spectrum, Energy Rings, Wave, Pulsar, Spiral, Volcano, Beam, Dual Spectrum, Radial Grid
+- **Real-time FFT**: NumPy-based 96-band spectrum
+- **Fullscreen Support**: Separate window or embedded bar
+- **Smooth Bars**: Attack/release smoothing with peak caps
 
 ### 🎛️ Ses İşleme
 - **32 Bant Ana EQ + Hazır Ayarlar**: Yüzlerce preset, arama, seçili preset göstergesi
@@ -63,12 +77,24 @@
   - Bass Boost
 - **Crossfade**: Parçalar arası geçiş efekti
 
+### 🎛️ Audio Processing
+- **32-band EQ + Presets**: Hundreds of presets, search, selected preset indicator
+- **DSP Effects** (C++ engine): Compressor, Limiter, Exciter, Stereo Widener, Bass Boost
+- **Crossfade**: Smooth transitions between tracks
+
 ## 🆕 Yeni Sürüm (Aurivo)
 
 Bu sürümde uygulama adı **Angolla → Aurivo** olarak yeniden markalandı.
 - Paketleme/kurulum dosyaları ve launcher adı **aurivo** olacak şekilde güncellendi
 - İkon seti **Aurivo** adıyla üretildi ve bağlandı
 - Eski kullanıcı verileri için (playlist/config) geriye dönük taşıma mantığı korunur
+
+## 🆕 New Release (Aurivo)
+
+In this release, the app has been rebranded from **Angolla → Aurivo**.
+- Packaging/install scripts and launcher name updated to **aurivo**
+- Icon set generated and wired under the **Aurivo** name
+- Backward compatibility kept for existing user data (playlist/config)
 
 ### 📚 Kütüphane Yönetimi
 - **SQLite Veritabanı**: Hızlı tarama ve arama
@@ -89,17 +115,19 @@ Bu sürümde uygulama adı **Angolla → Aurivo** olarak yeniden markalandı.
 
 ## 🚀 Hızlı Başlangıç
 
+## 🚀 Quick Start
+
 ### İndirme ve Kurulum
 ```bash
 # 1. Son sürümü indirin
-wget https://github.com/KULLANICI_ADI/Aurivo-Music-Player/releases/latest/download/Aurivo-Linux-v1.0.tar.gz
+wget https://github.com/muhammeddali1453-beep/Aurivo-Music-Player/releases/latest/download/Aurivo-Linux-v2.0.1.tar.gz
 
 # 2. Sistem bağımlılıklarını kurun
 sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav  # Arch
 # sudo apt install gstreamer1.0-plugins-* gstreamer1.0-libav  # Ubuntu
 
 # 3. Paketi çıkartın
-tar -xzf Aurivo-Linux-v2.0.tar.gz
+tar -xzf Aurivo-Linux-v2.0.1.tar.gz
 cd aurivo
 
 # 4. Çalıştırın
@@ -108,34 +136,68 @@ cd aurivo
 
 Detaylı kurulum talimatları için [INSTALL.md](INSTALL.md) dosyasına bakın.
 
-## 📸 Ekran Görüntüleri
+For detailed installation instructions, see [INSTALL.md](INSTALL.md).
+
+## 🚀 Try Aurivo & Give Feedback
+
+### 🇹🇷 Türkçe
+- Son sürümü indirin: [Releases](../../releases)
+- Hata bildirin: [Issues (Yeni)](../../issues/new/choose)
+- Özellik isteyin / fikir paylaşın: [Discussions](../../discussions)
+
+### 🇬🇧 English
+- Download the latest build: [Releases](../../releases)
+- Report bugs: [Issues (New)](../../issues/new/choose)
+- Request features / share ideas: [Discussions](../../discussions)
+
+> Not / Note:
+> Discussions kategorileri GitHub tarafından varsayılan olarak oluşturulur (General / Ideas / Q&A vb.).
+> Bu repo’da önerilen kullanım:
+> - 💡 Feature Requests / Özellik İstekleri → **Ideas**
+> - 🐛 Bug Reports / Hata Raporları → **Issues**
+> - 💬 General / Genel → **General**
+> - 🙏 Q&A / Soru & Cevap → **Q&A**
+
+## 📸 Ekran Görüntüleri / Screenshots
 
 ### Ana Arayüz
 <div align="center">
   <img src="screenshots/01-main-interface.png" alt="Ana Arayüz" width="80%">
-  <p><em>Playlist yönetimi ve görselleştirme</em></p>
+  <p><em>Playlist yönetimi ve görselleştirme / Playlist management & visualization</em></p>
 </div>
 
 ### Görselleştirme Modları
 <div align="center">
   <img src="screenshots/02-visualization-1.png" alt="Görselleştirme 1" width="45%">
   <img src="screenshots/03-visualization-2.png" alt="Görselleştirme 2" width="45%">
-  <p><em>11 farklı FFT tabanlı görselleştirme modu</em></p>
+  <p><em>11 farklı FFT tabanlı görselleştirme modu / 11 FFT-based visualization modes</em></p>
 </div>
 
 ### Ekolayzır & Kütüphane
 <div align="center">
   <img src="screenshots/04-equalizer.png" alt="10 Bantlı Ekolayzır" width="45%">
   <img src="screenshots/05-library-view.png" alt="Kütüphane Görünümü" width="45%">
-  <p><em>10 bantlı EQ ve SQLite kütüphane yönetimi</em></p>
+  <p><em>10 bantlı EQ ve SQLite kütüphane yönetimi / EQ & SQLite-powered library</em></p>
 </div>
 
 ### Tam Ekran & Video Desteği
 <div align="center">
   <img src="screenshots/07-fullscreen.png" alt="Tam Ekran Görselleştirme" width="45%">
   <img src="screenshots/08-video-subtitle.png" alt="Video + Altyazı" width="45%">
-  <p><em>Tam ekran mod ve çoklu dil altyazı desteği</em></p>
+  <p><em>Tam ekran mod ve çoklu dil altyazı desteği / Fullscreen & multi-language subtitles</em></p>
 </div>
+
+## 🔮 Gelecek Özellikler / Future Plans
+
+### 🇹🇷 Türkçe
+- YouTube entegrasyonu
+- Özel tema sistemi (custom themes)
+- Yeni görselleştiriciler ve preset paketleri
+
+### 🇬🇧 English
+- YouTube integration
+- Custom themes
+- New visualizers and preset packs
 
 ## 💻 Teknik Detaylar
 
@@ -205,7 +267,13 @@ Detaylar için [CONTRIBUTING.md](CONTRIBUTING.md) dosyasına bakın.
 
 ## 📝 Lisans
 
-Bu proje GPL-3.0 lisansı altında dağıtılmaktadır. Detaylar için [LICENSE](LICENSE) dosyasına bakın.
+### 🇹🇷 Türkçe
+Bu proje **proprietary** lisansla dağıtılır. Kaynak kodun kopyalanması/dağıtılması/değiştirilmesi lisans kapsamında kısıtlanmıştır.
+Detaylar için [LICENSE](LICENSE) dosyasına bakın.
+
+### 🇬🇧 English
+This project is distributed under a **proprietary** license. Copying/distributing/modifying the source code is restricted by the license terms.
+See [LICENSE](LICENSE) for details.
 
 ## 🐛 Hata Bildirimi
 

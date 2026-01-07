@@ -12722,6 +12722,19 @@ class AurivoPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Aurivo Music Player - Aurivo Tarzı (Gelişmiş)")
+        try:
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else os.getcwd()
+            icon_path = os.path.join(base_dir, "icons", "aurivo_256.png")
+            if os.path.isfile(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+            else:
+                # Fallback: tema ikonu veya çalışma dizinindeki ikon
+                icon = QIcon.fromTheme("aurivo")
+                if icon.isNull():
+                    icon = QIcon(os.path.join("icons", "aurivo_256.png"))
+                self.setWindowIcon(icon)
+        except Exception:
+            pass
         self.setGeometry(100, 100, 1200, 820)
         self.vis_modes = self._build_visual_modes()
         self.vis_favorites = []
@@ -25530,6 +25543,18 @@ def main():
     app = QApplication(sys.argv)
     try:
         app.setQuitOnLastWindowClosed(False)
+    except Exception:
+        pass
+    # Uygulama geneli ikon (taskbar / dialog'lar için)
+    try:
+        base_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else os.getcwd()
+        icon_path = os.path.join(base_dir, "icons", "aurivo_256.png")
+        if os.path.isfile(icon_path):
+            app.setWindowIcon(QIcon(icon_path))
+        else:
+            icon = QIcon.fromTheme("aurivo")
+            if not icon.isNull():
+                app.setWindowIcon(icon)
     except Exception:
         pass
     app.setFont(QFont("Ubuntu", 10))
