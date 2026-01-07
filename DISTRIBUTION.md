@@ -6,6 +6,13 @@
 - **Standard**: ~150-200MB (Whisper hariç, çoğu kullanıcı için)
 - **Pro**: ~2.5GB (Whisper dahil, otomatik altyazı için)
 
+### 🎯 Kullanıcı Kararı Akışı
+```
+Kullanıcı → Otomatik video altyazısı gerekli mi?
+  ↓ HAYIR → Standard Edition (150MB)
+  ↓ EVET  → Pro Edition (2GB)
+```
+
 ### Standard Paket İçeriği
 ✅ Müzik çalar (tüm formatlar)
 ✅ Video oynatıcı
@@ -63,21 +70,46 @@ dist\Aurivo.exe
 - PyInstaller: `pip install pyinstaller`
 - (Opsiyonel) AppImage için: [appimagetool](https://github.com/AppImage/AppImageKit)
 
-### Build Adımları
+### Build Adımları - Standard Edition
 ```bash
 # 1. Sanal ortam oluştur (önerilen)
 python3 -m venv venv
 source venv/bin/activate
 
-# 2. Bağımlılıkları kur
+# 2. Bağımlılıkları kur (Whisper HARİÇ)
 pip install PyQt5 mutagen numpy pyinstaller
 
-# 3. Build çalıştır
-./build_linux.sh
+# 3. Standard build çalıştır
+./build_linux_standard.sh
 ```
 
 **Çıktı:** 
-- `dist/aurivo/aurivo` (klasör yapısı)
+- `dist/aurivo-standard/aurivo` (~150-200MB)
+
+### Build Adımları - Pro Edition
+```bash
+# 1. Sanal ortam kullan (yukarıdaki ile aynı)
+source venv/bin/activate
+
+# 2. Whisper ve PyTorch kur
+pip install openai-whisper torch torchaudio
+
+# 3. Pro build çalıştır
+./build_linux_pro.sh
+```
+
+**Çıktı:** 
+- `dist/aurivo-pro/aurivo` (~2.5GB)
+
+### Paketleme
+```bash
+# Standard
+cd dist
+tar -czf aurivo-standard-v1.0-linux.tar.gz aurivo-standard/
+
+# Pro
+tar -czf aurivo-pro-v1.0-linux.tar.gz aurivo-pro/
+```
 - `Aurivo-x86_64.AppImage` (tek dosya, opsiyonel)
 
 ### Test

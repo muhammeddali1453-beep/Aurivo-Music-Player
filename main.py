@@ -3488,7 +3488,7 @@ class GlobalAudioEngine(QThread):
             pass
         self.stream = None
         self.quit()
-        self.wait(2000)
+        self.wait(500)  # 500ms yeterli
 
     def play_file(self, file_path):
         """Compatibility slot for playlist integration"""
@@ -24903,6 +24903,13 @@ class AurivoPlayer(QMainWindow):
             if hasattr(self, 'vis_widget_main_window'):
                 self.vis_widget_main_window.animation_timer.stop()
             
+            # Tüm timer'ları durdur
+            for obj in self.findChildren(QTimer):
+                try:
+                    obj.stop()
+                except:
+                    pass
+            
             self.save_playlist()
             self.save_config()
             print("  ✓ Ayarlar kaydedildi")
@@ -24912,6 +24919,8 @@ class AurivoPlayer(QMainWindow):
 
             if getattr(self, "audio_engine", None):
                 self.audio_engine.shutdown()
+                # Thread'in bitmesini bekle
+                QApplication.processEvents()
 
             for attr in ("webView", "web_view"):
                 view = getattr(self, attr, None)
@@ -24943,6 +24952,9 @@ class AurivoPlayer(QMainWindow):
             pass
         
         event.accept()
+        
+        # QApplication'ı kapat
+        QApplication.instance().quit()
     # ------------------------------------------------------------ #
     # PLAYLIST – Çoklu seçim + sürükle bırak + CTRL+A aktif etme
     # ------------------------------------------------------------ #

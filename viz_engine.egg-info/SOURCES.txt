@@ -1,9 +1,0 @@
-README.md
-setup.py
-viz_engine.cpp
-kissfft/kiss_fft.c
-kissfft/tools/kiss_fftr.c
-viz_engine.egg-info/PKG-INFO
-viz_engine.egg-info/SOURCES.txt
-viz_engine.egg-info/dependency_links.txt
-viz_engine.egg-info/top_level.txt

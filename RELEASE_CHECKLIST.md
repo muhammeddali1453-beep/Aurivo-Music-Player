@@ -5,8 +5,24 @@
 - [ ] **Version numarası belirle**: Örnek: `v1.0`, `v1.1`, `v2.0`
 - [ ] **Changelog hazırla**: Yeni özellikler, düzeltmeler, değişiklikler
 - [ ] **Tüm testler geçiyor**: Yerel sistemde test et
-- [ ] **Build başarılı**: `./build_linux.sh` hatasız çalışıyor
-- [ ] **Paket oluşturuldu**: `./package_linux.sh` ile tar.gz oluşturuldu
+
+### 🏗️ Build İşlemleri (İKİ VERSİYON)
+
+#### Standard Versiyon (Altyazı HARİÇ - ~150-200MB)
+- [ ] **Linux Build**: `./build_linux_standard.sh` hatasız çalışıyor
+- [ ] **Windows Build**: `build_windows_standard.bat` hatasız çalışıyor (Windows'ta)
+- [ ] **Paketleme**: Oluşturulan dosyaları yeniden adlandır:
+  - Linux: `aurivo-standard-vX.X-linux.tar.gz`
+  - Windows: `aurivo-standard-vX.X-windows.zip`
+
+#### Pro Versiyon (Altyazı DAHİL - ~2GB+)
+- [ ] **Linux Build**: `./build_linux_pro.sh` hatasız çalışıyor
+- [ ] **Windows Build**: `build_windows_pro.bat` hatasız çalışıyor (Windows'ta)
+- [ ] **Paketleme**: Oluşturulan dosyaları yeniden adlandır:
+  - Linux: `aurivo-pro-vX.X-linux.tar.gz`
+  - Windows: `aurivo-pro-vX.X-windows.zip`
+
+- [ ] **Tüm paketler test edildi**: Her dosya açılıp çalıştırıldı
 
 ## GitHub Ayarları
 
@@ -94,6 +110,49 @@ git push -u origin main
 # 🎉 Aurivo Music Player v1.0
 
 İlk kararlı sürümümüzü duyurmaktan mutluluk duyuyoruz!
+
+---
+
+## 📥 İNDİRME SEÇENEKLERİ / DOWNLOAD OPTIONS
+
+### 🎵 Standard Edition (~150-200MB) - ÖNERİLEN / RECOMMENDED
+**Çoğu kullanıcı için ideal** — Tüm temel özellikler dahil
+
+#### Linux:
+- **aurivo-standard-v1.0-linux.tar.gz** — Doğrudan çalıştırılabilir
+
+#### Windows:
+- **aurivo-standard-v1.0-windows.zip** — Kurulum gerektirmez
+
+**İçerik:**
+- ✅ Müzik ve video oynatma (tüm formatlar)
+- ✅ 11 görselleştirme modu
+- ✅ 32-band EQ + yüzlerce preset
+- ✅ DSP efektleri (Compressor, Limiter, Exciter, vb.)
+- ✅ Manuel altyazı (.srt, .vtt dosyaları)
+- ✅ YouTube indirme
+- ❌ Otomatik altyazı (AI transkripsiyon)
+
+---
+
+### 🚀 Pro Edition (~2GB+) - ADVANCED
+**Otomatik video altyazısı isteyenler için** — Whisper AI dahil
+
+#### Linux:
+- **aurivo-pro-v1.0-linux.tar.gz** — AI modelleri dahil
+
+#### Windows:
+- **aurivo-pro-v1.0-windows.zip** — AI modelleri dahil
+
+**Ek Özellikler:**
+- ✅ **Standard'daki tüm özellikler**
+- ✅ **Otomatik video transkripsiyon** (Whisper AI)
+- ✅ **Çoklu dil altyazı oluşturma** (90+ dil)
+- ✅ **Gerçek zamanlı altyazı üretimi**
+
+⚠️ **Not:** Pro sürüm daha büyük boyutlu (AI modelleri nedeniyle). Sadece otomatik altyazı özelliği gerekiyorsa indirin.
+
+---
 
 ## ✨ Özellikler
 
