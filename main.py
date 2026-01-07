@@ -17266,7 +17266,16 @@ class AurivoPlayer(QMainWindow):
                     self._start_whisper_transcription(whisper_lang)
                     return
                 except ImportError:
-                    pass  # Whisper yoksa normal template kullan
+                    # Whisper yoksa kullanıcıya bilgi ver
+                    QMessageBox.information(
+                        self,
+                        "Otomatik Altyazı Özelliği",
+                        "🚀 Otomatik video altyazısı için Whisper AI gereklidir.\n\n"
+                        "Kurulum:\n"
+                        "pip install openai-whisper torch\n\n"
+                        "Manuel altyazı (.srt/.vtt) yükleyebilirsiniz."
+                    )
+                    return
             self._set_video_subtitle_source_from_menu(p, lbl)
             return
 
@@ -17278,7 +17287,16 @@ class AurivoPlayer(QMainWindow):
             self._start_whisper_transcription(whisper_lang)
             return
         except ImportError:
-            pass  # Whisper yoksa template'e devam
+            # Whisper yoksa kullanıcıya bilgi ver
+            QMessageBox.information(
+                self,
+                "Otomatik Altyazı Özelliği",
+                "🚀 Otomatik video altyazısı için Whisper AI gereklidir.\n\n"
+                "Kurulum:\n"
+                "pip install openai-whisper torch\n\n"
+                "Manuel altyazı (.srt/.vtt) yükleyebilirsiniz."
+            )
+            return
         
         # Whisper yoksa gizli temp şablon dosyası oluşturmayı dene
         try:

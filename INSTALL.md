@@ -49,6 +49,21 @@ cd aurivo
 ./aurivo
 ```
 
+### 4. Otomatik Altyazı (Opsiyonel)
+
+Otomatik video transkripsiyon için Whisper AI'yi kurun:
+
+```bash
+pip install openai-whisper torch
+```
+
+**Özellikler:**
+- 90+ dil desteği (İngilizce, Türkçe, Fransızca, Almanca, vb.)
+- Gerçek zamanlı altyazı üretimi
+- .srt/.vtt formatında dışa aktarma
+
+**Not:** Whisper + PyTorch ~2GB ek alan gerektirir. Uygulama otomatik algılar - kurulu değilse manuel altyazı (.srt/.vtt) kullanabilirsiniz.
+
 ### 4. Masaüstü Kısayolu Oluşturma (Opsiyonel)
 Uygulama menüsünden başlatmak için:
 

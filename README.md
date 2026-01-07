@@ -23,6 +23,42 @@
 
 ---
 
+## 📥 İndirme / Download
+
+<div align="center">
+
+[![Download Latest](https://img.shields.io/badge/İndir-Aurivo_v1.0-blue?style=for-the-badge)](../../releases/latest)
+
+**Boyut:** ~205MB | **Platform:** Linux 64-bit
+
+</div>
+
+### 🎯 İçerik:
+- ✅ Müzik/video oynatma (tüm formatlar)
+- ✅ 11 görselleştirme modu (FFT analizi)
+- ✅ 32-band EQ + yüzlerce preset
+- ✅ DSP efektleri (C++ motoru)
+- ✅ Manuel altyazı (.srt, .vtt)
+- ✅ YouTube indirme
+- ✅ Kütüphane yönetimi
+
+### 🚀 Otomatik Altyazı (Opsiyonel)
+
+Otomatik video altyazısı için Whisper AI'yi kurun:
+
+```bash
+pip install openai-whisper torch
+```
+
+**Özellikler:**
+- 90+ dil otomatik transkripsiyon
+- Gerçek zamanlı altyazı üretimi
+- .srt/.vtt dışa aktarma
+
+⚠️ Not: Whisper + PyTorch ~2GB ek alan gerektirir
+
+---
+
 ## ⚠️ DİKKAT / WARNING
 
 <div align="center">
