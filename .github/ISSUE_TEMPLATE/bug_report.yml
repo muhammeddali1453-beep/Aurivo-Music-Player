@@ -1,0 +1,69 @@
+name: 🐛 Bug Report / Hata Raporu
+description: Report a bug in Aurivo Music Player / Aurivo Music Player'da bir hata bildirin
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Thanks for reporting a bug! / Hata bildirdiğiniz için teşekkürler! 🔧
+        
+  - type: textarea
+    id: bug-description
+    attributes:
+      label: Bug Description / Hata Açıklaması
+      description: What happened? / Ne oldu?
+      placeholder: |
+        Example: The app crashes when I try to add a song to playlist
+        Örnek: Çalma listesine şarkı eklemeye çalıştığımda uygulama çöküyor
+    validations:
+      required: true
+      
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce / Hatayı Tekrarlama Adımları
+      description: How can we reproduce this bug? / Bu hatayı nasıl tekrarlayabiliriz?
+      placeholder: |
+        1. Open the app / Uygulamayı aç
+        2. Click on playlist / Çalma listesine tıkla
+        3. Try to add a song / Şarkı eklemeyi dene
+        4. App crashes / Uygulama çöküyor
+    validations:
+      required: true
+      
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior / Beklenen Davranış
+      description: What should happen instead? / Bunun yerine ne olmalı?
+      placeholder: The song should be added to the playlist / Şarkı çalma listesine eklenmeliydi
+    validations:
+      required: true
+      
+  - type: input
+    id: version
+    attributes:
+      label: Version / Sürüm
+      description: Which version are you using? / Hangi sürümü kullanıyorsunuz?
+      placeholder: "v2.0.1"
+    validations:
+      required: true
+      
+  - type: input
+    id: os
+    attributes:
+      label: Operating System / İşletim Sistemi
+      description: Which OS are you using? / Hangi işletim sistemini kullanıyorsunuz?
+      placeholder: "Windows 11, macOS 14, Ubuntu 22.04, etc."
+    validations:
+      required: true
+      
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context / Ek Bilgi
+      description: Add screenshots, error messages, or logs / Ekran görüntüsü, hata mesajı veya log ekleyin
+      placeholder: You can paste error messages or attach files here / Hata mesajlarını yapıştırabilir veya dosya ekleyebilirsiniz
+    validations:
+      required: false
