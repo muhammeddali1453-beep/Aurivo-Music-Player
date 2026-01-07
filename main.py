@@ -17412,7 +17412,17 @@ class AurivoPlayer(QMainWindow):
             import tempfile
             import subprocess
         except ImportError as e:
-            QMessageBox.warning(self, 'Hata', f'Gerekli modül eksik: {e}\n\npip install openai-whisper')
+            # Whisper modülü bulunamadı - Standard versiyonda çalışıyor olabilir
+            QMessageBox.warning(
+                self, 
+                'Otomatik Altyazı Kullanılamıyor',
+                '<b>Bu özellik Aurivo Pro versiyonunda mevcuttur.</b><br><br>'
+                'Aurivo Standard versiyonunda:<br>'
+                '• Manuel altyazı (.srt, .vtt) kullanabilirsiniz<br>'
+                '• Otomatik transkripsiyon için Pro versiyona yükseltmelisiniz<br><br>'
+                '<i>Pro versiyonu ~2.5GB boyutundadır ve Whisper AI içerir.</i><br><br>'
+                f'<small>Teknik detay: {e}</small>'
+            )
             return
 
         # Video yolu kontrolü
