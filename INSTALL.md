@@ -93,19 +93,26 @@ gtk-update-icon-cache -f /usr/local/share/icons/hicolor || true
 3. **Görselleştirme**: 11 farklı görselleştirme modu (Alt panel veya tam ekran)
 4. **Ekolayzır**: Ses → Ekolayzır (10 bant ayarlanabilir)
 5. **Video Oynatma**: Video dosyalarını sürükleyip bırakın
-6. **Altyazı**: Video oynatırken sağ tıklayın → Altyazı Seç (otomatik transkripsiyon için Whisper kurulumu gerekir)
+6. **Altyazı**: Video oynatırken sağ tıklayın → Altyazı Seç (otomatik transkripsiyon için Pro versiyonu gerekir)
 
 ## 🛠️ Gelişmiş Özellikler
 
-### Whisper Altyazı Desteği (Opsiyonel)
-Otomatik video transkripsiyon için:
+### Whisper Altyazı Desteği
+⚠️ **Sadece Aurivo Pro versiyonunda mevcuttur**
 
+Eğer Standard versiyonu kullanıyorsanız:
+- Manuel altyazı (.srt, .vtt) kullanabilirsiniz
+- Otomatik transkripsiyon için Pro versiyona yükseltmelisiniz
+
+Pro versiyonda otomatik altyazı kullanımı:
 ```bash
-# Whisper kurulumu
-pip install openai-whisper
-
-# Kullanım: Video oynatırken sağ tıklayın → "Whisper ile Transkripsiyonu Oluştur"
+# Video oynatırken sağ tıklayın → "Whisper ile Transkripsiyon Oluştur"
+# İlk çalıştırmada model otomatik indirilir (~500MB, tek seferlik)
 ```
+
+Standard versiyonda otomatik altyazı denemesi:
+- "Bu özellik Aurivo Pro versiyonunda mevcuttur" mesajı gösterilir
+- Manuel altyazı yükleyebilir veya Pro versiyona yükseltebilirsiniz
 
 ### DSP Efektleri
 Dahili C++ DSP motoru ile:

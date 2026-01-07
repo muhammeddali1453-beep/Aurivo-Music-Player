@@ -113,6 +113,60 @@ In this release, the app has been rebranded from **Angolla → Aurivo**.
 - **Bar Renk Modları**: Normal, RGB spektrum, Gradyan
 - **Dinamik Renkler**: Tema değişimi ile otomatik uyum
 
+## 📦 İndirme Seçenekleri
+
+### 🎵 Aurivo Standard (Önerilen)
+**Boyut**: ~150-200MB  
+**İçerik**:
+- ✅ Müzik çalma (tüm formatlar)
+- ✅ Video oynatma
+- ✅ Manuel altyazı (.srt, .vtt)
+- ✅ 11 görselleştirme modu
+- ✅ 10 bantlı ekolayzır
+- ✅ DSP efektleri
+- ✅ YouTube indirme
+- ❌ Otomatik video altyazı (Whisper)
+
+**Kimler için?**: Çoğu kullanıcı için yeterli
+
+### 🎬 Aurivo Pro (Gelişmiş)
+**Boyut**: ~2.5GB  
+**İçerik**:
+- ✅ Standard'daki tüm özellikler
+- ✅ **Otomatik video transkripsiyon** (Whisper AI)
+- ✅ Çoklu dil otomatik altyazı
+
+**Kimler için?**: Video altyazı oluşturmak isteyenler
+
+---
+
+## 📦 Download Options
+
+### 🎵 Aurivo Standard (Recommended)
+**Size**: ~150-200MB  
+**Features**:
+- ✅ Music playback (all formats)
+- ✅ Video playback
+- ✅ Manual subtitles (.srt, .vtt)
+- ✅ 11 visualization modes
+- ✅ 10-band equalizer
+- ✅ DSP effects
+- ✅ YouTube download
+- ❌ Automatic video subtitles (Whisper)
+
+**Who is it for?**: Sufficient for most users
+
+### 🎬 Aurivo Pro (Advanced)
+**Size**: ~2.5GB  
+**Features**:
+- ✅ All Standard features
+- ✅ **Automatic video transcription** (Whisper AI)
+- ✅ Multi-language automatic subtitles
+
+**Who is it for?**: Users who want to generate video subtitles
+
+---
+
 ## 🚀 Hızlı Başlangıç
 
 ## 🚀 Quick Start
