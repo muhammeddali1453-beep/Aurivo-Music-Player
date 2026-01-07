@@ -1,14 +1,21 @@
 import ctypes
 import os
+import sys
 import numpy as np
 
 
 class LiveDSPBridge:
-    def __init__(self, lib_path="./aurivo_dsp.so"):
-        if not os.path.exists(lib_path):
-            raise FileNotFoundError(f"DSP Library not found: {lib_path}")
+    def __init__(self, lib_path: str | None = None):
+        resolved_path = self._resolve_dsp_lib_path(lib_path)
+        if not os.path.exists(resolved_path):
+            searched = "\n".join(f" - {p}" for p in self._candidate_dsp_paths())
+            raise FileNotFoundError(
+                "DSP Library not found. Looked for:\n"
+                f"{searched}\n"
+                f"(Last tried: {resolved_path})"
+            )
 
-        self.lib = ctypes.CDLL(lib_path)
+        self.lib = ctypes.CDLL(resolved_path)
 
         self.lib.create_dsp.restype = ctypes.c_void_p
         self.lib.destroy_dsp.argtypes = [ctypes.c_void_p]
@@ -100,6 +107,66 @@ class LiveDSPBridge:
             self.has_process_monitor_audio = False
 
         self.dsp_ptr = self.lib.create_dsp()
+
+    @staticmethod
+    def _default_dsp_lib_name() -> str:
+        if sys.platform.startswith("win"):
+            return "aurivo_dsp.dll"
+        if sys.platform == "darwin":
+            return "aurivo_dsp.dylib"
+        return "aurivo_dsp.so"
+
+    @staticmethod
+    def _iter_search_dirs() -> list[str]:
+        dirs: list[str] = []
+
+        # Repo/script working dir
+        try:
+            dirs.append(os.path.abspath(os.path.dirname(__file__)))
+        except Exception:
+            pass
+        dirs.append(os.getcwd())
+
+        # PyInstaller extraction dir (onefile)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if isinstance(meipass, str) and meipass:
+            dirs.append(meipass)
+            dirs.append(os.path.join(meipass, "_internal"))
+
+        # Frozen executable dir (onedir)
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(sys.executable)
+            dirs.append(exe_dir)
+            dirs.append(os.path.join(exe_dir, "_internal"))
+
+        # De-dup while preserving order
+        seen: set[str] = set()
+        unique_dirs: list[str] = []
+        for d in dirs:
+            d = os.path.abspath(d)
+            if d not in seen:
+                unique_dirs.append(d)
+                seen.add(d)
+        return unique_dirs
+
+    @classmethod
+    def _candidate_dsp_paths(cls) -> list[str]:
+        name = cls._default_dsp_lib_name()
+        return [os.path.join(d, name) for d in cls._iter_search_dirs()]
+
+    @classmethod
+    def _resolve_dsp_lib_path(cls, lib_path: str | None) -> str:
+        if lib_path:
+            # Kullanıcı açıkça verdiyse ona sadık kal.
+            return lib_path
+
+        for p in cls._candidate_dsp_paths():
+            if os.path.exists(p):
+                return p
+
+        # Bulunamadı; en azından anlamlı bir varsayılan döndür.
+        candidates = cls._candidate_dsp_paths()
+        return candidates[-1] if candidates else cls._default_dsp_lib_name()
 
     def __del__(self):
         if hasattr(self, "lib") and self.dsp_ptr:

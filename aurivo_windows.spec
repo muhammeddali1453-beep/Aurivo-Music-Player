@@ -3,6 +3,8 @@
 # Whisper DAHİL DEĞİL (kullanıcı isteğe bağlı kuracak)
 
 import sys
+import os
+import glob
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
@@ -31,12 +33,24 @@ excludes = [
     'scipy',
 ]
 
+ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
+
+extra_binaries = []
+for pattern in [
+    'aurivo_dsp.dll',
+    'subtitle_engine*.pyd',
+    'viz_engine*.pyd',
+]:
+    for match in glob.glob(os.path.join(ROOT_DIR, pattern)):
+        extra_binaries.append((match, '.'))
+
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=extra_binaries,
     datas=[
         ('icons', 'icons'),  # Icon klasörünü dahil et
+        ('presets', 'presets'),  # ProjectM presetleri (opsiyonel ama önerilir)
     ],
     hiddenimports=hiddenimports,
     hookspath=[],

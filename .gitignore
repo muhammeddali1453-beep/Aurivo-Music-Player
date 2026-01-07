@@ -24,8 +24,11 @@ dist/
 
 # Local native binaries (generated)
 aurivo_dsp.so
+aurivo_dsp.dll
 subtitle_engine.cpython-*.so
+subtitle_engine*.pyd
 viz_engine.cpython-*.so
+viz_engine*.pyd
 
 # Local recovery / backup files
 main.py.clean
