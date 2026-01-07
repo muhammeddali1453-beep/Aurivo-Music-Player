@@ -216,7 +216,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QListView,
     QColorDialog, QToolBar, QToolButton, QStyle, QSizePolicy, QProgressBar,
     QCompleter, QKeySequenceEdit, QActionGroup, QSpinBox, QGroupBox, QProgressDialog,
-    QStyledItemDelegate, QStyleOptionViewItem
+    QStyledItemDelegate, QStyleOptionViewItem, QSystemTrayIcon
 )
 from PyQt5.QtWidgets import QPlainTextEdit
 from PyQt5.QtMultimedia import (
@@ -12844,6 +12844,358 @@ class AurivoPlayer(QMainWindow):
         except Exception as e:
             print(f"⚠ Güvenli web bileşenleri kurulamadı: {e}")
 
+        # --- Sistem tepsisi (Clementine tarzı arka planda çalışma) ---
+        self._allow_quit = False
+        self._tray_notice_shown = False
+        self._tray_enabled = False
+        self._init_system_tray()
+
+    def _get_tray_icon(self) -> QIcon:
+        """Tray için ikon döndür (tema -> dosya fallback)."""
+        try:
+            icon = QIcon.fromTheme("aurivo")
+            if not icon.isNull():
+                return icon
+        except Exception:
+            pass
+
+        for candidate in (
+            os.path.join("icons", "aurivo.png"),
+            os.path.join("icons", "aurivo_256.png"),
+            os.path.join("icons", "aurivo_128.png"),
+            os.path.join("icons", "media-playback-start.png"),
+        ):
+            try:
+                if os.path.isfile(candidate):
+                    return QIcon(candidate)
+            except Exception:
+                continue
+        return self.style().standardIcon(QStyle.SP_MediaPlay)
+
+    def _icon_from_theme_or_files(self, theme_names, file_candidates=(), fallback_sp=None) -> QIcon:
+        """Tema ikonunu dener; yoksa dosya ikonlarına düşer."""
+        try:
+            if isinstance(theme_names, (list, tuple)):
+                for name in theme_names:
+                    try:
+                        icon = QIcon.fromTheme(str(name))
+                        if not icon.isNull():
+                            return icon
+                    except Exception:
+                        continue
+            else:
+                icon = QIcon.fromTheme(str(theme_names))
+                if not icon.isNull():
+                    return icon
+        except Exception:
+            pass
+
+        for candidate in file_candidates or ():
+            try:
+                if candidate and os.path.isfile(candidate):
+                    return QIcon(candidate)
+            except Exception:
+                continue
+
+        try:
+            if fallback_sp is not None:
+                return self.style().standardIcon(fallback_sp)
+        except Exception:
+            pass
+        return QIcon()
+
+    def _init_system_tray(self):
+        """Sistem tepsisi ikonunu ve sağ-tık menüsünü kurar."""
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                self._tray_enabled = False
+                return
+        except Exception:
+            self._tray_enabled = False
+            return
+
+        try:
+            QApplication.instance().setQuitOnLastWindowClosed(False)
+        except Exception:
+            pass
+
+        self.tray_icon = QSystemTrayIcon(self._get_tray_icon(), self)
+        self.tray_menu = QMenu()
+
+        # Bazı Linux/tema kombinasyonlarında menü ikonları gizlenebiliyor.
+        # Bu property çoğu platformda işe yarar; çalışmazsa zararsızdır.
+        try:
+            self.tray_menu.setProperty("iconVisibleInMenu", True)
+        except Exception:
+            pass
+
+        self.tray_action_show_hide = QAction("Gizle", self)
+        try:
+            self.tray_action_show_hide.setIcon(self._icon_from_theme_or_files(
+                ["view-restore", "window-restore"],
+                fallback_sp=QStyle.SP_TitleBarNormalButton,
+            ))
+        except Exception:
+            pass
+        self.tray_action_show_hide.triggered.connect(self._tray_toggle_show_hide)
+        self.tray_menu.addAction(self.tray_action_show_hide)
+        self.tray_menu.addSeparator()
+
+        self.tray_action_prev = QAction("Önceki parça", self)
+        try:
+            self.tray_action_prev.setIcon(self._icon_from_theme_or_files(
+                ["media-skip-backward", "go-previous"],
+                file_candidates=(os.path.join("icons", "media-skip-backward.png"),),
+                fallback_sp=QStyle.SP_MediaSkipBackward,
+            ))
+        except Exception:
+            pass
+        self.tray_action_prev.triggered.connect(lambda: self._prev_track("tray"))
+        self.tray_menu.addAction(self.tray_action_prev)
+
+        self.tray_action_play_pause = QAction("Oynat/Duraklat", self)
+        try:
+            self.tray_action_play_pause.setIcon(self._icon_from_theme_or_files(
+                ["media-playback-start", "media-play"],
+                file_candidates=(os.path.join("icons", "media-playback-start.png"),),
+                fallback_sp=QStyle.SP_MediaPlay,
+            ))
+        except Exception:
+            pass
+        self.tray_action_play_pause.triggered.connect(self.play_pause)
+        self.tray_menu.addAction(self.tray_action_play_pause)
+
+        self.tray_action_stop = QAction("Durdur", self)
+        try:
+            self.tray_action_stop.setIcon(self._icon_from_theme_or_files(
+                ["media-playback-stop", "media-stop"],
+                file_candidates=(os.path.join("icons", "media-playback-stop.png"),),
+                fallback_sp=QStyle.SP_MediaStop,
+            ))
+        except Exception:
+            pass
+        self.tray_action_stop.triggered.connect(self._tray_stop)
+        self.tray_menu.addAction(self.tray_action_stop)
+
+        self.tray_action_next = QAction("Sonraki parça", self)
+        try:
+            self.tray_action_next.setIcon(self._icon_from_theme_or_files(
+                ["media-skip-forward", "go-next"],
+                file_candidates=(os.path.join("icons", "media-skip-forward.png"),),
+                fallback_sp=QStyle.SP_MediaSkipForward,
+            ))
+        except Exception:
+            pass
+        self.tray_action_next.triggered.connect(lambda: self._next_track("tray"))
+        self.tray_menu.addAction(self.tray_action_next)
+
+        self.tray_menu.addSeparator()
+
+        self.tray_action_mute = QAction("Sessiz", self)
+        self.tray_action_mute.setCheckable(True)
+        try:
+            self.tray_action_mute.setIcon(self._icon_from_theme_or_files(
+                ["audio-volume-muted", "audio-volume-off"],
+                fallback_sp=QStyle.SP_MediaVolumeMuted,
+            ))
+        except Exception:
+            pass
+        self.tray_action_mute.triggered.connect(lambda _checked=False: self._toggle_mute())
+        self.tray_menu.addAction(self.tray_action_mute)
+
+        self.tray_menu.addSeparator()
+
+        self.tray_action_quit = QAction("Kapat", self)
+        try:
+            self.tray_action_quit.setIcon(self._icon_from_theme_or_files(
+                ["application-exit", "window-close"],
+                fallback_sp=QStyle.SP_TitleBarCloseButton,
+            ))
+        except Exception:
+            pass
+        self.tray_action_quit.triggered.connect(self._request_quit_from_tray)
+        self.tray_menu.addAction(self.tray_action_quit)
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.setToolTip("Aurivo Music Player")
+        self.tray_icon.show()
+
+        # Durum değişimlerinde menüyü güncelle
+        try:
+            self.audio_engine.media_player.stateChanged.connect(lambda *_args: self._sync_tray_state())
+        except Exception:
+            pass
+        try:
+            self.audio_engine.media_player.positionChanged.connect(lambda *_args: self._sync_tray_tooltip())
+        except Exception:
+            pass
+        try:
+            self.volumeSlider.valueChanged.connect(lambda *_args: self._sync_tray_state())
+        except Exception:
+            pass
+
+        self._tray_enabled = True
+        self._sync_tray_state()
+        self._sync_tray_tooltip()
+
+    def _tray_toggle_show_hide(self):
+        try:
+            if self.isVisible():
+                self.hide()
+            else:
+                self._show_from_tray()
+        except Exception:
+            pass
+        self._sync_tray_state()
+
+    def _show_from_tray(self):
+        try:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            try:
+                if self.windowState() & Qt.WindowMinimized:
+                    self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_tray_activated(self, reason):
+        # Tek tık / çift tık: göster/gizle
+        try:
+            if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+                self._tray_toggle_show_hide()
+        except Exception:
+            pass
+
+    def _sync_tray_tooltip(self):
+        if not getattr(self, "_tray_enabled", False):
+            return
+        try:
+            now_playing = ""
+            try:
+                now_playing = str(self.fileLabel.text() or "")
+                now_playing = now_playing.replace("Şu An Çalınan: ", "").strip()
+            except Exception:
+                now_playing = ""
+            tip = "Aurivo Music Player"
+            if now_playing:
+                tip = f"Aurivo - {now_playing}"[:120]
+            self.tray_icon.setToolTip(tip)
+        except Exception:
+            pass
+
+    def _sync_tray_state(self):
+        if not getattr(self, "_tray_enabled", False):
+            return
+
+        try:
+            self.tray_action_show_hide.setText("Gizle" if self.isVisible() else "Göster")
+        except Exception:
+            pass
+
+        # Context-aware playing/mute
+        playing = False
+        muted = False
+        try:
+            if self.mainContentStack.currentIndex() == 1 and hasattr(self, 'videoPlayer'):
+                playing = self.videoPlayer.state() == QMediaPlayer.PlayingState
+                muted = bool(self.videoPlayer.isMuted())
+            elif self.search_mode == "web" and getattr(self, "webView", None):
+                playing = bool(getattr(self, "_web_playing", False))
+                muted = bool(self.volumeSlider.value() == 0)
+            else:
+                st = self.audio_engine.media_player.state() if getattr(self, "audio_engine", None) else QMediaPlayer.StoppedState
+                playing = st == QMediaPlayer.PlayingState
+                muted = bool(self.mediaPlayer.volume() == 0)
+        except Exception:
+            pass
+
+        try:
+            self.tray_action_play_pause.setText("Duraklat" if playing else "Oynat")
+        except Exception:
+            pass
+
+        # Oynat/Duraklat ikonunu da senkronize et
+        try:
+            if playing:
+                self.tray_action_play_pause.setIcon(self._icon_from_theme_or_files(
+                    ["media-playback-pause", "media-pause"],
+                    file_candidates=(os.path.join("icons", "media-playback-pause.png"),),
+                    fallback_sp=QStyle.SP_MediaPause,
+                ))
+            else:
+                self.tray_action_play_pause.setIcon(self._icon_from_theme_or_files(
+                    ["media-playback-start", "media-play"],
+                    file_candidates=(os.path.join("icons", "media-playback-start.png"),),
+                    fallback_sp=QStyle.SP_MediaPlay,
+                ))
+        except Exception:
+            pass
+        try:
+            self.tray_action_mute.blockSignals(True)
+            self.tray_action_mute.setChecked(bool(muted))
+        except Exception:
+            pass
+        finally:
+            try:
+                self.tray_action_mute.blockSignals(False)
+            except Exception:
+                pass
+
+        try:
+            if muted:
+                self.tray_action_mute.setIcon(self._icon_from_theme_or_files(
+                    ["audio-volume-muted", "audio-volume-off"],
+                    fallback_sp=QStyle.SP_MediaVolumeMuted,
+                ))
+            else:
+                self.tray_action_mute.setIcon(self._icon_from_theme_or_files(
+                    ["audio-volume-high", "audio-volume"],
+                    fallback_sp=QStyle.SP_MediaVolume,
+                ))
+        except Exception:
+            pass
+
+        self._sync_tray_tooltip()
+
+    def _tray_stop(self):
+        """Tray menüsünden durdur (context-aware)."""
+        try:
+            if self.mainContentStack.currentIndex() == 1 and hasattr(self, 'videoPlayer'):
+                self.videoPlayer.stop()
+                return
+        except Exception:
+            pass
+
+        try:
+            if self.search_mode == "web" and getattr(self, "webView", None):
+                self._stop_web_media_playback()
+                return
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "audio_engine", None):
+                self.audio_engine.media_player.stop()
+        except Exception:
+            pass
+
+    def _request_quit_from_tray(self):
+        """Tray menüsünden çıkış: gerçek cleanup + uygulamayı kapat."""
+        self._allow_quit = True
+        try:
+            if getattr(self, "tray_icon", None):
+                try:
+                    self.tray_icon.hide()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.close()
+
     def _on_video_viz_data_ready(self, band_vals, pcm_raw):
         """Video sekmesine özel FFT verisi: sadece video ritim çubuklarını güncelle."""
         try:
@@ -24467,6 +24819,33 @@ class AurivoPlayer(QMainWindow):
             self.popup_eq.raise_()
 
     def closeEvent(self, event):
+        """Uygulama kapatılırken kaynakları temizle.
+
+        Clementine benzeri davranış: Tray varsa, pencere kapatılınca uygulama kapanmaz;
+        arka planda çalışmaya devam eder. Gerçek çıkış için tray menüsündeki "Çık" kullanılır.
+        """
+
+        # Tray varsa ve kullanıcı gerçekten çıkmak istemediyse: sadece gizle
+        if getattr(self, "_tray_enabled", False) and not getattr(self, "_allow_quit", False):
+            try:
+                event.ignore()
+                self.hide()
+                if getattr(self, "tray_icon", None) and not getattr(self, "_tray_notice_shown", False):
+                    self._tray_notice_shown = True
+                    try:
+                        self.tray_icon.showMessage(
+                            "Aurivo arka planda çalışıyor",
+                            "Uygulamayı kapatmak için tepsideki Aurivo simgesine sağ tık → Kapat",
+                            QSystemTrayIcon.Information,
+                            5000,
+                        )
+                    except Exception:
+                        pass
+                self._sync_tray_state()
+                return
+            except Exception:
+                pass
+
         """Uygulama kapatılırken kaynakları temizle"""
         # Old dsp_bridge cleanup removed as it's now handled by GlobalAudioEngine.
             
@@ -25141,7 +25520,18 @@ def main():
     except Exception:
         pass
     
+    # Bazı Linux temalarında menü ikonları default olarak gizlenebiliyor.
+    # Bu attribute'u app yaratılmadan önce kapatmayı dene.
+    try:
+        QApplication.setAttribute(Qt.AA_DontShowIconsInMenus, False)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+    try:
+        app.setQuitOnLastWindowClosed(False)
+    except Exception:
+        pass
     app.setFont(QFont("Ubuntu", 10))
     
     window = AurivoPlayer()
