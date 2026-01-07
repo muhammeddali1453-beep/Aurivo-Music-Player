@@ -2,19 +2,24 @@
 
 ## 🎵 Paket Stratejisi
 
-**Tek paket + Opsiyonel Whisper**
-- Ana paket: ~150-200MB (temel özellikler)
-- Whisper eklentisi: ~2.2GB (kullanıcı isteğe bağlı)
+**İki Ayrı Paket: Standard ve Pro**
+- **Standard**: ~150-200MB (Whisper hariç, çoğu kullanıcı için)
+- **Pro**: ~2.5GB (Whisper dahil, otomatik altyazı için)
 
-### Neler Dahil?
+### Standard Paket İçeriği
 ✅ Müzik çalar (tüm formatlar)
 ✅ Video oynatıcı
 ✅ 11 görselleştirme modu
-✅ Manuel altyazı desteği
+✅ Manuel altyazı desteği (.srt, .vtt)
 ✅ Ekolayzır + DSP efektleri
 ✅ Kütüphane yönetimi
+✅ YouTube indirme
+❌ Otomatik altyazı (Whisper yok)
 
-❌ Otomatik altyazı (Whisper) - **kullanıcı yükler**
+### Pro Paket İçeriği
+✅ **Standard'daki tüm özellikler**
+✅ **Otomatik video transkripsiyon (Whisper AI)**
+✅ **Çoklu dil otomatik altyazı**
 
 ---
 
@@ -157,23 +162,40 @@ Uygulama ilk kez "Otomatik Altyazı" kullanıldığında:
 
 ## 🚀 Kullanıcıya Notlar
 
+## 📦 Hangi Paketi İndirmeliyim?
+
+### Aurivo Standard İndir Eğer:
+- Sadece müzik dinleyecekseniz
+- Video izleyeceksiniz ama altyazı gerekmiyorsa
+- Manuel olarak .srt/.vtt altyazı eklemek yeterliyse
+- Disk alanı sınırlıysa
+
+### Aurivo Pro İndir Eğer:
+- Videolardan otomatik altyazı oluşturacaksanız
+- Çoklu dilde transkripsiyon yapacaksanız
+- 2.5GB+ disk alanınız varsa
+
+---
+
 ### İlk Çalıştırma
 ```
-Windows: Aurivo.exe'ye çift tıkla
-Linux:   ./aurivo veya AppImage'a çift tıkla
+Windows Standard: Aurivo-Standard.exe'ye çift tıkla
+Windows Pro:      Aurivo-Pro.exe'ye çift tıkla
+Linux Standard:   ./dist/aurivo-standard/aurivo
+Linux Pro:        ./dist/aurivo-pro/aurivo
 ```
 
-### Whisper Olmadan Kullanım
+### Standard Versiyonda Kullanım
 - Müzik çalma: ✅ Tam özellikli
 - Video oynatma: ✅ Tam özellikli
 - Manuel altyazı: ✅ `.vtt/.srt` yükle
-- Otomatik altyazı: ❌ Whisper gerekli
+- Otomatik altyazı: ❌ Pro versiyonu gerekli
 
-### Whisper İle Kullanım
-1. Video menüsünden "Otomatik Altyazı" seç
-2. İlk seferde kurulum prompt'u gelir
-3. Kabul et → 2.2GB indirilir (~5-10 dakika)
-4. Sonraki videolarda direkt çalışır
+### Pro Versiyonda Kullanım
+- Standard'daki tüm özellikler: ✅
+- Otomatik altyazı: ✅ Direkt kullanılabilir
+- Video menüsünden "Whisper ile Transkripsiyon" seç
+- İlk çalıştırmada model indirilir (~500MB, tek seferlik)
 
 ---
 
