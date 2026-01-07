@@ -13135,8 +13135,24 @@ class AurivoPlayer(QMainWindow):
             try:
                 self.mpris = MPRISInterface(self)
                 print("✓ MPRIS2 sistem entegrasyonu aktif")
+                # DE'lerin (KDE/GNOME) butonları doğru güncellemesi için PlaybackStatus
+                # değişimlerini PropertiesChanged ile yayınla.
+                try:
+                    self._mpris_signal_wired = True
+                    if getattr(self, 'audio_engine', None) and hasattr(self.audio_engine, 'media_player'):
+                        self.audio_engine.media_player.stateChanged.connect(self._on_mpris_audio_state_changed)
+                except Exception:
+                    self._mpris_signal_wired = False
             except Exception as e:
                 print(f"⚠️ MPRIS başlatma hatası: {e}")
+
+    @pyqtSlot(int)
+    def _on_mpris_audio_state_changed(self, _state: int):
+        try:
+            if hasattr(self, 'mpris') and self.mpris:
+                self.mpris.update_playback_status()
+        except Exception:
+            pass
 
     def _get_tray_icon(self) -> QIcon:
         """Tray için ikon döndür (tema -> dosya fallback)."""
@@ -22468,10 +22484,28 @@ class AurivoPlayer(QMainWindow):
             pass
 
         if getattr(self, 'search_mode', '') == 'web':
+            # Web'de toggle yerine "force play" yap (paused ise play)
             try:
-                if hasattr(self, '_web_toggle_play'):
-                    # web tarafında ayrı "play" yok; toggle en güvenlisi.
-                    self._web_toggle_play()
+                if getattr(self, 'webView', None):
+                    js = """
+                    (function() {
+                        try {
+                            window.__aurivoUserGestureTS = Date.now();
+                            window.__aurivoAllowPlayUntil = Date.now() + 6000;
+                            if (window.__aurivoInitAudioFromGesture) {
+                                window.__aurivoInitAudioFromGesture();
+                            }
+                        } catch (e) {}
+                        var v = document.querySelector('video') || document.querySelector('audio');
+                        if (v && v.paused) { v.play(); return; }
+                        // Spotify/Deezer için: play butonu varsa tıkla
+                        var btn = document.querySelector('[data-testid="control-button-playpause"]');
+                        if (btn) { btn.click(); return; }
+                        var dbtn = document.querySelector('[data-testid="play_button_play"]');
+                        if (dbtn) { dbtn.click(); return; }
+                    })();
+                    """
+                    self.webView.page().runJavaScript(js)
             except Exception:
                 pass
             return
@@ -22479,9 +22513,27 @@ class AurivoPlayer(QMainWindow):
         if not getattr(self, 'audio_engine', None):
             return
         try:
-            if self.audio_engine.media_player.state() != QMediaPlayer.PlayingState:
-                # play_pause içindeki "NoMedia yükle" mantığını kullan
-                self.play_pause()
+            # Playlist boşsa play yapma
+            if getattr(self, 'playlist', None) is not None:
+                if self.playlist.mediaCount() <= 0:
+                    return
+                if self.playlist.currentIndex() < 0:
+                    self.playlist.setCurrentIndex(0)
+
+            # NoMedia ise yükle, değilse direkt play
+            if self.audio_engine.media_player.mediaStatus() == QMediaPlayer.NoMedia:
+                try:
+                    self.playlist_position_changed(self.playlist.currentIndex())
+                except Exception:
+                    return
+            else:
+                self.audio_engine.media_player.play()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, 'mpris') and self.mpris:
+                self.mpris.update_playback_status()
         except Exception:
             pass
 
