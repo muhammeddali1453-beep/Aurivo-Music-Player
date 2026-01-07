@@ -1,0 +1,40 @@
+name: ✨ Feature Request / Özellik İsteği
+description: Suggest a new feature for Aurivo Music Player / Aurivo Music Player için yeni bir özellik önerin
+title: "[FEATURE] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Thanks for suggesting a feature! / Özellik önerdiğiniz için teşekkürler! 🎵
+        
+  - type: textarea
+    id: feature-description
+    attributes:
+      label: Feature Description / Özellik Açıklaması
+      description: What feature would you like to see? / Hangi özelliği görmek istersiniz?
+      placeholder: |
+        Example: I would like YouTube integration to play music directly from YouTube
+        Örnek: YouTube'dan doğrudan müzik çalmak için YouTube entegrasyonu istiyorum
+    validations:
+      required: true
+      
+  - type: textarea
+    id: why-needed
+    attributes:
+      label: Why is this needed? / Neden gerekli?
+      description: Explain why this feature would be useful / Bu özelliğin neden faydalı olacağını açıklayın
+      placeholder: |
+        Example: This would allow users to access millions of songs without downloading
+        Örnek: Bu, kullanıcıların indirmeden milyonlarca şarkıya erişmesini sağlar
+    validations:
+      required: true
+      
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context / Ek Bilgi
+      description: Add any other context, screenshots, or examples / Başka bağlam, ekran görüntüsü veya örnek ekleyin
+      placeholder: You can attach images or links here / Buraya resim veya bağlantı ekleyebilirsiniz
+    validations:
+      required: false
