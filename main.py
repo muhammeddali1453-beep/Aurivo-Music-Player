@@ -1276,7 +1276,19 @@ if DBUS_AVAILABLE:
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def PlayPause(self):
             """Oynat/Duraklat"""
-            self.player._play_pause()
+            # Aurivo'da public metot: play_pause()
+            try:
+                if hasattr(self.player, 'play_pause'):
+                    self.player.play_pause()
+                    return
+            except Exception:
+                pass
+            # Fallback (varsa)
+            try:
+                if hasattr(self.player, '_play_pause'):
+                    self.player._play_pause()
+            except Exception:
+                pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def Play(self):
@@ -1296,12 +1308,32 @@ if DBUS_AVAILABLE:
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def Next(self):
             """Sonraki parça"""
-            self.player._play_next()
+            try:
+                if hasattr(self.player, '_next_track'):
+                    self.player._next_track()
+                    return
+            except Exception:
+                pass
+            try:
+                if hasattr(self.player, '_play_next'):
+                    self.player._play_next()
+            except Exception:
+                pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player')
         def Previous(self):
             """Önceki parça"""
-            self.player._play_previous()
+            try:
+                if hasattr(self.player, '_prev_track'):
+                    self.player._prev_track()
+                    return
+            except Exception:
+                pass
+            try:
+                if hasattr(self.player, '_play_previous'):
+                    self.player._play_previous()
+            except Exception:
+                pass
         
         @dbus.service.method('org.mpris.MediaPlayer2.Player', in_signature='x')
         def Seek(self, offset):
@@ -1320,42 +1352,82 @@ if DBUS_AVAILABLE:
                            in_signature='ss', out_signature='v')
         def Get(self, interface, prop):
             """Property getter"""
-            if prop == 'Identity':
-                return 'Aurivo Music Player'
-            elif prop == 'CanQuit':
-                return True
-            elif prop == 'CanRaise':
-                return True
-            elif prop == 'HasTrackList':
-                return False
-            elif prop == 'DesktopEntry':
-                return 'aurivo'
-            elif prop == 'PlaybackStatus':
-                state = self.player.mediaPlayer.state()
-                if state == QMediaPlayer.PlayingState:
-                    return 'Playing'
-                elif state == QMediaPlayer.PausedState:
-                    return 'Paused'
-                return 'Stopped'
-            elif prop == 'Metadata':
-                return self._get_metadata()
-            elif prop == 'Volume':
-                return self.player.mediaPlayer.volume() / 100.0
-            elif prop == 'Position':
-                return dbus.Int64(self.player.mediaPlayer.position() * 1000)
-            elif prop == 'CanGoNext':
-                return self.player.playlistWidget.count() > 1
-            elif prop == 'CanGoPrevious':
-                return self.player.playlistWidget.count() > 1
-            elif prop == 'CanPlay':
-                return True
-            elif prop == 'CanPause':
-                return True
-            elif prop == 'CanSeek':
-                return True
-            elif prop == 'CanControl':
-                return True
+            # Birçok DE (GNOME/KDE), önce GetAll çağırır. Yine de Get'i tam tutalım.
+            try:
+                all_props = self.GetAll(interface)
+                if isinstance(all_props, dict) and prop in all_props:
+                    return all_props[prop]
+            except Exception:
+                pass
             return dbus.String('')
+
+        @dbus.service.method('org.freedesktop.DBus.Properties',
+                           in_signature='s', out_signature='a{sv}')
+        def GetAll(self, interface):
+            """İstenen arayüz için tüm properties (DE'ler bunu bekler)."""
+            props = dbus.Dictionary({}, signature='sv')
+
+            if interface == 'org.mpris.MediaPlayer2':
+                props['Identity'] = dbus.String('Aurivo Music Player')
+                props['DesktopEntry'] = dbus.String('aurivo')
+                props['CanQuit'] = dbus.Boolean(True)
+                props['CanRaise'] = dbus.Boolean(True)
+                props['HasTrackList'] = dbus.Boolean(False)
+                props['SupportedUriSchemes'] = dbus.Array([], signature='s')
+                props['SupportedMimeTypes'] = dbus.Array([], signature='s')
+                return props
+
+            if interface == 'org.mpris.MediaPlayer2.Player':
+                # PlaybackStatus
+                status = 'Stopped'
+                try:
+                    state = self.player.mediaPlayer.state()
+                    if state == QMediaPlayer.PlayingState:
+                        status = 'Playing'
+                    elif state == QMediaPlayer.PausedState:
+                        status = 'Paused'
+                except Exception:
+                    status = 'Stopped'
+                props['PlaybackStatus'] = dbus.String(status)
+
+                # Metadata
+                try:
+                    props['Metadata'] = self._get_metadata()
+                except Exception:
+                    props['Metadata'] = dbus.Dictionary({}, signature='sv')
+
+                # Volume
+                try:
+                    props['Volume'] = dbus.Double(self.player.mediaPlayer.volume() / 100.0)
+                except Exception:
+                    props['Volume'] = dbus.Double(1.0)
+
+                # Position (microseconds)
+                try:
+                    props['Position'] = dbus.Int64(self.player.mediaPlayer.position() * 1000)
+                except Exception:
+                    props['Position'] = dbus.Int64(0)
+
+                # Capabilities
+                try:
+                    has_many = bool(getattr(self.player.playlistWidget, 'count', lambda: 0)() > 1)
+                except Exception:
+                    has_many = False
+                props['CanGoNext'] = dbus.Boolean(has_many)
+                props['CanGoPrevious'] = dbus.Boolean(has_many)
+                props['CanPlay'] = dbus.Boolean(True)
+                props['CanPause'] = dbus.Boolean(True)
+                props['CanSeek'] = dbus.Boolean(True)
+                props['CanControl'] = dbus.Boolean(True)
+
+                # Rate fields (bazı kontrol merkezleri bunları sorabiliyor)
+                props['Rate'] = dbus.Double(1.0)
+                props['MinimumRate'] = dbus.Double(1.0)
+                props['MaximumRate'] = dbus.Double(1.0)
+                return props
+
+            # Bilinmeyen arayüz
+            return props
         
         @dbus.service.method('org.freedesktop.DBus.Properties',
                            in_signature='ssv')
@@ -1410,6 +1482,15 @@ if DBUS_AVAILABLE:
                 self.PropertiesChanged('org.mpris.MediaPlayer2.Player',
                                      {'Metadata': self._get_metadata()}, [])
             except:
+                pass
+
+        def update_playback_status(self):
+            """Oynatma durumu değiştiğinde DE'ye bildir."""
+            try:
+                status = self.GetAll('org.mpris.MediaPlayer2.Player').get('PlaybackStatus', dbus.String('Stopped'))
+                self.PropertiesChanged('org.mpris.MediaPlayer2.Player',
+                                     {'PlaybackStatus': status}, [])
+            except Exception:
                 pass
         
         @dbus.service.signal('org.freedesktop.DBus.Properties',
